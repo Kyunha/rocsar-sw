@@ -149,13 +149,19 @@ func TestGeneratedProtobufIsConfinedToCodecPackages(t *testing.T) {
 	root := moduleRoot(t)
 	const genPath = "github.com/rocsar/obc/api/rocsar/v1"
 
-	// The transport speaks the wire, and the pico codec is the wire. Everything
-	// else must go through them.
+	// The four places where the wire and the domain meet, and nowhere else.
 	allowed := map[string]bool{
+		// transport encodes and decodes the frames.
 		"internal/transport": true,
-		"internal/pico":      true,
-		"internal/telemetry": true, // it builds the aggregate that goes on the wire
-		"cmd/obc":            true, // the composition root wires concrete types
+		// pico is the COBS+protobuf link; the codec lives there.
+		"internal/pico": true,
+		// command dispatches CommandRequest, so it necessarily sees the wire
+		// type. It converts to domain types at the top of each handler and
+		// nothing below that point touches protobuf -- which is the property
+		// this rule is actually protecting.
+		"internal/command": true,
+		// the composition root wires concrete implementations together.
+		"cmd/obc": true,
 	}
 
 	for _, f := range allGoFiles(t, root) {
