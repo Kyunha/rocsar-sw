@@ -1,0 +1,92 @@
+# ROCSAR configuration. Read by the On-Board Computer and by the Ground
+# Station -- the two agree on purpose, and where they differ (the server half
+# binds a wildcard, the client half dials an address) that difference is the
+# point.
+#
+# Resolution order, highest first:
+#
+#     explicit flag  >  ROCSAR_* environment  >  this file  >  code default
+#
+# `rocsar.local.toml` is gitignored and merged over this file for per-machine
+# overrides.
+#
+# DELIBERATELY ABSENT: every value below has a default in the code, and the
+# defaults are NOT repeated here. A default written into this file is a second
+# home for a fact, and two homes drift. An empty file is the correct state of
+# this file on a fresh checkout. `obc --help` lists the defaults.
+#
+# An unrecognised key is ignored, not an error, so that a newer Ground Station
+# carrying a key this OBC predates does not stop it from starting.
+
+# Top-level, and therefore ABOVE the first [section] header.
+#
+# It sat under [qos] until a test caught it, and it failed *open*: TOML reads a
+# key written after a section header as belonging to that section, so this became
+# the unknown key `qos.require_hardware`, was ignored, and the code default --
+# also false -- was used instead. Identical observable behaviour, wrong reason,
+# and the next person's change to the default would have silently overridden
+# this file. test/config_test.go parses this exact file and fails on any key that
+# is not in config.KnownKeys, which is what catches the nesting.
+require_hardware = false
+
+[server]
+# Bind endpoints. The wildcard is correct on the Pi and undialable from a
+# laptop, which is why the client half below exists separately.
+control_endpoint = "tcp://*:5555"
+telemetry_endpoint = "tcp://*:5556"
+
+[client]
+# The value that has to change when DHCP moves the Pi.
+control_endpoint = "tcp://192.168.1.50:5555"
+telemetry_endpoint = "tcp://192.168.1.50:5556"
+
+[http]
+addr = ":5557"
+root = "/mnt/rocsar/data"
+# The port in `addr` is load-bearing. The kernel's flower filter classifies bulk
+# traffic on `dst_port 5557`, and it is a constant (config.BulkPort), not a key
+# here. If the two disagree the failure is silent: downloads join the priority
+# class, the priority class starves, and nothing reports an error. Startup
+# refuses a mismatched pair rather than discovering it in flight.
+
+[link]
+device = "eth0"
+# Kilobits per second. The air link is 115 kbit/s and that is a property of the
+# radio, not a tuning knob. Re-applied at every start, so restarting the OBC
+# returns to the launch value.
+rate_kbps = 115
+# Needs CAP_NET_ADMIN. Set false on a laptop or in CI -- a bare run on a
+# developer machine would otherwise try to reshape a real NIC.
+shaping = true
+
+[pico]
+port = "/dev/ttyACM0"
+# The USB link rate to the Pi. NOT the ST3215 servo bus rate, which is also
+# 115200 and is unrelated. Two buses, one coincidental number.
+baudrate = 115200
+
+[gnss]
+# One entry per Read_uB instance.
+ports = [2001, 2002, 2003]
+# Which receiver is trusted, by 1-based ID: 1 is the first entry in `ports`.
+# Must be in range. Selection is explicit and never automatic; the other
+# receivers are still reported so the redundancy is visible.
+selected = 1
+# A fix older than this reports fix_ok = false even though the last decoded
+# value was valid. An old fix is worse than no fix.
+stale_after = "2s"
+
+[camera]
+device = "/dev/video0"
+
+[sdr]
+program = "third_party/sdr-ettus-b200mini"
+
+[telemetry]
+interval = "1s"
+
+[qos]
+# Userspace token-bucket ceiling for the bulk class, bytes per second. The
+# kernel shaper is the real limit; this stops a bulk transfer from monopolising
+# the socket's send path before the kernel ever sees the traffic.
+bulk_rate_bps = 65536

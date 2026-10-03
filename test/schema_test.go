@@ -13,8 +13,8 @@ import (
 // and it is the first thing that runs.
 func TestPicoMessageRoundTrip(t *testing.T) {
 	in := &rocsarv1.PicoMessage{
-		Sequence:     42,
-		TimestampUs:  1_700_000_000_000_000,
+		Sequence:    42,
+		TimestampUs: 1_700_000_000_000_000,
 		Payload: &rocsarv1.PicoMessage_Telemetry{
 			Telemetry: &rocsarv1.PicoTelemetry{
 				GondolaHeadingDeg: 123.5,
