@@ -701,3 +701,7 @@ func isPortClosed(err error) bool {
 	msg := err.Error()
 	return strings.Contains(msg, "port closed") || strings.Contains(msg, "closed port")
 }
+
+// Shutdown satisfies domain.Shutdown. It is Close with a context, so the
+// composition root can unwind everything uniformly without type-switching.
+func (l *Link) Shutdown(ctx context.Context) error { return l.Close() }

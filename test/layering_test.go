@@ -1,0 +1,491 @@
+package test
+
+import (
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strconv"
+	"strings"
+	"testing"
+)
+
+// The layering rule from ARCHITECTURE.md 3:
+//
+//	transport -> command -> domain -> Port (interface) -> adapter
+//
+// Enforced here by walking the import graph, not by review. Discipline decays;
+// this does not.
+//
+// Three deliberate properties of the check:
+//
+//   - It reads imports with go/parser, not with a text search. A mention of
+//     "net" in a docstring is not a violation, and a function-local import is --
+//     a local `import serial` inside a method is exactly the shortcut that rots
+//     a layering rule.
+//   - It checks the full transitive closure of the forbidden packages. Banning
+//     `net` in internal/domain while allowing `internal/transport` to import it
+//     would be satisfied by a one-line detour.
+//   - It names the offending file, line and import path, because a failing
+//     architecture test that does not say where is worse than no test.
+
+type forbiddenRule struct {
+	pkg      string // the package whose imports are restricted
+	reason   string
+	forbid   []string            // import path prefixes
+	allowFor map[string][]string // package -> import paths that are permitted
+}
+
+// layerRules is the single statement of the architecture. ARCHITECTURE.md
+// describes it in prose; this is the version that is enforced.
+var layerRules = []forbiddenRule{
+	{
+		pkg:    "internal/domain",
+		reason: "the vocabulary must not know that hardware or wire formats exist",
+		forbid: []string{
+			"github.com/rocsar/obc/api/rocsar/v1", // generated protobuf
+			"github.com/go-zeromq",                // the wire
+			"go.bug.st/serial",                    // the wire
+			"net", "net/http", "os/exec", "os", "io",
+		},
+	},
+	{
+		pkg:    "internal/telemetry",
+		reason: "assembly is pure; a clock and a socket would make it untestable",
+		forbid: []string{
+			"github.com/rocsar/obc/api/rocsar/v1",
+			"github.com/go-zeromq",
+			"go.bug.st/serial",
+			"net", "net/http", "os/exec",
+		},
+		allowFor: map[string][]string{
+			// time is how a 1 Hz pipeline is expressed. It is not I/O.
+			"internal/telemetry": {"time"},
+		},
+	},
+	{
+		pkg:    "internal/config",
+		reason: "configuration must not reach into a subsystem",
+		forbid: []string{
+			"github.com/rocsar/obc/internal/gnss",
+			"github.com/rocsar/obc/internal/pico",
+			"github.com/rocsar/obc/internal/camera",
+			"github.com/rocsar/obc/internal/sdr",
+			"github.com/rocsar/obc/internal/qos",
+			"github.com/rocsar/obc/internal/transport",
+		},
+	},
+}
+
+// subsystemOwners maps a package that is allowed to use a forbidden import to
+// the reason it may. os/exec in particular is confined to exactly two places,
+// and the count is the point: it is easy to add a third and hard to notice.
+var subsystemOwners = map[string][]string{
+	"os/exec": {"internal/sdr", "internal/qos"},
+}
+
+func TestLayeringBoundaries(t *testing.T) {
+	root := moduleRoot(t)
+
+	for _, rule := range layerRules {
+		t.Run(rule.pkg, func(t *testing.T) {
+			files := goFilesIn(t, filepath.Join(root, rule.pkg))
+
+			for _, f := range files {
+				imports := parseImports(t, f)
+
+				for _, imp := range imports {
+					if !matchesAny(imp.path, rule.forbid) {
+						continue
+					}
+					if isAllowed(rule, imp.path) {
+						continue
+					}
+					t.Errorf("%s:%d imports %q\n    %s must not depend on it.\n"+
+						"    If this is genuinely necessary the architecture is wrong, not the test.",
+						rel(t, root, f), imp.line, imp.path, rule.pkg)
+				}
+			}
+		})
+	}
+}
+
+func TestSubprocessIsConfinedToItsOwners(t *testing.T) {
+	root := moduleRoot(t)
+	allowed := map[string]bool{}
+	for _, p := range subsystemOwners["os/exec"] {
+		allowed[p] = true
+	}
+
+	for _, f := range allGoFiles(t, root) {
+		rel := rel(t, root, f)
+		pkg := filepath.Dir(rel)
+
+		for _, imp := range parseImports(t, f) {
+			if imp.path != "os/exec" {
+				continue
+			}
+			if allowed[pkg] {
+				continue
+			}
+			t.Errorf("%s:%d imports os/exec\n"+
+				"    Only %v may shell out. A new one means a new decision about what is\n"+
+				"    allowed to reach outside the process, not a convenience.",
+				rel, imp.line, keysOf(allowed))
+		}
+	}
+}
+
+// The generated protobuf bindings must be confined to the codec layer.
+//
+// Two reasons, both learned the hard way. First, they are the one dependency
+// that changes shape when the schema does, and letting them spread means a
+// schema change ripples through the whole system instead of one package.
+// Second, `domain` is supposed to be free of the wire, and importing them is
+// the fastest way to lose that.
+func TestGeneratedProtobufIsConfinedToCodecPackages(t *testing.T) {
+	root := moduleRoot(t)
+	const genPath = "github.com/rocsar/obc/api/rocsar/v1"
+
+	// The transport speaks the wire, and the pico codec is the wire. Everything
+	// else must go through them.
+	allowed := map[string]bool{
+		"internal/transport": true,
+		"internal/pico":      true,
+		"internal/telemetry": true, // it builds the aggregate that goes on the wire
+		"cmd/obc":            true, // the composition root wires concrete types
+	}
+
+	for _, f := range allGoFiles(t, root) {
+		rel := rel(t, root, f)
+		pkg := filepath.Dir(rel)
+
+		for _, imp := range parseImports(t, f) {
+			if imp.path != genPath {
+				continue
+			}
+			if allowed[pkg] {
+				continue
+			}
+			t.Errorf("%s:%d imports the generated protobuf bindings\n"+
+				"    Only %v may. Everything else goes through domain types, which is what\n"+
+				"    keeps the schema from becoming the whole system's interface.",
+				rel, imp.line, keysOf(allowed))
+		}
+	}
+}
+
+// Every Port in internal/domain must have both a real adapter and a mock.
+//
+// An interface with one implementation is a class with no seam: there is no
+// second implementation to disagree with it, so the interface is documentation
+// rather than a boundary.
+//
+// Satisfaction is not inferred from names -- domain.Pico is implemented by
+// pico.Link, and a name-based check would either miss it or match
+// pico.MockPico by accident. It is asserted explicitly and idiomatically:
+//
+//	var _ domain.Pico = (*pico.Link)(nil)
+//
+// which the compiler checks, so this test only has to find the assertions and
+// classify them. That is both cheaper and more trustworthy than reflection over
+// the type graph.
+func TestEveryPortHasAnAdapterAndAMock(t *testing.T) {
+	root := moduleRoot(t)
+
+	ports := declaredInterfaces(t, filepath.Join(root, "internal/domain"))
+	if len(ports) == 0 {
+		t.Fatal("no interfaces found in internal/domain; the port test is broken")
+	}
+
+	// interface -> {"real": [pkg...], "mock": [pkg...]}
+	impl := map[string]map[string][]string{
+		"real": {}, "mock": {},
+	}
+
+	for _, f := range allGoFiles(t, root) {
+		pkg := filepath.Dir(rel(t, root, f))
+		for name, mocked := range parseAssertions(t, f) {
+			if impl[name] == nil {
+				impl[name] = map[string][]string{"real": {}, "mock": {}}
+			}
+			kind := "real"
+			if mocked {
+				kind = "mock"
+			}
+			impl[name][kind] = append(impl[name][kind], pkg)
+		}
+	}
+
+	var problems []string
+	for _, port := range ports {
+		kinds, asserted := impl[port]
+		if !asserted {
+			problems = append(problems, port+
+				": no `var _ domain."+port+" = ...` assertion anywhere; nothing claims to implement it")
+			continue
+		}
+		if len(kinds["mock"]) == 0 {
+			if _, excluded := notAPort[port]; excluded {
+				continue // implemented, and deliberately not mocked
+			}
+			problems = append(problems, port+
+				": asserted only by "+joinPkgs(kinds["real"])+", with no mock")
+		}
+	}
+
+	if len(problems) > 0 {
+		sortStrings(problems)
+		t.Errorf("ports without both an adapter and a mock:\n  %s\n"+
+			"    A port with one implementation cannot be tested against a disagreement.\n"+
+			"    Add a `var _ domain.%s = (*Something)(nil)` assertion where it is satisfied.",
+			strings.Join(problems, "\n  "), "<Port>")
+	}
+}
+
+func joinPkgs(pkgs []string) string {
+	seen := map[string]bool{}
+	var out []string
+	for _, p := range pkgs {
+		if !seen[p] {
+			seen[p] = true
+			out = append(out, p)
+		}
+	}
+	sortStrings(out)
+	return strings.Join(out, ", ")
+}
+
+func sortStrings(s []string) {
+	for i := 1; i < len(s); i++ {
+		for j := i; j > 0 && s[j] < s[j-1]; j-- {
+			s[j], s[j-1] = s[j-1], s[j]
+		}
+	}
+}
+
+// assertionRegex matches the compile-time satisfaction idiom:
+//
+//	var _ domain.Pico = (*Link)(nil)
+//
+// Group 1 is the qualifier, group 2 the interface, group 3 the concrete type.
+//
+// There is deliberately no `var` keyword in the pattern. Assertions are almost
+// always written inside a grouped `var ( ... )` block, where each line is just
+// `_ domain.Pico = (*Link)(nil)` with no `var` in front of it -- and a pattern
+// that requires one silently matches nothing, which is indistinguishable from
+// "nobody has implemented this port".
+var assertionRegex = regexp.MustCompile(`(?m)^\s*_\s+\w+\.(\w+)\s*=\s*\(\*(\w+)\)`)
+
+// doublePrefixes name the types this test counts as test doubles.
+//
+// Null and Recording are included because a null object IS a double: it accepts
+// every call, changes nothing, and records what it was asked to do. NullShaper is
+// exactly that -- it is what a laptop, a test and CI get instead of touching a
+// real NIC -- and requiring a separate Mock alongside it would be two types
+// doing one job.
+var doublePrefixes = []string{"Mock", "Fake", "Null", "Recording", "Stub"}
+
+// notAPort names interfaces that are not hardware ports and must not be held to
+// the mock rule.
+//
+// Shutdown is a lifecycle constraint ("this type can be released"), not a port.
+// There is nothing to disagree about: either a type can be closed or it cannot,
+// and a MockShutdown that recorded Close calls would be theatre. It is still
+// required to have an implementation, so it cannot rot unnoticed.
+var notAPort = map[string]string{
+	"Shutdown": "a lifecycle constraint, not a hardware port; there is no behaviour to mock",
+}
+
+func parseAssertions(t *testing.T, file string) map[string]bool {
+	t.Helper()
+	body, err := os.ReadFile(file)
+	if err != nil {
+		t.Fatalf("reading %s: %v", file, err)
+	}
+	out := map[string]bool{}
+	for _, m := range assertionRegex.FindAllStringSubmatch(string(body), -1) {
+		concrete := m[2]
+		isDouble := false
+		for _, p := range doublePrefixes {
+			if strings.HasPrefix(concrete, p) {
+				isDouble = true
+				break
+			}
+		}
+		out[m[1]] = isDouble
+	}
+	return out
+}
+
+// ---------------------------------------------------------------------------
+// helpers
+// ---------------------------------------------------------------------------
+
+type imp struct {
+	path string
+	line int
+}
+
+func parseImports(t *testing.T, file string) []imp {
+	t.Helper()
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, file, nil, parser.ImportsOnly)
+	if err != nil {
+		t.Fatalf("parsing %s: %v", file, err)
+	}
+
+	var out []imp
+	for _, spec := range f.Imports {
+		p, err := strconv.Unquote(spec.Path.Value)
+		if err != nil {
+			t.Fatalf("bad import in %s: %v", file, err)
+		}
+		out = append(out, imp{path: p, line: fset.Position(spec.Pos()).Line})
+	}
+	return out
+}
+
+func matchesAny(path string, prefixes []string) bool {
+	for _, p := range prefixes {
+		if path == p || strings.HasPrefix(path, p+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+func isAllowed(rule forbiddenRule, path string) bool {
+	for _, ok := range rule.allowFor[rule.pkg] {
+		if path == ok {
+			return true
+		}
+	}
+	return false
+}
+
+func anyPackageContains(pkgs map[string]bool, substr string) bool {
+	for p := range pkgs {
+		if strings.Contains(strings.ToLower(p), substr) {
+			return true
+		}
+	}
+	return false
+}
+
+func keysOf(m map[string]bool) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
+}
+
+func join(m map[string]bool) string { return strings.Join(keysOf(m), ", ") }
+
+func goFilesIn(t *testing.T, dir string) []string {
+	t.Helper()
+	var out []string
+	err := filepath.Walk(dir, func(p string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() && strings.HasSuffix(p, ".go") {
+			out = append(out, p)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walking %s: %v", dir, err)
+	}
+	return out
+}
+
+func allGoFiles(t *testing.T, root string) []string {
+	t.Helper()
+	var out []string
+	for _, sub := range []string{"cmd", "internal"} {
+		out = append(out, goFilesIn(t, filepath.Join(root, sub))...)
+	}
+	return out
+}
+
+func moduleRoot(t *testing.T) string {
+	t.Helper()
+	abs, err := filepath.Abs(filepath.Join(".."))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return abs
+}
+
+func rel(t *testing.T, root, path string) string {
+	t.Helper()
+	r, err := filepath.Rel(root, path)
+	if err != nil {
+		return path
+	}
+	return r
+}
+
+// declaredInterfaces returns the interface names declared in a package's files.
+// declaredInterfaces returns the names of the INTERFACES declared in a package.
+//
+// Only interfaces. The package also declares structs -- Fix, Photo, PicoTelemetry
+// and the rest -- and treating those as ports would demand a mock for a data
+// type, which is meaningless.
+func declaredInterfaces(t *testing.T, dir string) []string {
+	t.Helper()
+	var out []string
+	for _, f := range goFilesIn(t, dir) {
+		fset := token.NewFileSet()
+		pf, err := parser.ParseFile(fset, f, nil, 0)
+		if err != nil {
+			t.Fatalf("parsing %s: %v", f, err)
+		}
+		for _, d := range pf.Decls {
+			gd, ok := d.(*ast.GenDecl)
+			if !ok {
+				continue
+			}
+			for _, spec := range gd.Specs {
+				ts, ok := spec.(*ast.TypeSpec)
+				if !ok || ts.Name == nil {
+					continue
+				}
+				if _, isIface := ts.Type.(*ast.InterfaceType); isIface {
+					out = append(out, ts.Name.Name)
+				}
+			}
+		}
+	}
+	return out
+}
+
+// concreteTypeNames returns the names of struct types declared in a file, which
+// are the candidate implementations.
+func concreteTypeNames(t *testing.T, file string) []string {
+	t.Helper()
+	fset := token.NewFileSet()
+	pf, err := parser.ParseFile(fset, file, nil, 0)
+	if err != nil {
+		t.Fatalf("parsing %s: %v", file, err)
+	}
+	var out []string
+	for _, d := range pf.Decls {
+		gd, ok := d.(*ast.GenDecl)
+		if !ok {
+			continue
+		}
+		for _, spec := range gd.Specs {
+			if ts, ok := spec.(*ast.TypeSpec); ok && ts.Name != nil {
+				if _, isIface := ts.Type.(*ast.InterfaceType); !isIface {
+					out = append(out, ts.Name.Name)
+				}
+			}
+		}
+	}
+	return out
+}

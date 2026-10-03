@@ -70,7 +70,7 @@ func NewBank(ports []int, selectedID int, staleAfter time.Duration, log *slog.Lo
 	}
 
 	for i, port := range ports {
-		r := NewReceiver(i+1, port, log)
+		r := NewReceiver(i+1, port, staleAfter, log)
 		b.receivers = append(b.receivers, r)
 		b.byID[i+1] = r
 	}
@@ -215,8 +215,11 @@ func (b *Bank) SelectedFix() (domain.Fix, bool) {
 func (b *Bank) Status() []domain.ReceiverStatus {
 	out := make([]domain.ReceiverStatus, 0, len(b.receivers))
 	for _, r := range b.receivers {
-		out = append(out, r.Status(b.staleAfter))
+		out = append(out, r.Status())
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ReceiverID < out[j].ReceiverID })
 	return out
 }
+
+// Shutdown satisfies domain.Shutdown.
+func (b *Bank) Shutdown(ctx context.Context) error { return b.Close() }

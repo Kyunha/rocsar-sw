@@ -22,6 +22,11 @@ type Receiver struct {
 	port int
 	log  *slog.Logger
 
+	// staleAfter is supplied by the Bank at construction. A receiver cannot know
+	// the policy, and a Status() that needed the bound passed in would be a port
+	// whose signature leaked its caller.
+	staleAfter time.Duration
+
 	conn  *net.UDPConn
 	fixes chan domain.Fix
 
@@ -39,13 +44,14 @@ type Receiver struct {
 }
 
 // NewReceiver returns a receiver bound to nothing yet. Call Open.
-func NewReceiver(id, port int, log *slog.Logger) *Receiver {
+func NewReceiver(id, port int, staleAfter time.Duration, log *slog.Logger) *Receiver {
 	return &Receiver{
-		id:    id,
-		port:  port,
-		log:   log.With("receiver", id, "port", port),
-		fixes: make(chan domain.Fix, 64),
-		done:  make(chan struct{}),
+		id:         id,
+		port:       port,
+		staleAfter: staleAfter,
+		log:        log.With("receiver", id, "port", port),
+		fixes:      make(chan domain.Fix, 64),
+		done:       make(chan struct{}),
 	}
 }
 
@@ -174,7 +180,7 @@ func (r *Receiver) SetSelected(v bool) {
 }
 
 // Status reports health for telemetry.
-func (r *Receiver) Status(staleAfter time.Duration) domain.ReceiverStatus {
+func (r *Receiver) Status() domain.ReceiverStatus {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -191,7 +197,10 @@ func (r *Receiver) Status(staleAfter time.Duration) domain.ReceiverStatus {
 		// An old fix is worse than no fix. Reported false even though the last
 		// decoded value was valid, because that is the situation where an
 		// operator is most likely to trust a stale number.
-		st.FixOK = r.lastFix.Valid() && st.FixAge <= staleAfter
+		st.FixOK = r.lastFix.Valid() && st.FixAge <= r.staleAfter
 	}
 	return st
 }
+
+// Shutdown satisfies domain.Shutdown.
+func (r *Receiver) Shutdown(ctx context.Context) error { return r.Close() }
