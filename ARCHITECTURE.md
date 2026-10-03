@@ -450,20 +450,64 @@ absent or complete — which is the property that actually matters.
 | `camera` | the V4L2 device | touch the network |
 | `sdr` | the child process, `params.json` | block the command path |
 | `telemetry` | the 1 Hz ticker | perform I/O in assembly |
-| `zmq-router` | **all** ZMQ sockets | call anything but the command handler |
+| `zmq-control` | the ROUTER socket | touch the PUB socket |
+| `zmq-publish` | the PUB socket | touch the ROUTER socket |
 | `qos` | the priority queue | spawn a process except `tc` |
 
-Two invariants:
+Three invariants:
 
 1. **No goroutine mutates shared state directly.** Everything goes through a
-   command or the event bus. This is what makes the system debuggable: there is
+   command or a channel. This is what makes the system debuggable: there is
    exactly one place where a transition happens.
-2. **All ZMQ sockets are owned by one goroutine.** A ZeroMQ socket is not
-   thread-safe, and the failure mode of sharing one is a corrupted message stream
-   that looks like a network problem. Everything else talks to it over channels.
 
-`context.Context` is the shutdown mechanism throughout. There are no ad-hoc
-goroutine kills.
+2. **One goroutine per socket — never two on one, and never one for all.** A
+   ZeroMQ socket is not thread-safe, and the failure mode of sharing one is a
+   corrupted message stream that presents as a network fault. This was originally
+   written as "all sockets on one goroutine", which is *also* safe, and which is
+   what the first implementation did.
+
+3. **Command handling blocks the control socket** for its duration. Acceptable
+   because the slowest thing a handler does is the Pico acknowledgement timeout,
+   bounded at 500 ms, and there is a single operator. A handler that blocked
+   indefinitely would stop the Ground Station commanding anything at all, so this
+   is a constraint to respect rather than a detail.
+
+### 7.1 Why not one goroutine for both sockets
+
+This is a correction, and the reason is worth recording because the obvious
+design does not work with the chosen library.
+
+`go-zeromq/zmq4` has **no receive timeout**. There is no `SetReadDeadline`, and
+`WithTimeout` — which looks as though it would cover it — bounds only `Send`.
+`Recv` derives a plain cancellable context with no deadline, so it blocks until a
+message arrives or the socket is closed.
+
+A single loop that drained the publish queue and then called `Recv` would
+therefore publish **nothing** while no command was inbound: with a 1 Hz
+telemetry stream and an idle operator, telemetry would never leave the process.
+Polling is not available and cannot be added from outside the library.
+
+Hence two goroutines, one per socket, and sockets are closed rather than
+interrupted to shut the receive loop down.
+
+### 7.2 Router frame layout
+
+Asymmetric, and measured against real sockets rather than assumed from the ZMTP
+pattern:
+
+| Direction | Frames on the wire |
+| :--- | :--- |
+| Arriving at the ROUTER | `[sender identity, <empty>, payload]` |
+| Sent from the ROUTER | `[destination identity, payload]` |
+
+The first frame of a `Send` is consumed as routing and is **not** put on the
+wire, so a DEALER peer receives the payload alone. A reply is built with
+`NewMsgFrom(identity, payload)` — passing an extra empty delimiter, as the
+REQ/REP pattern suggests, sends one fewer frame than expected and the peer reads
+the wrong thing.
+
+`context.Context` is the shutdown mechanism throughout, with sockets closed to
+release a blocked `Recv`. There are no ad-hoc goroutine kills.
 
 ---
 
