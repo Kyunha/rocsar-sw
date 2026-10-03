@@ -1,0 +1,37 @@
+version: v2
+
+# One schema, three generators. The Go and Python outputs are the same wire
+# format as the C output; there is no second contract to keep in sync.
+#
+# The nanopb plugin is the vendored binary, referenced by path rather than
+# fetched from the BSR, for two reasons: the build works with no network, and
+# nanopb stays pinned to the version the firmware was validated against. A
+# remote `buf.build/nanopb/nanopb:vX` would silently move under us.
+#
+# NOTE: firmware generation is a SEPARATE invocation over an explicit file list
+# (scripts/generate.sh), not a plugin line here. That is what stops
+# command.proto and telemetry.proto -- the Ground Station schemas -- from
+# producing C structs that end up compiled into the RP2040 binary.
+
+managed:
+  enabled: false
+
+plugins:
+  - local: protoc-gen-go
+    out: api
+    opt:
+      - paths=source_relative
+
+  # Python via the BSR rather than a local `protoc-gen-python`. The C and Go
+  # targets are local and work offline; there is no maintained standalone
+  # protoc-gen-python binary, and the one that exists needs a protobuf runtime
+  # installed, which the Ground Station's build environment does not otherwise
+  # require. This is the only step that needs a network.
+  #
+  # To make the whole pipeline offline, install protoc-gen-python and swap this
+  # for `local: protoc-gen-python` -- the out/opt are identical.
+  - remote: buf.build/protocolbuffers/python
+    out: gs
+
+# No `input:` here. In buf v2 the input is the workspace's `modules:` list in
+# buf.yaml, and declaring it in both places is an error rather than a default.

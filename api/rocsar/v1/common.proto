@@ -1,0 +1,93 @@
+syntax = "proto3";
+
+// Shared vocabulary for both links: the Pico <-> OBC link and the
+// Ground Station <-> OBC link. This file is one of the two the RP2040 is
+// allowed to compile -- see ARCHITECTURE.md 4.4.
+package rocsar.v1;
+
+option go_package = "github.com/rocsar/obc/api/rocsar/v1;rocsarv1";
+
+// Every failure the OBC can report back to a caller.
+//
+// ERROR_NONE is 0 and the host keys its success/failure decision off
+// `CommandResponse.success`, not off this enum. The enum is for the operator
+// reading a log; the boolean is for the code making a decision.
+enum ErrorCode {
+  ERROR_NONE = 0;
+  ERROR_INVALID_COMMAND = 1;
+  ERROR_INVALID_PARAMETER = 2;
+  ERROR_INVALID_SERVO = 3;
+  ERROR_INVALID_HEATER = 4;
+  ERROR_NOT_CONNECTED = 5;
+  ERROR_UNSUPPORTED = 6;
+  ERROR_HARDWARE_FAULT = 7;
+  ERROR_INTERNAL = 8;
+
+  // ERROR_BUSY / NOT_READY were defined at 9..13 in an earlier draft and are
+  // reserved rather than deleted. Nothing ever produced or read them -- there
+  // is no code path that reports "busy" -- and reserving the numbers means a
+  // future author who wants one must take the reservation off deliberately
+  // instead of silently reusing a value a deployed host may already parse.
+  reserved 9 to 13;
+}
+
+// Whether the three servo feedback fields above it are a measurement.
+//
+// Declared as an enum for the Ground Station, which wants to switch on it.
+// Carried on the wire as int32 in AntennaTelemetry.feedback_state, and the
+// difference is deliberate: an unknown value from a future firmware decodes to
+// a plain integer on an old host instead of failing the whole frame.
+enum FeedbackState {
+  // The servo has never answered. Position/load/temp are a command echo and
+  // init-time constants; nothing has been measured and nothing can be.
+  FEEDBACK_UNKNOWN = 0;
+  // The ST3215 answered this read. The numbers are real.
+  FEEDBACK_MEASURED = 1;
+  // It answered, then stopped. The numbers are the last real reading, stale.
+  FEEDBACK_HELD = 2;
+}
+
+// Health of one hardware or software subsystem, for the telemetry frame.
+enum SubsystemState {
+  SUBSYSTEM_UNSPECIFIED = 0;
+  SUBSYSTEM_DISCONNECTED = 1;
+  SUBSYSTEM_READY = 2;
+  SUBSYSTEM_BUSY = 3;
+  SUBSYSTEM_ERROR = 4;
+}
+
+// One antenna axis, as the flight controller sees it.
+//
+// Two design decisions here are load-bearing and were both learned on the bench,
+// not in review. Neither may be "simplified" away.
+//
+// 1. feedback_state and feedback_error are int32, not their enums. See
+//    FeedbackState above and the note in pico.proto.
+// 2. load and temperature_c are real register reads. They used to be constants
+//    written once at init, which made a dead servo indistinguishable from an
+//    idle one. A console showing zeros for a motor that has not moved is worse
+//    than a console showing nothing, because zeros look like data.
+message AntennaTelemetry {
+  uint32 servo_id = 1;
+  bool manual_mode = 2;
+
+  // Live feedback from the ST3215 status registers.
+  uint32 current_tick = 3;
+  float current_angle_deg = 4;
+  int32 load = 5;
+  int32 temperature_c = 6;
+
+  // Configuration state, echoed from the flight controller.
+  uint32 center_tick = 7;
+  float mount_offset_deg = 8;
+  float dir_multiplier = 9;
+
+  // 0 unknown, 1 measured, 2 held. See FeedbackState.
+  int32 feedback_state = 10;
+
+  // The ST3215's own status byte from the same read, 0 == ERROR_NONE.
+  // Independent of feedback_state: a servo can answer a perfectly well-formed
+  // frame while reporting overheat or an overloaded regulator. This byte used
+  // to be parsed by nothing and discarded, so a servo in trouble read clean.
+  int32 feedback_error = 11;
+}

@@ -1,0 +1,17 @@
+version: v2
+# Module root for the `rocsar` buf module. The import path rocsar/v1/*.proto
+# comes from the directory layout below this file.
+#
+# Two things are deliberately absent:
+#
+#   name:   A v2 module name must be a fully-qualified BSR name
+#          (registry/owner/name). A bare "rocsar" makes buf fail to parse this
+#          file, and it then falls back to default lint rules *silently* --
+#          which looks exactly like your exceptions being ignored.
+#
+#   lint:   The workspace root's buf.yaml holds the lint and breaking config,
+#          because `buf lint` run from the root uses that and ignores this one.
+#          Keeping a second copy here would be two homes for one fact.
+lint:
+  use:
+    - DEFAULT

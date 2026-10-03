@@ -1,0 +1,16 @@
+# nanopb codegen options for the RP2040.
+#
+# nanopb resolves this file by convention: `<proto filename minus .proto>.options`,
+# sitting beside the proto it configures. A file named after the *package*
+# (rocsar.options) is silently ignored, and the symptom is a `repeated` field
+# generated as a pointer -- which is how the RP2040's RAM stops being
+# budgetable at build time. Do not rename this file.
+#
+# Two antennas is a hardware fact, not a default. There are two gimbal axes.
+#
+# This file configures pico.proto only. command.proto and telemetry.proto are
+# not compiled for the firmware at all -- see scripts/generate.sh and
+# ARCHITECTURE.md 4.4 -- so they need no options file, and adding one would be
+# a sign that a ground-station message is on its way to the flight controller.
+
+rocsar.v1.PicoTelemetry.antennas max_count:2

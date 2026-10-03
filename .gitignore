@@ -1,0 +1,22 @@
+# buf generate writes these. The Python and C outputs ARE committed -- the GS
+# must install on a laptop with no toolchain, and the Arduino build compiles by
+# folder proximity so firmware/*.c must exist on disk.
+/api/rocsar/v1/*.pb.go
+
+# Vendored upstream, pinned, not ours to reformat.
+third_party/
+
+# Build output
+/obc
+*.test
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Per-machine config overrides rocsar.toml
+rocsar.local.toml
+
+# Runtime data
+/data/

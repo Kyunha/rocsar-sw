@@ -1,0 +1,124 @@
+syntax = "proto3";
+
+// Ground Station -> OBC commands.
+//
+// EXCLUDED from RP2040 firmware generation. The firmware learns new struct
+// shapes through gondola_model.h, not through this file -- see ARCHITECTURE.md
+// 4.4. If you find yourself wanting to add a message here that the firmware
+// would have to carry, the answer is almost always "the OBC should translate
+// it" and never "the firmware should learn a new message".
+package rocsar.v1;
+
+import "rocsar/v1/common.proto";
+import "rocsar/v1/pico.proto";
+
+option go_package = "github.com/rocsar/obc/api/rocsar/v1;rocsarv1";
+
+// ---------------------------------------------------------------------------
+// SDR
+// ---------------------------------------------------------------------------
+
+// Partial update of parameters/params.json. Every field is optional: an absent
+// field means "leave it alone", which is why this is `optional` and not a
+// zero. A PRF of 0 is not a request to set PRF to 0.
+//
+// Validation happens host-side before the write. The JSON is a frozen contract
+// with the vendored C++ program and a value it cannot use is a bricked SDR, not
+// a runtime error.
+message SdrParams {
+  optional double prf_hz = 1;
+  optional double sample_rate_hz = 2;
+  optional double tx_freq_hz = 3;
+  optional double normalized_gain_tx = 4;
+  optional double normalized_gain_rx = 5;
+  optional double pulse_duration_s = 6;
+  optional double bandwidth_hz = 7;
+  optional uint32 session_duration_s = 8;
+}
+
+message SdrConnectCommand {}
+
+message SdrSetParamsCommand {
+  SdrParams params = 1;
+}
+
+message SdrResetUSBCommand {}
+
+message SdrProbeCommand {}
+
+// ---------------------------------------------------------------------------
+// Camera
+// ---------------------------------------------------------------------------
+
+message TakePhotoCommand {}
+
+// ---------------------------------------------------------------------------
+// GNSS receiver bank
+// ---------------------------------------------------------------------------
+
+// Make receiver_id the selected one. Selection is explicit and never automatic;
+// `mode` on GnssSelectCommand exists only to rotate deliberately.
+message GnssSelectCommand {
+  uint32 receiver_id = 1;
+  bool rotate = 2;
+}
+
+// ---------------------------------------------------------------------------
+// Link shaping
+// ---------------------------------------------------------------------------
+
+message LinkSetLimitCommand {
+  uint32 rate_kbps = 1;
+}
+
+// ---------------------------------------------------------------------------
+// System
+// ---------------------------------------------------------------------------
+
+message SystemResetCommand {}
+
+message QueryStatusCommand {}
+
+// ---------------------------------------------------------------------------
+// The envelope.
+// ---------------------------------------------------------------------------
+
+// One frame from the Ground Station.
+//
+// `pico` is a nested message that has its own oneof, rather than the eight
+// servo commands being flattened into this oneof alongside the system commands.
+// Flattening would put 16 unrelated commands in one flat list, and the
+// discriminating information ("this is a Pico command, and which one") would
+// stop being structural.
+message CommandRequest {
+  // Chosen by the Ground Station and echoed in CommandResponse. Without it a
+  // reply cannot be matched to the control that caused it.
+  string request_id = 1;
+
+  oneof payload {
+    PicoCommand pico = 2;
+    SdrConnectCommand sdr_connect = 3;
+    SdrSetParamsCommand sdr_set_params = 4;
+    SdrResetUSBCommand sdr_reset_usb = 5;
+    SdrProbeCommand sdr_probe = 6;
+    TakePhotoCommand take_photo = 7;
+    GnssSelectCommand gnss_select = 8;
+    LinkSetLimitCommand link_set_limit = 9;
+    SystemResetCommand system_reset = 10;
+    QueryStatusCommand query_status = 11;
+  }
+}
+
+message CommandResponse {
+  string request_id = 1;
+  bool success = 2;
+  ErrorCode error = 3;
+  string message = 4;
+
+  // For take_photo: where the operator should fetch the bytes. The image is
+  // never carried in the response -- it goes over HTTP :5557. Constraint H1 in
+  // ARCHITECTURE.md is why this field is a name and not bytes.
+  optional string artefact_name = 5;
+  optional uint64 artefact_size_bytes = 6;
+  optional string artefact_kind = 7;
+}

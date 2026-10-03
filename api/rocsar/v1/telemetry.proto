@@ -1,0 +1,105 @@
+syntax = "proto3";
+
+// The 1 Hz aggregate, OBC -> Ground Station.
+//
+// EXCLUDED from RP2040 firmware generation -- see ARCHITECTURE.md 4.4.
+package rocsar.v1;
+
+import "rocsar/v1/common.proto";
+import "rocsar/v1/pico.proto";
+
+option go_package = "github.com/rocsar/obc/api/rocsar/v1;rocsarv1";
+
+// Where a GNSS receiver stands, independent of whether it is the selected one.
+// All three are reported so the operator can see the redundancy working, and
+// knows which one is trusted.
+message GnssReceiverStatus {
+  uint32 receiver_id = 1;
+  bool selected = 2;
+
+  // Set false once the last fix is older than gnss_stale_after. An old fix is
+  // worse than no fix, and a stale-but-valid coordinate is the case a boolean
+  // cannot distinguish from a live one.
+  bool fix_ok = 3;
+  double latitude_deg = 4;
+  double longitude_deg = 5;
+  double altitude_m = 6;
+  double ground_speed_mps = 7;
+  double course_deg = 8;
+  uint32 satellites = 9;
+
+  // Seconds since the last accepted datagram, and -1 if there never was one.
+  // Negative and zero are different states and are not collapsed.
+  double fix_age_s = 10;
+
+  uint64 packets_accepted = 11;
+  uint64 packets_rejected = 12;
+}
+
+message SdrStatus {
+  SubsystemState state = 1;
+  bool running = 2;
+
+  // -1 when no acquisition has ever run.
+  int64 pid = 3;
+  optional string last_log = 4;
+  optional string last_error = 5;
+  optional string last_output_file = 6;
+}
+
+message CameraStatus {
+  SubsystemState state = 1;
+  optional string device = 2;
+  optional string last_photo_name = 3;
+  optional uint64 photos_taken = 4;
+}
+
+message LinkStatus {
+  SubsystemState state = 1;
+  string device = 2;
+  uint32 rate_kbps = 3;
+  uint32 priority_kbps = 4;
+  bool shaping_active = 5;
+
+  // Why shaping is off, when it is. "tc unavailable" and "no permission" and
+  // "shaping disabled by config" are three different operator actions and
+  // collapsing them into a bool sends someone to debug the wrong thing.
+  optional string inactive_reason = 6;
+}
+
+message SystemStatus {
+  SubsystemState state = 1;
+  double uptime_s = 2;
+  double cpu_temp_c = 3;
+
+  // True when SubsystemState says READY but the value came from a mock. A
+  // system that fabricates telemetry because a device was not found is the
+  // worst failure mode this project has; making it visible in the wire is the
+  // defence. See ARCHITECTURE.md 9.
+  repeated string mocked_subsystems = 4;
+}
+
+message TelemetryFrame {
+  // Monotonic, gaps detected by the Ground Station. A frame that goes backwards
+  // means the OBC restarted, which is a different event from a skipped frame
+  // and the client treats them differently.
+  uint64 sequence = 1;
+  double generated_at_unix = 2;
+
+  SystemStatus system = 3;
+
+  // The selected receiver's fix is the first entry with selected == true; the
+  // rest are health only.
+  repeated GnssReceiverStatus gnss = 4;
+
+  PicoTelemetry pico = 5;
+  bool pico_connected = 6;
+
+  // Populated only when the Pico has ever answered. Absent means "we have never
+  // heard from it", which is different from "it answered and this is zero".
+  optional PicoAck pico_last_ack = 7;
+
+  SdrStatus sdr = 8;
+  CameraStatus camera = 9;
+  LinkStatus link = 10;
+}

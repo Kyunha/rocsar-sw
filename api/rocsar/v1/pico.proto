@@ -1,0 +1,117 @@
+syntax = "proto3";
+
+// The Raspberry Pi <-> RP2040 flight controller link.
+//
+// This is the ONLY file the RP2040 compiles from (with common.proto). Ground
+// Station messages live in command.proto and telemetry.proto and are excluded
+// from firmware generation by name -- see ARCHITECTURE.md 4.4.
+//
+// Field names and numbers are identical to the schema the shipped firmware was
+// built against, so gondola_model.h and rocsar_pico.ino port with mechanical
+// renames only. Do not renumber these fields; a field number is the wire.
+package rocsar.v1;
+
+import "rocsar/v1/common.proto";
+
+option go_package = "github.com/rocsar/obc/api/rocsar/v1;rocsarv1";
+
+// ---------------------------------------------------------------------------
+// OBC -> Pico. The oneof IS the discriminant: there is no `kind` string that
+// can disagree with the payload it describes.
+// ---------------------------------------------------------------------------
+
+message SetTargetCommand {
+  float target_heading_deg = 1;
+}
+
+// Absolute tick, valid 0..4095, in manual mode for that axis.
+message JogCommand {
+  uint32 servo_id = 1;
+  uint32 tick = 2;
+}
+
+// Return an axis to its mechanical centre (center_tick).
+message ZeroCommand {
+  uint32 servo_id = 1;
+}
+
+message MountCommand {
+  uint32 servo_id = 1;
+  float offset_deg = 2;
+}
+
+// Direction multiplier. Only +1.0 and -1.0 are legal; anything else is a
+// parameter error, checked host-side before it reaches the wire.
+message DirCommand {
+  uint32 servo_id = 1;
+  float multiplier = 2;
+}
+
+message HeaterCommand {
+  uint32 heater_id = 1;
+  bool state = 2;
+}
+
+message StopCommand {
+  uint32 servo_id = 1;
+}
+
+message StatusRequestCommand {}
+
+message PicoCommand {
+  uint32 sequence = 1;
+
+  oneof payload {
+    SetTargetCommand set_target = 2;
+    JogCommand jog = 3;
+    ZeroCommand zero = 4;
+    MountCommand mount = 5;
+    DirCommand dir = 6;
+    HeaterCommand heater = 7;
+    StopCommand stop = 8;
+    StatusRequestCommand status_request = 9;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Pico -> OBC: acknowledgement. One per PicoCommand, echoed command_sequence.
+// ---------------------------------------------------------------------------
+
+message PicoAck {
+  uint32 command_sequence = 1;
+  bool success = 2;
+  ErrorCode error = 3;
+}
+
+// ---------------------------------------------------------------------------
+// Pico -> OBC: telemetry, emitted once per 50 Hz control tick.
+// ---------------------------------------------------------------------------
+
+message PicoTelemetry {
+  float gondola_heading_deg = 1;
+  float target_heading_deg = 2;
+  bool heater1_state = 3;
+  bool heater2_state = 4;
+  repeated AntennaTelemetry antennas = 5;
+
+  // Whether gondola_heading_deg is a measurement. False when no BNO055 is
+  // fitted, in which case the heading is the last bearing *held* rather than a
+  // reading, and the two are indistinguishable without this bit. A blank proto3
+  // frame defaults to false, so a frame from a firmware predating this field
+  // reads as "no measurement", which is the honest reading of one.
+  bool imu_present = 6;
+}
+
+// ---------------------------------------------------------------------------
+// The COBS payload. One frame, one direction-agnostic envelope.
+// ---------------------------------------------------------------------------
+
+message PicoMessage {
+  uint32 sequence = 1;
+  uint64 timestamp_us = 2;
+
+  oneof payload {
+    PicoAck ack = 3;
+    PicoTelemetry telemetry = 4;
+  }
+}

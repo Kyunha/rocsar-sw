@@ -1,0 +1,45 @@
+# buf workspace.
+#
+# Lint and breaking configuration lives HERE, not in api/buf.yaml. Running `buf
+# lint` from this directory uses this file's config and ignores the per-module
+# one, so a rule excepted in two places is a rule excepted in one place and
+# apparently not the other. One home for the fact.
+version: v2
+modules:
+  - path: api
+
+lint:
+  use:
+    - STANDARD
+  except:
+    # The package is rocsar.v1 but the files live at rocsar/v1/. The directory
+    # already encodes the version, which is the point of the layout.
+    - PACKAGE_DIRECTORY_MATCH
+
+    # The enum value names in this schema are a frozen contract with the C
+    # target, not a naming preference. `gondola_model.h` and the ST3215 status
+    # path reference `rocsarv1_ErrorCode_ERROR_NONE` by name, and
+    # `FeedbackState`'s zero value is `FEEDBACK_UNKNOWN` -- which means "this
+    # servo has never answered", a *meaningful* state that an `_UNSPECIFIED`
+    # suffix would erase by merging it with "no value set".
+    #
+    # The convention exists to stop two enums colliding and to keep "unset"
+    # distinguishable from "set to the default". Both risks are already handled
+    # explicitly: the names are package-prefixed in C, and the zero values that
+    # need an unset state have one. Renaming them would churn the firmware for
+    # no gain and would lose a real distinction.
+    - ENUM_VALUE_PREFIX
+    - ENUM_ZERO_VALUE_SUFFIX
+
+breaking:
+  use:
+    - FILE
+  except:
+    # Field numbers in pico.proto are the wire, and they match the schema the
+    # shipped RP2040 firmware was built against. A "safe" renumbering is a field
+    # reorder, which on a `oneof` is a silent behaviour change on a device we
+    # cannot easily reach in flight. Changing a pico.proto field number is a
+    # firmware reflash and should be a deliberate, obvious act.
+    - FIELD_NO_DELETE
+    - FIELD_SAME_TYPE
+    - FIELD_SAME_NAME
