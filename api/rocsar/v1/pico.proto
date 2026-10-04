@@ -6,9 +6,54 @@ syntax = "proto3";
 // Station messages live in command.proto and telemetry.proto and are excluded
 // from firmware generation by name -- see ARCHITECTURE.md 4.4.
 //
-// Field names and numbers are identical to the schema the shipped firmware was
-// built against, so gondola_model.h and rocsar_pico.ino port with mechanical
-// renames only. Do not renumber these fields; a field number is the wire.
+// Porting note -- READ BEFORE PORTING THE FIRMWARE
+// ================================================
+//
+// This schema is NOT field-number compatible with the one the shipped firmware
+// was built against. An earlier version of this comment claimed it was, and
+// that claim was false in both halves. It is reproduced here because someone
+// will otherwise trust it and skip a step that matters.
+//
+// The shipped flight controller was built against `pico_protocol.proto`, which
+// numbered these oneofs from 10. This file numbers them from 2:
+//
+//   PicoCommand.payload    set_target  10 -> 2     jog      11 -> 3
+//                          zero        12 -> 4     mount    13 -> 5
+//                          dir         14 -> 6     heater   15 -> 7
+//                          stop        16 -> 8     status_request 17 -> 9
+//   PicoMessage.payload    ack          10 -> 3     telemetry 11 -> 4
+//
+// And in AntennaTelemetry, two fields swapped places -- same names, same types,
+// different numbers:
+//
+//   temperature_c    5 -> 6
+//   load             6 -> 5
+//
+// What is genuinely mechanical:
+//
+//   - The message renames: CommandMessage -> PicoCommand, CommandResponse ->
+//     PicoAck, TelemetryMessage -> PicoTelemetry, and every
+//     `telemetry_system_pico_*` symbol -> `rocsar_v1_*`.
+//   - ErrorCode 0..4 kept their numbers (ERROR_NONE, ERROR_INVALID_COMMAND,
+//     ERROR_INVALID_PARAMETER, ERROR_INVALID_SERVO, ERROR_INVALID_HEATER), so
+//     error mapping needs no table. Codes 5..8 were reserved in the old schema
+//     and carry meaning here.
+//
+// What is NOT mechanical, and is the whole reason this note exists:
+//
+//   - Assign fields by NAME, never by number. The regenerated pico.pb.h makes
+//     the new numbering correct by construction, so a build against it is
+//     right; anything hand-numbered is wrong in a way that compiles.
+//   - The load/temperature_c swap is the dangerous one, because both are int32
+//     and both survive a wire round trip. Reading `load` where the firmware
+//     wrote `temperature_c` reports a servo at -100% load and 85 C at the same
+//     time, and neither value is out of range for its type.
+//   - A stale pico_protocol.pb.h left in the sketch folder compiles happily and
+//     produces a link that passes every host test and sends frames the flight
+//     controller cannot parse. `firmware/` must contain the generated header
+//     from THIS schema and no other.
+//
+// A field number is the wire. Do not renumber these fields.
 package rocsar.v1;
 
 import "rocsar/v1/common.proto";

@@ -67,9 +67,23 @@ typedef enum _rocsar_v1_SubsystemState {
 typedef struct _rocsar_v1_AntennaTelemetry {
     uint32_t servo_id;
     bool manual_mode;
-    /* Live feedback from the ST3215 status registers. */
+    /* Live feedback from the ST3215 status registers.
+
+ `current_tick` is a MEASUREMENT of where the encoder is, not an echo of the
+ last commanded tick. It used to be the echo, and the change is silent: both
+ are a uint32 near 2048. A client that treats it as the command is wrong by
+ exactly the tracking error, which is small when the axis is tracking and
+ large when it is stalled -- which is precisely when nobody is looking.
+
+ The three are read from register P6, not synthesised. See the note on
+ feedback_state below for what happens when a servo does not answer. */
     uint32_t current_tick;
     float current_angle_deg;
+    /* Real register reads, and they arrived here in the opposite order to the
+ shipped firmware: temperature_c was 5 and load was 6 there, and they are
+ swapped here. Both are int32 and both survive a round trip, so a stale
+ header produces a servo reporting -100% load at 85 C rather than an error.
+ See the porting note at the top of pico.proto. */
     int32_t load;
     int32_t temperature_c;
     /* Configuration state, echoed from the flight controller. */
