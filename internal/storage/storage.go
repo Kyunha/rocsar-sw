@@ -235,7 +235,11 @@ func sortEntries(e []Entry) {
 }
 
 var (
-	cameraName = regexp.MustCompile(`^cam-.*\.(jpg|jpeg)$`)
+	// `cam` or `camera`: NameFor(storage.KindCamera, ...) produces
+	// "camera-20261003-142530.jpg", which the narrower `^cam-` did NOT match --
+	// "cam" followed by "era", not by "-". Every photograph the system took was
+	// therefore classified `unknown` and listed as such.
+	cameraName = regexp.MustCompile(`^cam(era)?-.*\.(jpg|jpeg)$`)
 	// The vendored program writes `Data/rx_data_<localtime>.bin`, so the
 	// timestamp is part of the stem and the pattern has to allow for it. An
 	// earlier version anchored `rx_data` directly against the extension and
@@ -281,12 +285,26 @@ func (s *Store) FreeSpace() (uint64, error) {
 	return uint64(st.Bavail) * uint64(st.Bsize), nil
 }
 
-// NameFor builds a sortable, unique artefact name: "<kind>-<timestamp>.<ext>".
+// NameFor builds a sortable artefact name: "<kind>-<timestamp>.<ext>".
 //
 // The timestamp is local and formatted for lexical ordering, which is why it is
 // not RFC3339. `camera-20261003-142530.jpg` sorts correctly as a plain string
 // comparison; `camera-2026-10-03T14:25:30Z.jpg` does not compare usefully
 // against anything.
+//
+// UNIQUE only to the second. Two captures inside one second produce the same
+// name and the second overwrites the first. That is accepted: the alternative is
+// sub-second precision, which reads badly and sorts no better, and an operator
+// taking two photographs of the same thing a second apart has almost certainly
+// taken the same photograph twice. A caller that needs distinct names must add
+// its own discriminator -- see camera.Mock, which does.
 func NameFor(kind, ext string) string {
 	return fmt.Sprintf("%s-%s.%s", kind, time.Now().Format("20060102-150405"), ext)
+}
+
+// UniqueNameFor is NameFor with a caller-supplied discriminator, for the case
+// where two artefacts of the same kind in the same second really are different
+// things.
+func UniqueNameFor(kind, discriminator, ext string) string {
+	return fmt.Sprintf("%s-%s-%s.%s", kind, discriminator, time.Now().Format("20060102-150405"), ext)
 }

@@ -176,3 +176,64 @@ func TestFreeSpaceReportsSomethingPlausible(t *testing.T) {
 		t.Errorf("FreeSpace returned %d bytes, which is implausible", free)
 	}
 }
+
+// Regression: NameFor(storage.KindCamera, "jpg") produces "camera-<ts>.jpg",
+// and the classifier's pattern was `^cam-.*\.jpg$`. "cam" is followed by "era",
+// not by "-", so it did not match. Every photograph the system wrote was
+// classified `unknown` and every listing said `unknown` instead of `camera`.
+//
+// Nothing failed loudly. The file was written, served over HTTP with
+// Content-Type: image/jpeg, and described as unknown -- which is exactly the
+// combination that makes you doubt your own eyes.
+func TestPhotographNamesClassifyAsCamera(t *testing.T) {
+	for _, ext := range []string{"jpg", "jpeg"} {
+		name := NameFor(KindCamera, ext)
+
+		if got := KindOf(name, false); got != KindCamera {
+			t.Errorf("KindOf(%q) = %q, want %q", name, got, KindCamera)
+		}
+	}
+}
+
+// The name the system actually produced must classify, not just the one built
+// here, or this test only proves NameFor and KindOf agree with each other.
+func TestRealCameraArtefactNamesClassify(t *testing.T) {
+	// The strings NameFor has actually produced in the field.
+	for _, name := range []string{
+		"camera-20261003-142530.jpg",
+		"camera-20251003-142530.jpeg",
+		"camera-mock1-20261003-142530.jpg", // the mock's discriminated form
+	} {
+		if got := KindOf(name, false); got != KindCamera {
+			t.Errorf("KindOf(%q) = %q, want %q", name, got, KindCamera)
+		}
+	}
+
+	// And the ones that must not be swept up by a widened pattern.
+	for _, name := range []string{
+		"camera.log",
+		"cam-20261003-142530.txt",
+		"campfire-20261003.jpg",
+		"scan-20261003-142530.jpg",
+	} {
+		if got := KindOf(name, false); got == KindCamera {
+			t.Errorf("KindOf(%q) = %q; it is not a photograph", name, got)
+		}
+	}
+}
+
+// UniqueNameFor exists because NameFor is only unique to the second. Two
+// captures in one second overwrite each other, which is acceptable for a
+// photograph but not for anything a test needs to tell apart.
+func TestUniqueNameForSeparatesTheSameSecond(t *testing.T) {
+	a := UniqueNameFor(KindCamera, "mock1", "jpg")
+	b := UniqueNameFor(KindCamera, "mock2", "jpg")
+
+	if a == b {
+		t.Fatalf("two names from the same second collided: %q", a)
+	}
+	if got := KindOf(a, false); got != KindCamera {
+		t.Errorf("KindOf(%q) = %q, want %q -- the discriminator must not break classification",
+			a, got, KindCamera)
+	}
+}

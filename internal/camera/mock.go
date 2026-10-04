@@ -3,6 +3,7 @@ package camera
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"image"
 	"image/color"
 	"image/jpeg"
@@ -76,7 +77,11 @@ func (m *Mock) Capture(ctx context.Context) (*domain.Photo, error) {
 		return nil, err
 	}
 
-	name := storage.NameFor(storage.KindCamera, "jpg")
+	// The shot number is in the name so two captures in the same second do not
+	// collide and overwrite each other. It is also what makes the returned name
+	// usable for telling two mock photographs apart.
+	name := storage.UniqueNameFor(storage.KindCamera,
+		fmt.Sprintf("mock%d", m.shots), "jpg")
 	sub, err := m.store.Sub(m.dir)
 	if err != nil {
 		return nil, err

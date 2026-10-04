@@ -1,12 +1,18 @@
 package test
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
+	"image/jpeg"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/rocsar/obc/internal/camera"
 	"github.com/rocsar/obc/internal/storage"
 	"github.com/rocsar/obc/internal/transport"
 )
@@ -286,4 +292,56 @@ func bytesEqual(a, b []byte) bool {
 		}
 	}
 	return true
+}
+
+// camera_bench's whole addition over the server is decoding the JPEG it just
+// wrote and checking the result. This does that against the mock, which produces
+// a real JPEG rather than bytes that happen to be called one.
+//
+// A camera that ignores S_FMT and hands back raw pixels would be written to the
+// data directory, served over HTTP with Content-Type: image/jpeg, and reported
+// as a successful capture by every layer above. Only decoding it catches that.
+func TestCameraMockProducesADecodableJPEG(t *testing.T) {
+	dir := t.TempDir()
+	store := storage.New(dir)
+
+	cam := camera.NewMock("/dev/video0", "photos", store)
+
+	photo, err := cam.Capture(context.Background())
+	if err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+
+	body, err := os.ReadFile(filepath.Join(dir, photo.Path))
+	if err != nil {
+		t.Fatalf("the photograph is not where it said it was: %v", err)
+	}
+	if len(body) != int(photo.SizeBytes) {
+		t.Errorf("SizeBytes says %d, the file is %d", photo.SizeBytes, len(body))
+	}
+
+	img, err := jpeg.Decode(bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("%d bytes that are not a decodable JPEG: %v", len(body), err)
+	}
+	if b := img.Bounds(); b.Dx() < 16 || b.Dy() < 16 {
+		t.Errorf("the JPEG is %dx%d, which is not a usable photograph", b.Dx(), b.Dy())
+	}
+
+	// Two captures must be distinguishable, which is what makes this useful for
+	// checking that the fetch path serves the file the caller asked for.
+	second, err := cam.Capture(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Name == photo.Name {
+		t.Error("two captures produced the same name")
+	}
+	secondBody, err := os.ReadFile(filepath.Join(dir, second.Path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(body, secondBody) {
+		t.Error("two captures produced identical bytes; they cannot be told apart on the wire")
+	}
 }

@@ -201,6 +201,18 @@ func (s *Service) SetParams(ctx context.Context, patch domain.SdrParamsPatch) er
 	raw["BW"] = current.BandwidthHz
 	raw["SESSION_DURATION"] = current.SessionDurationS
 
+	// The whole file is rewritten, so the diff is the whole file.
+	//
+	// Two things change cosmetically and neither affects the program, which reads
+	// by key with j.at() and does not care about order:
+	//
+	//   - Go marshals a map in sorted key order, so the keys come out
+	//     alphabetically instead of grouped as they were.
+	//   - Floats are re-formatted: 3.64e-05 becomes 0.0000364.
+	//
+	// Preserving the original ordering would mean carrying an ordered key list
+	// through the read, patch and write for no gain the program can see. It is
+	// noted here so a large-looking diff on a one-line change is not a surprise.
 	body, err := json.MarshalIndent(raw, "", "    ")
 	if err != nil {
 		return fmt.Errorf("sdr: encode params.json: %w", err)
