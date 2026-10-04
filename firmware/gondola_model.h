@@ -25,8 +25,8 @@
 #define SERVO_TICK_MAX 4095
 
 // NUM_ANTENNAS and the generated telemetry array must agree, and the generated
-// array's size comes from `antennas max_count:2` in pico_protocol.options --
-// a file nothing in the firmware reads. Bumping one and not the other was
+// array's size comes from `antennas max_count:2` in api/rocsar/v1/pico.options
+// -- a file nothing in the firmware reads. Bumping one and not the other was
 // silent: the mapping loop below wrote antennas[i] for i < NUM_ANTENNAS, so a
 // NUM_ANTENNAS above max_count wrote past the end of a struct it had just filled
 // with init_zero. That is memory corruption on the wire, not a compile error.
@@ -38,8 +38,9 @@
 static_assert(NUM_ANTENNAS <=
                   sizeof(((rocsar_v1_PicoTelemetry*)0)->antennas) /
                       sizeof(((rocsar_v1_PicoTelemetry*)0)->antennas[0]),
-              "NUM_ANTENNAS exceeds TelemetryMessage.antennas max_count in "
-              "shared/pico_protocol.options");
+              "NUM_ANTENNAS exceeds the generated antennas array: "
+              "rocsar.v1.PicoTelemetry.antennas max_count in "
+              "api/rocsar/v1/pico.options");
 
 // EMA weight for the gondola heading. It lives here rather than in the sketch
 // because applyImuHeading() below is where it is used. A second filter declared
