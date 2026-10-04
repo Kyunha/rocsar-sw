@@ -79,11 +79,33 @@ var layerRules = []forbiddenRule{
 	},
 }
 
-// subsystemOwners maps a package that is allowed to use a forbidden import to
-// the reason it may. os/exec in particular is confined to exactly two places,
-// and the count is the point: it is easy to add a third and hard to notice.
+// subsystemOwners maps a package allowed to use a forbidden import to the reason
+// it may. os/exec in particular is confined to a short list, and the list is the
+// point: it is easy to add an entry and hard to notice you have.
+//
+// Adding one here is a decision, not a convenience, so the reason travels with it.
 var subsystemOwners = map[string][]string{
-	"os/exec": {"internal/sdr", "internal/qos"},
+	"os/exec": {
+		// Runs ./connect and reads USB device nodes for the SDR.
+		"internal/sdr",
+		// Runs tc to shape the link.
+		"internal/qos",
+		// Runs fswebcam.
+		//
+		// The third entry, and the only one added by asking rather than by
+		// accident. The hand-written V4L2 path in this package negotiates the
+		// camera correctly and then never receives a frame on the target hardware:
+		// every ioctl succeeds and poll() returns POLLERR immediately after
+		// STREAMON, at every resolution and pixel format, with and without
+		// O_NONBLOCK, S_INPUT or a settle delay, via both mmap/DQBUF and read().
+		// fswebcam photographs the same node at the same moment and works.
+		//
+		// So the working mechanism is used and the built-in one is kept for when
+		// fswebcam is absent. This is the same shape as the qos.Limiter deletion:
+		// code is justified by having a caller and being verified, not by being
+		// written here.
+		"internal/camera",
+	},
 }
 
 func TestLayeringBoundaries(t *testing.T) {

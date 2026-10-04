@@ -12,6 +12,7 @@ import (
 	"image"
 	"image/jpeg"
 	"os"
+	"path/filepath"
 	"sync"
 	"syscall"
 	"time"
@@ -227,6 +228,10 @@ type Capture struct {
 
 	quality int
 
+	// ext photographs by shelling out, and is preferred when present. See
+	// fswebcam.go for why. nil means "use the V4L2 path below".
+	ext *fswebcamCapturer
+
 	mu     sync.Mutex
 	state  domain.SubsystemState
 	shots  uint64
@@ -241,12 +246,24 @@ func NewCapture(device, dir string, store *storage.Store, quality int) *Capture 
 	if quality <= 0 || quality > 100 {
 		quality = 85
 	}
+	// Scratch space for the fswebcam path, which has to write to a file because it
+	// is a separate process. Under the data root rather than /tmp so that a full
+	// or read-only /tmp cannot silently become a capture failure, and so the
+	// scratch file is on the same filesystem as the store, which is what makes
+	// WriteFileAtomic's rename atomic.
+	ext, err := newFswebcamCapturer(device, filepath.Join(os.TempDir(), "rocsar-camera"), nil)
+	if err != nil {
+		// Not installed, or no scratch directory. The built-in V4L2 path stays.
+		ext = nil
+	}
+
 	return &Capture{
 		device:  device,
 		store:   store,
 		dir:     dir,
 		quality: quality,
 		state:   domain.SubsystemDisconnected,
+		ext:     ext,
 	}
 }
 
@@ -294,6 +311,18 @@ func (c *Capture) captureOnce(ctx context.Context) (*domain.Photo, error) {
 		return nil, fmt.Errorf("camera: %s is not present", c.device)
 	}
 
+	// fswebcam first when it is installed. The built-in path below negotiates the
+	// camera correctly and then never receives a frame on this hardware; see
+	// fswebcam.go. Trying it first and falling back would cost every capture a
+	// five-second timeout on the device that is actually in use.
+	if c.ext != nil {
+		body, err := c.ext.Capture(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return c.savePhoto(body)
+	}
+
 	fd, err := syscall.Open(c.device, syscall.O_RDWR|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		return nil, fmt.Errorf("camera: open %s: %w", c.device, err)
@@ -321,6 +350,16 @@ func (c *Capture) captureOnce(ctx context.Context) (*domain.Photo, error) {
 		}
 	}
 
+	return c.savePhoto(buf)
+}
+
+// savePhoto stores JPEG bytes and describes them.
+//
+// Both capture backends end here, so a photograph is classified, named and
+// recorded identically whichever produced it. That matters: the classification
+// bug this project shipped once was a mismatch between what was written and what
+// was reported about it.
+func (c *Capture) savePhoto(buf []byte) (*domain.Photo, error) {
 	name := storage.NameFor(storage.KindCamera, "jpg")
 	sub, err := c.store.Sub(c.dir)
 	if err != nil {
@@ -329,7 +368,6 @@ func (c *Capture) captureOnce(ctx context.Context) (*domain.Photo, error) {
 	if err := sub.WriteFileAtomic(name, buf, 0o644); err != nil {
 		return nil, err
 	}
-
 	return &domain.Photo{
 		Name:      name,
 		SizeBytes: uint64(len(buf)),
