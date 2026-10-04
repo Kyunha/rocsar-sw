@@ -514,8 +514,16 @@ pattern:
 
 | Direction | Frames on the wire |
 | :--- | :--- |
-| Arriving at the ROUTER | `[sender identity, <empty>, payload]` |
+| Arriving at the ROUTER | `[sender identity, payload]` or `[sender identity, <empty>, payload]` |
 | Sent from the ROUTER | `[destination identity, payload]` |
+
+**The payload is the last frame, and the frames before it are envelope.** Both
+arrival forms are legal ZMTP and both must work: a DEALER sending one part
+produces the first, a REQ produces the second. Requiring the empty delimiter
+rejects every peer that follows this table — found by `tools/gs_probe.py`,
+because the Go test client had been sending `NewMsgFrom([]byte(""), body)`,
+hand-rolling the REQ envelope, so the tests passed and the Python Ground Station
+was silently dropped.
 
 The first frame of a `Send` is consumed as routing and is **not** put on the
 wire, so a DEALER peer receives the payload alone. A reply is built with

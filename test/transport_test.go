@@ -371,3 +371,81 @@ func TestPublishOutsideTheLifecycleIsSafe(t *testing.T) {
 
 	cancel()
 }
+
+// A plain DEALER sends one part. The server must answer it.
+//
+// This is the test that would have caught the Ground Station being dropped, and
+// it could not have existed before gs_probe.py: every other test in this file
+// goes through sendRaw, which prepends an empty delimiter and therefore looks
+// like a REQ. A server that required the delimiter passed all of them and
+// rejected the only consumer that matters.
+//
+// Both arrival forms are legal ZMTP -- `[identity, payload]` and
+// `[identity, <empty>, payload]` -- so this is not a case of one client being
+// more correct than another. See ARCHITECTURE.md 7.2.
+func TestPlainDealerSinglePartCommandIsAnswered(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		send func(*dealerClient, []byte) error
+	}{
+		{"dealer, one part", (*dealerClient).sendBare},
+		{"req-style, with delimiter", (*dealerClient).sendRaw},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ports := freePorts(t, 2)
+			control, telemetry := addr(ports[0]), addr(ports[1])
+
+			var calls int
+			z := transport.NewZMQ(quietLogger(),
+				func(req *rocsarv1.CommandRequest) *rocsarv1.CommandResponse {
+					calls++
+					return &rocsarv1.CommandResponse{
+						RequestId: req.GetRequestId(),
+						Success:   true,
+					}
+				})
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			defer z.Stop()
+
+			if err := z.Start(ctx, control, telemetry); err != nil {
+				t.Fatalf("Start: %v", err)
+			}
+			client, err := newDealer(control)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer client.close()
+
+			body, err := proto.Marshal(&rocsarv1.CommandRequest{
+				RequestId: "bare-1",
+				Payload: &rocsarv1.CommandRequest_Pico{
+					Pico: &rocsarv1.PicoCommand{
+						Payload: &rocsarv1.PicoCommand_Zero{Zero: &rocsarv1.ZeroCommand{}},
+					},
+				},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := tc.send(client, body); err != nil {
+				t.Fatal(err)
+			}
+
+			resp, err := client.recv(3 * time.Second)
+			if err != nil {
+				t.Fatalf("no reply: %v -- the ROUTER requires an empty delimiter "+
+					"that a plain DEALER does not send", err)
+			}
+			if !resp.GetSuccess() {
+				t.Errorf("success = false, error = %s", resp.GetError())
+			}
+			if resp.GetRequestId() != "bare-1" {
+				t.Errorf("reply is for %q, want bare-1", resp.GetRequestId())
+			}
+			if calls != 1 {
+				t.Errorf("the handler ran %d times, want 1", calls)
+			}
+		})
+	}
+}

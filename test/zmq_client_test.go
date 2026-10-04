@@ -108,8 +108,19 @@ func (c *dealerClient) send(req *rocsarv1.CommandRequest) error {
 // sendRaw writes bytes that may not be a valid message, to check that the OBC
 // answers rather than drops.
 func (c *dealerClient) sendRaw(body []byte) error {
-	// The DEALER envelope a ROUTER expects: an empty delimiter then the payload.
+	// With the REQ-style envelope: an explicit empty delimiter, then the payload.
 	return c.sock.Send(zmq4.NewMsgFrom([]byte(""), body))
+}
+
+// sendBare sends the payload as a SINGLE part, which is what a plain DEALER does
+// and what the Python Ground Station does.
+//
+// The distinction is the whole point of this test. sendRaw hand-rolls the
+// REQ/REP envelope, so a server that wrongly REQUIRES the delimiter passes every
+// test written against sendRaw and drops the Ground Station on the floor. Both
+// forms are legal ZMTP and the server must accept both.
+func (c *dealerClient) sendBare(body []byte) error {
+	return c.sock.Send(zmq4.NewMsgFrom(body))
 }
 
 func (c *dealerClient) recv(timeout time.Duration) (*rocsarv1.CommandResponse, error) {

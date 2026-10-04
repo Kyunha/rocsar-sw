@@ -128,10 +128,26 @@ func (z *ZMQ) controlLoop() {
 			return
 		}
 
-		// ROUTER frames: [identity, <empty>, payload...]. The empty frame is part
-		// of the REQ/DEALER envelope and carries no information.
-		if len(msg.Frames) < 3 {
-			z.log.Warn("short router frame", "frames", len(msg.Frames))
+		// The payload is the LAST frame, and everything before it is envelope.
+		//
+		// Two forms arrive and both are legal ZMTP:
+		//
+		//	[identity, payload]             a DEALER sending a single part
+		//	[identity, <empty>, payload]    a REQ, or a DEALER that adds the
+		//	                              delimiter itself
+		//
+		// The empty frame carries no information, so requiring it rejected every
+		// peer that follows the documented contract. The Go test client had been
+		// sending `NewMsgFrom([]byte(""), body)` -- it hand-rolled the REQ
+		// envelope -- so the tests passed and the one consumer that matters, the
+		// Python Ground Station on a plain DEALER, was silently dropped with only
+		// a WARN to say so. Found by gs_probe.py, which is the only code here
+		// that speaks to the OBC the way the GS will.
+		//
+		// Fewer than two frames is an identity with no payload and is not
+		// answerable.
+		if len(msg.Frames) < 2 {
+			z.log.Warn("router frame with no payload", "frames", len(msg.Frames))
 			continue
 		}
 
