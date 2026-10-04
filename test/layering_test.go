@@ -121,6 +121,22 @@ func TestSubprocessIsConfinedToItsOwners(t *testing.T) {
 
 	for _, f := range allGoFiles(t, root) {
 		rel := rel(t, root, f)
+
+		// Test files are not in the shipped binary, so what they import is not a
+		// property of the system this rule exists to constrain.
+		//
+		// internal/camera shells out from v4l2_test.go to compile a C probe
+		// against videodev2.h and compare the real VIDIOC codes with ours. That is
+		// verification, not a runtime dependency, and internal/camera still
+		// imports no os/exec at all.
+		//
+		// The alternative -- letting a test reach outside the layering rules --
+		// would be worse than useless, because the rules are only worth having
+		// while something is allowed to break them.
+		if strings.HasSuffix(rel, "_test.go") {
+			continue
+		}
+
 		pkg := filepath.Dir(rel)
 
 		for _, imp := range parseImports(t, f) {

@@ -419,31 +419,48 @@ func TestPicoLinkOverARealSerialPort(t *testing.T) {
 		}
 	}
 
-	// Telemetry must have crossed the port.
+	// Telemetry must have crossed the port, and it must reflect the commands.
+	//
+	// The wait is on the EXPECTED STATE, not merely on a frame arriving. Every
+	// command above has been acknowledged, but the fake emits telemetry on its
+	// own tick, so the first frame to arrive can perfectly well predate the
+	// heater being switched on. Returning on it made this test fail perhaps one
+	// run in eight under -race, which is the worst possible failure rate: rare
+	// enough to look like noise, common enough to cost trust.
+	//
+	// On timeout, report what was actually seen rather than "no telemetry". A
+	// frame that arrived with the wrong heading is a different problem from no
+	// frame at all, and the message should say which.
 	deadline := time.Now().Add(2 * time.Second)
+	var last domain.PicoTelemetry
+	var sawLast bool
 	for time.Now().Before(deadline) {
-		if tel, ok := link.Telemetry(); ok && len(tel.Axes) == 2 {
-			if tel.TargetHeadingDeg != 180 {
-				t.Errorf("target heading = %v, want 180 -- the command did not take effect", tel.TargetHeadingDeg)
+		tel, ok := link.Telemetry()
+		if ok && len(tel.Axes) == 2 {
+			last, sawLast = tel, true
+			if tel.TargetHeadingDeg == 180 &&
+				tel.Heater2State &&
+				tel.Axes[0].CurrentTick == 3000 &&
+				tel.Axes[0].FeedbackState == domain.FeedbackMeasured &&
+				tel.Axes[1].FeedbackState == domain.FeedbackHeld {
+				return // everything converged
 			}
-			if !tel.Heater2State {
-				t.Error("heater 2 is off after SetHeater(2, true)")
-			}
-			if tel.Axes[0].CurrentTick != 3000 {
-				t.Errorf("axis 1 tick = %d, want 3000 after jog", tel.Axes[0].CurrentTick)
-			}
-			// The tri-state must survive a real port in both directions.
-			if tel.Axes[0].FeedbackState != domain.FeedbackMeasured {
-				t.Errorf("axis 1 feedback = %v, want MEASURED", tel.Axes[0].FeedbackState)
-			}
-			if tel.Axes[1].FeedbackState != domain.FeedbackHeld {
-				t.Errorf("axis 2 feedback = %v, want HELD", tel.Axes[1].FeedbackState)
-			}
-			return
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	t.Error("no telemetry with two axes arrived over the real port")
+
+	if !sawLast {
+		t.Fatal("no telemetry with two axes arrived over the real port")
+	}
+	t.Errorf("telemetry arrived but never reflected the commands:\n"+
+		"  heading       %v, want 180\n"+
+		"  heater2       %v, want on\n"+
+		"  axis1 tick    %d, want 3000\n"+
+		"  axis1 feedback %v, want %v\n"+
+		"  axis2 feedback %v, want %v",
+		last.TargetHeadingDeg, last.Heater2State, last.Axes[0].CurrentTick,
+		last.Axes[0].FeedbackState, domain.FeedbackMeasured,
+		last.Axes[1].FeedbackState, domain.FeedbackHeld)
 }
 
 // A command the fake refuses must come back as a refusal, not as success.
