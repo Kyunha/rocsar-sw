@@ -19,21 +19,32 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"os/exec"
-	"strings"
+	"os"
 	"sync"
-	"time"
+	"syscall"
 
 	"github.com/rocsar/obc/internal/domain"
 )
 
-// CommandTimeout bounds every tc invocation.
+// KernelOps is the traffic control surface the shaper needs from the kernel.
 //
-// `sudo` with no passwordless rule and no TTY blocks forever, and a telemetry
-// server blocked in a kernel call is worse than an unshaped one. Five seconds is
-// long enough for tc to do its work and short enough that a wedged sudo is a
-// visible event rather than a silent hang.
-const CommandTimeout = 5 * time.Second
+// It is an interface for one reason: the hierarchy logic below is the part worth
+// testing and worth reading, and it should not be welded to a particular way of
+// reaching the kernel. NetlinkOps is the implementation that ships. Swapping in a
+// tc-based one is a single type, and the tests here already drive it through a
+// fake.
+type KernelOps interface {
+	// ClearRoot removes the root qdisc. An absent one is success.
+	ClearRoot(device string) error
+	// AddRootHTB installs the root discipline.
+	AddRootHTB(device string) error
+	// AddClass adds an HTB class with a rate and a ceiling, both in kbit/s.
+	AddClass(device string, classid, parent uint32, rateKbps, ceilKbps uint32) error
+	// AddLeaf attaches a queueing discipline under a class.
+	AddLeaf(device string, parent, leaf uint32) error
+	// Present reports whether a shaping qdisc is actually on the device.
+	Present(device string) (bool, error)
+}
 
 // PriorityShare is the fraction of the link reserved for telemetry and commands.
 //
@@ -45,8 +56,8 @@ const PriorityShare = 0.36
 
 // Shaper installs the kernel traffic control hierarchy.
 type Shaper struct {
-	log  *slog.Logger
-	exec func(ctx context.Context, name string, args ...string) (string, error)
+	log *slog.Logger
+	ops KernelOps
 
 	mu       sync.RWMutex
 	device   string
@@ -56,20 +67,15 @@ type Shaper struct {
 	reason   string
 }
 
-// NewShaper returns a shaper. Pass nil for exec to use the real one.
-func NewShaper(log *slog.Logger, runner func(context.Context, string, ...string) (string, error)) *Shaper {
-	if runner == nil {
-		runner = runCommand
+// NewShaper returns a shaper. Pass nil for ops to use rtnetlink.
+func NewShaper(log *slog.Logger, ops KernelOps) *Shaper {
+	if log == nil {
+		log = slog.Default()
 	}
-	return &Shaper{log: log, exec: runner}
-}
-
-func runCommand(ctx context.Context, name string, args ...string) (string, error) {
-	ctx, cancel := context.WithTimeout(ctx, CommandTimeout)
-	defer cancel()
-
-	out, err := exec.CommandContext(ctx, name, args...).CombinedOutput()
-	return string(out), err
+	if ops == nil {
+		ops = NetlinkOps{}
+	}
+	return &Shaper{log: log, ops: ops}
 }
 
 // PriorityKbps returns the priority class ceiling for a link rate.
@@ -83,10 +89,10 @@ func PriorityKbps(rateKbps uint32) uint32 {
 
 // Apply installs the hierarchy. It never returns an error.
 //
-// tc fails for dozens of reasons unrelated to our logic -- sudo without a
-// password, tc not installed, wrong interface, kernel without HTB -- and not one
-// of them justifies taking down a telemetry server. The operator gets the real
-// reason in telemetry; everything else keeps running unshaped.
+// Traffic control fails for dozens of reasons unrelated to our logic -- no
+// CAP_NET_ADMIN, wrong interface, kernel without HTB -- and not one of them
+// justifies taking down a telemetry server. The operator gets the real reason in
+// telemetry; everything else keeps running unshaped.
 func (s *Shaper) Apply(ctx context.Context, device string, rateKbps uint32) (bool, string) {
 	if device == "" {
 		return s.fail("no link device configured")
@@ -105,49 +111,42 @@ func (s *Shaper) Apply(ctx context.Context, device string, rateKbps uint32) (boo
 
 	bulk := rateKbps - prio
 
-	// Remove any previous hierarchy first. This is best-effort: `tc qdisc del`
-	// on a device with no qdisc returns an error, and for us that error is
-	// SUCCESS -- see isNoSuchQdisc for why that distinction is not cosmetic.
-	if out, err := s.exec(ctx, "tc", "qdisc", "del", "dev", device, "root"); err != nil {
-		if !isNoSuchQdisc(out, err) {
-			// The message names tc explicitly. `exec` reports a missing binary
-			// as "executable file not found in $PATH", which reads to an operator
-			// as a missing PATH entry rather than as "the traffic shaper is not
-			// installed on this machine" -- and they then look in the wrong place.
-			return s.fail(fmt.Sprintf("could not run tc to clear the existing qdisc on %s: %v: %s",
-				device, err, oneLine(out)))
-		}
+	// Remove any previous hierarchy first, or the class adds fail on the second
+	// start and shaping silently degrades. An absent qdisc is success -- see
+	// absentQdisc for what the kernel calls that.
+	if err := s.ops.ClearRoot(device); err != nil && !absentQdisc(err) {
+		return s.fail(s.describe("could not clear the existing qdisc", err))
 	}
 
 	steps := []struct {
 		what string
-		args []string
+		run  func() error
 	}{
 		// default 10, not 20: unclassified traffic belongs in the class with a
 		// guaranteed floor, so a device with no classifier still protects
 		// telemetry rather than the other way round.
-		{"root HTB", []string{"qdisc", "add", "dev", device, "root", "handle", "1:", "htb", "default", "10"}},
+		{"root HTB", func() error { return s.ops.AddRootHTB(device) }},
 
 		// Priority class: a guaranteed floor at prio, free to borrow up to the
 		// full link when nothing else wants it.
-		{"priority class", []string{"class", "add", "dev", device, "parent", "1:", "classid", "1:10",
-			"htb", "rate", fmt.Sprintf("%dkbit", prio), "ceil", fmt.Sprintf("%dkbit", rateKbps)}},
+		{"priority class", func() error {
+			return s.ops.AddClass(device, PriorityClass, RootHandle, prio, rateKbps)
+		}},
 
 		// Bulk class: everything else, flat.
-		{"bulk class", []string{"class", "add", "dev", device, "parent", "1:", "classid", "1:20",
-			"htb", "rate", fmt.Sprintf("%dkbit", bulk), "ceil", fmt.Sprintf("%dkbit", bulk)}},
+		{"bulk class", func() error {
+			return s.ops.AddClass(device, BulkClass, RootHandle, bulk, bulk)
+		}},
 
-		// Leaf qdiscs. pfifo is queueing discipline, not shaping; the shaping is
-		// the HTB above it.
-		{"priority leaf", []string{"qdisc", "add", "dev", device, "parent", "1:10", "handle", "110:",
-			"pfifo", "limit", "200"}},
-		{"bulk leaf", []string{"qdisc", "add", "dev", device, "parent", "1:20", "handle", "120:",
-			"pfifo", "limit", "100"}},
+		// Leaf qdiscs. These are queueing, not shaping; the shaping is the HTB
+		// above them.
+		{"priority leaf", func() error { return s.ops.AddLeaf(device, PriorityClass, PriorityLeaf) }},
+		{"bulk leaf", func() error { return s.ops.AddLeaf(device, BulkClass, BulkLeaf) }},
 	}
 
 	for _, step := range steps {
-		if out, err := s.exec(ctx, "tc", step.args...); err != nil {
-			return s.fail(fmt.Sprintf("tc %s failed: %v: %s", step.what, err, oneLine(out)))
+		if err := step.run(); err != nil {
+			return s.fail(s.describe("could not install the "+step.what, err))
 		}
 	}
 
@@ -190,16 +189,67 @@ func (s *Shaper) Apply(ctx context.Context, device string, rateKbps uint32) (boo
 	// working classifier on this interface, and finding one is a piece of work in
 	// its own right -- u32 on the TCP port, net_cls on the listener's cgroup, or
 	// nftables. Guessing between those from here is how the current filter got
-	// written.
+	// written. Note that net_cls would need the artefact listener in its own
+	// process, since a cgroup is a property of a process and not of a goroutine or
+	// a socket, so it is not a small change either.
 	//
-	// The default is now the priority class, so an unconfigured device caps the
-	// whole link rather than dumping everything into a class named "bulk" that
-	// nothing is being deliberately steered into.
+	// The default is the priority class, so an unconfigured device caps the whole
+	// link rather than dumping everything into a class named "bulk" that nothing is
+	// being deliberately steered into.
 	s.set(device, rateKbps, prio, true, unclassifiedReason(rateKbps, prio))
 	s.log.Info("link rate applied; traffic is NOT classified",
 		"device", device, "rate_kbps", rateKbps, "priority_kbps", prio,
 		"unclassified_default", "1:10")
 	return true, s.reasonLocked()
+}
+
+// absentQdisc reports whether failing to clear a root qdisc means "there was
+// nothing to delete", which is success for us, because it is already the state we
+// want.
+//
+// The kernel says it two ways, and both have to be handled:
+//
+//   - ENOENT: the device has no qdisc at the handle we asked for.
+//   - EINVAL: the device's root qdisc exists but has handle zero. Every freshly
+//     created interface carries the built-in `noqueue` qdisc, whose handle is 0;
+//     the kernel finds it and then refuses, because deleting a handle-zero qdisc
+//     would be deleting the device's only queue. This is the case iproute2 prints
+//     as "Cannot delete qdisc with handle of zero", which is the string the tc
+//     implementation had to match -- carefully, because the message for a missing
+//     tc binary also contains "not found" and a loose match there reported
+//     success while nothing was shaped.
+//
+// EINVAL is safe to read as "nothing to delete" only because the request behind
+// this is fully determined: one root delete, one fixed handle, one fixed parent.
+// No caller input reaches it, so there is nothing here that could turn a malformed
+// request into this path.
+func absentQdisc(err error) bool {
+	return errors.Is(err, syscall.ENOENT) ||
+		errors.Is(err, os.ErrNotExist) ||
+		errors.Is(err, syscall.EINVAL)
+}
+
+// describe turns a kernel error into something an operator can act on.
+//
+// The errno is the message. "permission denied" on a traffic control call means
+// exactly one thing on a flight computer -- the unit is missing CAP_NET_ADMIN --
+// and saying so is more useful than passing the raw string through, because the
+// raw string does not tell a reader what to change.
+func (s *Shaper) describe(what string, err error) string {
+	switch {
+	case errors.Is(err, syscall.EPERM), errors.Is(err, syscall.EACCES):
+		return fmt.Sprintf("%s: permission denied. Link shaping needs CAP_NET_ADMIN; "+
+			"grant it to the obc unit or run obc with the capability", what)
+	case errors.Is(err, syscall.ENOENT):
+		return fmt.Sprintf("%s: the device or the qdisc does not exist (ENOENT)", what)
+	case errors.Is(err, syscall.EINVAL), errors.Is(err, syscall.EOPNOTSUPP):
+		return fmt.Sprintf("%s: the kernel rejected the request. Either the device "+
+			"cannot do HTB or the kernel has no traffic control support (%v)", what, err)
+	case errors.Is(err, syscall.ENODEV):
+		return fmt.Sprintf("%s: no such network device", what)
+	default:
+		return fmt.Sprintf("%s: %v", what, err)
+	}
 }
 
 func (s *Shaper) set(device string, rateKbps, prioKbps uint32, active bool, reason string) {
@@ -256,54 +306,10 @@ func (s *Shaper) Status() domain.LinkStatus {
 // QdiscPresent reads the device back from the kernel.
 //
 // This read-back is why the silent classification failure is detectable at all.
-// Without it the only evidence that shaping worked is that the commands
-// returned zero, which is exactly what happens when the commands are correct and
-// the effect is not.
+// Without it the only evidence that shaping worked is that the calls returned nil,
+// which is exactly what happens when the calls are correct and the effect is not.
 func (s *Shaper) QdiscPresent(ctx context.Context, device string) (bool, error) {
-	out, err := s.exec(ctx, "tc", "qdisc", "show", "dev", device)
-	if err != nil {
-		return false, fmt.Errorf("tc qdisc show: %w: %s", err, oneLine(out))
-	}
-	if strings.Contains(out, "htb") || strings.Contains(out, "noqueue") {
-		return true, nil
-	}
-	return false, nil
-}
-
-// isNoSuchQdisc reports whether `tc qdisc del` failing means "there was nothing
-// to delete", which is success for us.
-//
-// This cannot be done by checking the exit code, and it cannot be done by a
-// substring match on "not found": the message for a missing `tc` binary also
-// contains "executable not found", so a loose match reports success when tc is
-// not installed at all -- and then nothing is shaped, and telemetry claims it
-// is. Both known-good strings are anchored instead.
-func isNoSuchQdisc(output string, err error) bool {
-	if err == nil {
-		return true
-	}
-	if errors.Is(err, exec.ErrNotFound) {
-		return false
-	}
-	for _, known := range []string{
-		"RTNETLINK answers: No such file or directory",
-		"Cannot delete qdisc with handle of zero",
-		"Error: Cannot delete qdisc",
-	} {
-		if strings.Contains(output, known) {
-			return true
-		}
-	}
-	return false
-}
-
-func oneLine(s string) string {
-	s = strings.TrimSpace(strings.ReplaceAll(s, "\n", " "))
-	const max = 200
-	if len(s) > max {
-		return s[:max] + "..."
-	}
-	return s
+	return s.ops.Present(device)
 }
 
 // NullShaper records requests and changes nothing.

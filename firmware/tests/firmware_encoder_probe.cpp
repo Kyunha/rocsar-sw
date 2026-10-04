@@ -1,0 +1,557 @@
+// Host-side harness around the firmware's own encoder/decoder.
+//
+// Prints COBS-framed PicoMessage hex the exact way firmware.ino would emit
+// them, and decodes a command frame back. tests/test_firmware_wire_format.py
+// drives this to prove the nanopb C encoder and the Python decoder agree.
+//
+// Usage:
+//   firmware_encoder_probe                        -> prints sample TX frames as hex
+//   firmware_encoder_probe <hex-with-delim>       -> prints "DECODED <seq> <tag> <detail>"
+//   firmware_encoder_probe --response-for <hex> <ok|err>
+//                                                     -> decodes, then prints the
+//                                                        response frame the Pico
+//                                                        would send back
+//   firmware_encoder_probe --apply <hex> [<hex>...]
+//                                                     -> runs the firmware's real
+//                                                        command handling, printing
+//                                                        one "STATE ..." line per
+//                                                        command and the final state
+//   firmware_encoder_probe --heading <step> [<step>...]
+//                                                   -> drives applyImuHeading() with a
+//                                                      sequence of samples, printing one
+//                                                      "HEADING ..." line per step
+//   firmware_encoder_probe --target-tick <heading> <target>
+//                                                   -> prints the tick the firmware
+//                                                      would command, for the seam guard
+//   firmware_encoder_probe --servo-packet <id> <tick>
+//                                                   -> prints the 13 STS3215 wire bytes
+//                                                      as hex, checksum included
+//   firmware_encoder_probe --servo-status-request <id>
+//                                                   -> prints the status-read request hex
+//   firmware_encoder_probe --servo-status-scan <hex> <id>
+//                                                   -> runs scanServoStatus() over raw
+//                                                      bus bytes and prints the verdict
+//   firmware_encoder_probe --apply-feedback <hex> <id> [<hex> <id>...]
+//                                                   -> folds parsed status into the axes
+//                                                      and prints the resulting state
+//   firmware_encoder_probe --telemetry-from-state <heading> <target> <imu> <h1> <h2>
+//                                                   -> fills a TelemetryMessage through
+//                                                      the firmware's own mapping and
+//                                                      prints it as hex
+//
+// A <step> for --heading is a number (a real sample), "none" (no sensor fitted),
+// "nan"/"inf" (a non-finite sample), or "nodata" (a fitted sensor that delivered
+// nothing this tick -- the sketch simply holds, so the model is untouched).
+
+#include <stdio.h>
+#include <string.h>
+
+#include "cobs.h"
+#include "gondola_model.h"
+#include "pb_decode.h"
+#include "pb_encode.h"
+#include "pico.pb.h"
+#include "pico_wire.h"
+
+static void printHex(const uint8_t* data, size_t len) {
+  for (size_t i = 0; i < len; i++) {
+    printf("%02x", data[i]);
+  }
+  printf("\n");
+}
+
+static void emitTelemetry() {
+  rocsar_v1_PicoMessage message = rocsar_v1_PicoMessage_init_zero;
+  message.sequence = 7;
+  message.timestamp_us = 1234567890ULL;
+  message.which_payload = rocsar_v1_PicoMessage_telemetry_tag;
+
+  message.payload.telemetry.gondola_heading_deg = 123.5f;
+  message.payload.telemetry.target_heading_deg = 45.25f;
+  message.payload.telemetry.heater1_state = true;
+  message.payload.telemetry.heater2_state = false;
+  message.payload.telemetry.imu_present = true;
+  message.payload.telemetry.antennas_count = 2;
+
+  message.payload.telemetry.antennas[0].servo_id = 5;
+  message.payload.telemetry.antennas[0].manual_mode = true;
+  message.payload.telemetry.antennas[0].current_tick = 3000;
+  message.payload.telemetry.antennas[0].current_angle_deg = 80.5f;
+  message.payload.telemetry.antennas[0].temperature_c = 31;
+  message.payload.telemetry.antennas[0].load = 12;
+  message.payload.telemetry.antennas[0].center_tick = 2048;
+  message.payload.telemetry.antennas[0].mount_offset_deg = 270.0f;
+  message.payload.telemetry.antennas[0].dir_multiplier = -1.0f;
+  message.payload.telemetry.antennas[0].feedback_state = rocsar_v1_FeedbackState_FEEDBACK_MEASURED;
+  message.payload.telemetry.antennas[0].feedback_error = 0;
+
+  message.payload.telemetry.antennas[1].servo_id = 10;
+  message.payload.telemetry.antennas[1].current_tick = 100;
+  message.payload.telemetry.antennas[1].dir_multiplier = 1.0f;
+  // Deliberately left invalid/erroring: the emitted sample has to contain one
+  // axis reporting a measurement and one reporting a held value, or a test that
+  // only ever sees "valid" cannot tell a mapping from a constant.
+  message.payload.telemetry.antennas[1].feedback_state = rocsar_v1_FeedbackState_FEEDBACK_HELD;
+  message.payload.telemetry.antennas[1].feedback_error = 1;
+
+  uint8_t frame[PICO_TX_FRAME_MAX];
+  size_t len = encodePicoFrame(message, frame, sizeof(frame));
+  if (len == 0) {
+    fprintf(stderr, "telemetry encode failed\n");
+    return;
+  }
+  printHex(frame, len);
+}
+
+static void emitResponse(uint32_t commandSequence, bool success,
+                         rocsar_v1_ErrorCode error) {
+  rocsar_v1_PicoMessage message = rocsar_v1_PicoMessage_init_zero;
+  message.sequence = 3;
+  message.timestamp_us = 42;
+  message.which_payload = rocsar_v1_PicoMessage_ack_tag;
+  message.payload.ack.command_sequence = commandSequence;
+  message.payload.ack.success = success;
+  message.payload.ack.error = error;
+
+  uint8_t frame[PICO_TX_FRAME_MAX];
+  size_t len = encodePicoFrame(message, frame, sizeof(frame));
+  if (len == 0) {
+    fprintf(stderr, "response encode failed\n");
+    return;
+  }
+  printHex(frame, len);
+}
+
+static int decodeFrame(const char* hex, rocsar_v1_PicoCommand* out,
+                       bool verbose = true) {
+  size_t textLen = strlen(hex);
+  if (textLen == 0 || textLen % 2 != 0) {
+    fprintf(stderr, "bad hex length\n");
+    return 2;
+  }
+
+  uint8_t raw[512];
+  size_t rawLen = textLen / 2;
+  if (rawLen >= sizeof(raw)) {
+    fprintf(stderr, "frame too long\n");
+    return 2;
+  }
+  for (size_t i = 0; i < rawLen; i++) {
+    unsigned int byte = 0;
+    if (sscanf(hex + 2 * i, "%2x", &byte) != 1) {
+      fprintf(stderr, "bad hex digit\n");
+      return 2;
+    }
+    raw[i] = (uint8_t)byte;
+  }
+
+  // Strip the trailing 0x00 delimiter the sender appends.
+  if (rawLen == 0 || raw[rawLen - 1] != 0x00) {
+    fprintf(stderr, "missing frame delimiter\n");
+    return 2;
+  }
+  size_t frameLen = rawLen - 1;
+
+  uint8_t decoded[512];
+  size_t decodedLen = cobs_decode(raw, frameLen, decoded);
+  if (decodedLen == 0 && frameLen != 0) {
+    fprintf(stderr, "cobs decode failed\n");
+    return 2;
+  }
+
+  rocsar_v1_PicoCommand command =
+      rocsar_v1_PicoCommand_init_zero;
+  pb_istream_t stream = pb_istream_from_buffer(decoded, decodedLen);
+  if (!pb_decode(&stream, rocsar_v1_PicoCommand_fields, &command)) {
+    fprintf(stderr, "pb decode failed\n");
+    return 2;
+  }
+
+  const char* tag = "<none>";
+  char detail[128] = "";
+  switch (command.which_payload) {
+    case rocsar_v1_PicoCommand_set_target_tag:
+      tag = "set_target";
+      snprintf(detail, sizeof(detail), "%.4f", command.payload.set_target.target_heading_deg);
+      break;
+    case rocsar_v1_PicoCommand_jog_tag:
+      tag = "jog";
+      snprintf(detail, sizeof(detail), "%u %u", command.payload.jog.servo_id,
+               command.payload.jog.tick);
+      break;
+    case rocsar_v1_PicoCommand_zero_tag:
+      tag = "zero";
+      snprintf(detail, sizeof(detail), "%u", command.payload.zero.servo_id);
+      break;
+    case rocsar_v1_PicoCommand_mount_tag:
+      tag = "mount";
+      snprintf(detail, sizeof(detail), "%u %.4f", command.payload.mount.servo_id,
+               command.payload.mount.offset_deg);
+      break;
+    case rocsar_v1_PicoCommand_dir_tag:
+      tag = "dir";
+      snprintf(detail, sizeof(detail), "%u %.4f", command.payload.dir.servo_id,
+               command.payload.dir.multiplier);
+      break;
+    case rocsar_v1_PicoCommand_heater_tag:
+      tag = "heater";
+      snprintf(detail, sizeof(detail), "%u %d", command.payload.heater.heater_id,
+               command.payload.heater.state ? 1 : 0);
+      break;
+    case rocsar_v1_PicoCommand_stop_tag:
+      tag = "stop";
+      snprintf(detail, sizeof(detail), "%u", command.payload.stop.servo_id);
+      break;
+    case rocsar_v1_PicoCommand_status_request_tag:
+      tag = "status_request";
+      break;
+    default:
+      break;
+  }
+
+  if (verbose) {
+    printf("DECODED %u %s %s\n", command.sequence, tag, detail);
+  }
+  *out = command;
+  return 0;
+}
+
+static void printState(const GondolaState& state) {
+  printf("STATE heading=%.3f target=%.3f h1=%d h2=%d imu=%d", state.gondolaHeading,
+         state.targetHeading, state.heater1 ? 1 : 0, state.heater2 ? 1 : 0,
+         state.imuPresent ? 1 : 0);
+  for (int i = 0; i < NUM_ANTENNAS; i++) {
+    const AntennaAxis& axis = state.antennas[i];
+    printf(" | a%d id=%u center=%u manual=%d manualTick=%u tick=%u offset=%.3f dir=%.1f",
+           i, axis.id, axis.centerTick, axis.manualMode ? 1 : 0, axis.manualTick,
+           axis.currentTick, axis.mountOffsetDeg, axis.dirMultiplier);
+    printf(" fb_state=%d fb_err=%u load=%.2f temp=%.2f", (int)axis.feedbackState,
+           axis.feedbackError, axis.load, axis.temperatureC);
+  }
+  printf("\n");
+}
+
+// Reads raw hex bus bytes into a buffer. Shared by the two status entry points.
+static int hexToBytes(const char* hex, uint8_t* out, size_t outCap, size_t* outLen) {
+  size_t textLen = strlen(hex);
+  if (textLen == 0 || textLen % 2 != 0) {
+    fprintf(stderr, "bad hex length\n");
+    return 2;
+  }
+  size_t rawLen = textLen / 2;
+  if (rawLen > outCap) {
+    fprintf(stderr, "hex too long\n");
+    return 2;
+  }
+  for (size_t i = 0; i < rawLen; i++) {
+    unsigned int byte = 0;
+    if (sscanf(hex + 2 * i, "%2x", &byte) != 1) {
+      fprintf(stderr, "bad hex digit\n");
+      return 2;
+    }
+    out[i] = (uint8_t)byte;
+  }
+  *outLen = rawLen;
+  return 0;
+}
+
+// Prints the status-read request the sketch would put on the bus. The framing
+// lives in gondola_model.h, where a test can reach it; the sketch can only be
+// read, and a wrong length byte reads back whatever the servo felt like sending.
+static int servoStatusRequest(int argc, char** argv) {
+  if (argc < 3) {
+    fprintf(stderr, "usage: --servo-status-request <id>\n");
+    return 2;
+  }
+  uint8_t packet[SERVO_STATUS_REQUEST_LEN];
+  size_t len = buildServoStatusRequest((uint8_t)strtoul(argv[2], nullptr, 10), packet,
+                                       sizeof(packet));
+  if (len == 0) {
+    fprintf(stderr, "request build failed\n");
+    return 2;
+  }
+  printHex(packet, len);
+  return 0;
+}
+
+// Runs scanServoStatus() over raw bus bytes and prints its verdict.
+//
+// This is the entry point that makes the echo question testable. The caller
+// supplies whatever the wire actually produced -- an echo followed by a reply, a
+// reply alone, noise, a truncated frame -- and the firmware's own scanner decides
+// whether that is a usable status reading.
+static int servoStatusScan(int argc, char** argv) {
+  if (argc < 4) {
+    fprintf(stderr, "usage: --servo-status-scan <hex> <id>\n");
+    return 2;
+  }
+  uint8_t buffer[512];
+  size_t len = 0;
+  if (hexToBytes(argv[2], buffer, sizeof(buffer), &len) != 0) {
+    return 2;
+  }
+
+  uint8_t expectedId = (uint8_t)strtoul(argv[3], nullptr, 10);
+  ServoScan scan = scanServoStatus(buffer, len, expectedId);
+
+  printf("SCAN matched=%d consumed=%zu", scan.matched ? 1 : 0, scan.consumed);
+  if (scan.matched) {
+    printf(" tick=%u load=%.2f temp=%d err=%u", scan.status.positionTicks,
+           scan.status.loadPercent, (int)scan.status.temperatureC,
+           (unsigned)scan.status.error);
+  }
+  printf("\n");
+  return 0;
+}
+
+// Folds parsed status into the axes, exactly as the loop does, and prints the
+// state after each step. A step whose scan does not match must leave the axis
+// invalid and its last reading intact.
+static int applyFeedback(int argc, char** argv) {
+  if (argc < 4 || ((argc - 2) % 2) != 0) {
+    fprintf(stderr, "usage: --apply-feedback <hex> <id> [<hex> <id>...]\n");
+    return 2;
+  }
+  GondolaState state;
+  initGondolaState(state);
+
+  // Establish a commanded position first, so the fallback path has something to
+  // report and a test can tell "held the command echo" from "replaced by a
+  // measurement".
+  for (int i = 0; i < NUM_ANTENNAS; i++) {
+    state.antennas[i].lastSentTick = (uint16_t)(1000 + 100 * i);
+    updateAxisFeedback(state.antennas[i]);
+  }
+  printState(state);
+
+  for (int i = 2; i + 1 < argc; i += 2) {
+    uint8_t buffer[512];
+    size_t len = 0;
+    if (hexToBytes(argv[i], buffer, sizeof(buffer), &len) != 0) {
+      return 2;
+    }
+    uint8_t expectedId = (uint8_t)strtoul(argv[i + 1], nullptr, 10);
+
+    AntennaAxis* axis = findAntenna(state, expectedId);
+    if (axis == nullptr) {
+      fprintf(stderr, "no such servo in the model: %u\n", (unsigned)expectedId);
+      return 2;
+    }
+
+    ServoScan scan = scanServoStatus(buffer, len, expectedId);
+    if (scan.matched) {
+      applyServoFeedback(*axis, scan.status);
+      printf("FEEDBACK applied id=%u\n", (unsigned)expectedId);
+    } else {
+      invalidateAxisFeedback(*axis);
+      printf("FEEDBACK held id=%u\n", (unsigned)expectedId);
+    }
+    printState(state);
+  }
+  return 0;
+}
+
+static int applyFrames(int argc, char** argv) {
+  GondolaState state;
+  initGondolaState(state);
+
+  for (int i = 0; i < argc; i++) {
+    rocsar_v1_PicoCommand command =
+        rocsar_v1_PicoCommand_init_zero;
+    // Suppress the per-command DECODED line; only the resulting state matters here.
+    if (decodeFrame(argv[i], &command, false) != 0) {
+      return 2;
+    }
+    rocsar_v1_ErrorCode error = applyCommand(state, command);
+    printf("REPLY %u %d %s\n", command.sequence, (int)error,
+           error == rocsar_v1_ErrorCode_ERROR_NONE ? "ERROR_NONE" : "ERROR");
+    printState(state);
+  }
+  return 0;
+}
+
+static const char* sampleName(ImuSample sample) {
+  switch (sample) {
+    case IMU_SAMPLE_APPLIED: return "APPLIED";
+    case IMU_SAMPLE_NO_SENSOR: return "NO_SENSOR";
+    case IMU_SAMPLE_REJECTED: return "REJECTED";
+  }
+  return "?";
+}
+
+// Drives the heading policy the way the sketch's control loop does. This exists
+// because the policy used to live inline in the .ino, where the probe TU cannot
+// reach it -- which is how an unguarded getEvent() call survived a green suite.
+static int applyHeadings(int argc, char** argv) {
+  GondolaState state;
+  initGondolaState(state);
+
+  for (int i = 0; i < argc; i++) {
+    const char* step = argv[i];
+    bool present = true;
+    float sample = 0.0f;
+
+    if (strcmp(step, "none") == 0) {
+      present = false;
+    } else if (strcmp(step, "nodata") == 0) {
+      // The sketch's getEvent() failure path: nothing to fold in, so nothing is
+      // called. Modelled here as a no-op rather than as a zero sample, because
+      // a zero sample is finite and would be integrated as a real heading.
+      printf("HEADING NO_DATA imu=%d heading=%.3f\n",
+             state.imuPresent ? 1 : 0, state.gondolaHeading);
+      continue;
+    } else if (strcmp(step, "nan") == 0) {
+      sample = NAN;
+    } else if (strcmp(step, "inf") == 0) {
+      sample = INFINITY;
+    } else {
+      sample = strtof(step, nullptr);
+    }
+
+    ImuSample result = applyImuHeading(state, sample, present);
+    printf("HEADING %s imu=%d heading=%.3f\n", sampleName(result),
+           state.imuPresent ? 1 : 0, state.gondolaHeading);
+  }
+
+  printState(state);
+  return 0;
+}
+
+// The seam guard: a non-finite geometry must not reach the (int32_t) cast.
+static int targetTick(int argc, char** argv) {
+  if (argc < 4) {
+    fprintf(stderr, "usage: --target-tick <heading> <target>\n");
+    return 2;
+  }
+  GondolaState state;
+  initGondolaState(state);
+  state.antennas[0].manualMode = false;
+
+  float heading = strtof(argv[2], nullptr);
+  float target = strtof(argv[3], nullptr);
+  printf("TICK %u\n", state.antennas[0].calculateTargetTick(heading, target));
+  return 0;
+}
+
+// Prints the STS3215 packet the sketch would put on the bus. The checksum and
+// the little-endian position were inline in the .ino, where no test could see
+// them: a servo that does not move is indistinguishable from a servo nobody
+// commanded.
+static int servoPacket(int argc, char** argv) {
+  if (argc < 4) {
+    fprintf(stderr, "usage: --servo-packet <id> <tick>\n");
+    return 2;
+  }
+  uint8_t packet[SERVO_PACKET_LEN];
+  size_t len =
+      buildServoPacket((uint8_t)strtoul(argv[2], nullptr, 10), (int32_t)strtol(argv[3], nullptr, 10),
+                       packet, sizeof(packet));
+  if (len == 0) {
+    fprintf(stderr, "packet build failed\n");
+    return 2;
+  }
+  printHex(packet, len);
+  return 0;
+}
+
+// Fills a TelemetryMessage through the firmware's own mapping and prints the
+// encoded frame, so the Python side can decode it with the codec it really uses
+// and the two cannot disagree about a field. <imu> and <h1>/<h2> are 0/1.
+static int telemetryFromState(int argc, char** argv) {
+  if (argc < 7) {
+    fprintf(stderr,
+            "usage: --telemetry-from-state <heading> <target> <imu> <h1> <h2>\n");
+    return 2;
+  }
+  GondolaState state;
+  initGondolaState(state);
+
+  applyImuHeading(state, strtof(argv[2], nullptr), strcmp(argv[4], "0") != 0);
+  state.targetHeading = strtof(argv[3], nullptr);
+  state.heater1 = strcmp(argv[5], "0") != 0;
+  state.heater2 = strcmp(argv[6], "0") != 0;
+
+  // Give the axes something distinguishable to report, so a mapping that
+  // silently copies the wrong field is visible rather than plausible.
+  for (int i = 0; i < NUM_ANTENNAS; i++) {
+    AntennaAxis& axis = state.antennas[i];
+    axis.lastSentTick = (uint16_t)(1000 + 100 * i);
+    axis.manualMode = (i == 1);
+    axis.mountOffsetDeg = 270.0f + (float)i;
+    axis.dirMultiplier = -1.0f;
+    updateAxisFeedback(axis);
+  }
+
+  rocsar_v1_PicoMessage message = rocsar_v1_PicoMessage_init_zero;
+  message.sequence = 11;
+  message.timestamp_us = 99ULL;
+  message.which_payload = rocsar_v1_PicoMessage_telemetry_tag;
+  fillTelemetryMessage(state, message.payload.telemetry);
+
+  uint8_t frame[PICO_TX_FRAME_MAX];
+  size_t len = encodePicoFrame(message, frame, sizeof(frame));
+  if (len == 0) {
+    fprintf(stderr, "telemetry encode failed\n");
+    return 2;
+  }
+  printHex(frame, len);
+  return 0;
+}
+
+int main(int argc, char** argv) {
+  if (argc > 2 && strcmp(argv[1], "--apply") == 0) {
+    return applyFrames(argc - 2, argv + 2);
+  }
+
+  if (argc > 2 && strcmp(argv[1], "--heading") == 0) {
+    return applyHeadings(argc - 2, argv + 2);
+  }
+
+  if (argc > 3 && strcmp(argv[1], "--target-tick") == 0) {
+    return targetTick(argc, argv);
+  }
+
+  if (argc > 3 && strcmp(argv[1], "--servo-packet") == 0) {
+    return servoPacket(argc, argv);
+  }
+
+  if (argc > 2 && strcmp(argv[1], "--servo-status-request") == 0) {
+    return servoStatusRequest(argc, argv);
+  }
+
+  if (argc > 3 && strcmp(argv[1], "--servo-status-scan") == 0) {
+    return servoStatusScan(argc, argv);
+  }
+
+  if (argc > 3 && strcmp(argv[1], "--apply-feedback") == 0) {
+    return applyFeedback(argc, argv);
+  }
+
+  if (argc > 6 && strcmp(argv[1], "--telemetry-from-state") == 0) {
+    return telemetryFromState(argc, argv);
+  }
+
+  if (argc > 2 && strcmp(argv[1], "--response-for") == 0) {
+    rocsar_v1_PicoCommand command =
+        rocsar_v1_PicoCommand_init_zero;
+    if (decodeFrame(argv[2], &command) != 0) {
+      return 2;
+    }
+    bool ok = (argc <= 3) || strcmp(argv[3], "ok") == 0;
+    emitResponse(command.sequence, ok,
+                 ok ? rocsar_v1_ErrorCode_ERROR_NONE
+                    : rocsar_v1_ErrorCode_ERROR_INVALID_SERVO);
+    return 0;
+  }
+
+  if (argc > 1) {
+    rocsar_v1_PicoCommand ignored =
+        rocsar_v1_PicoCommand_init_zero;
+    return decodeFrame(argv[1], &ignored);
+  }
+
+  emitTelemetry();
+  emitResponse(11, true, rocsar_v1_ErrorCode_ERROR_NONE);
+  emitResponse(12, false, rocsar_v1_ErrorCode_ERROR_INVALID_SERVO);
+  return 0;
+}

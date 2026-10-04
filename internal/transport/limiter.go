@@ -1,10 +1,11 @@
 package transport
 
 import (
+	"context"
 	"fmt"
 	"io"
-	"sync"
-	"time"
+
+	"golang.org/x/time/rate"
 )
 
 // bulkLimiter bounds artefact downloads by back-pressure.
@@ -37,21 +38,19 @@ import (
 // artefact requests is not punished. Sleeping a fixed interval per chunk would
 // add latency to every response and would still be wrong at the boundaries.
 //
-// Per-goroutine state, shared bucket. Two concurrent downloads share the rate
+// Per-request state, shared bucket. Two concurrent downloads share the rate
 // rather than each getting it, because the constraint is the link and not the
-// request.
+// request. That is rate.Limiter's concurrency behaviour, which is why it is the
+// library's and not ours.
+//
+// This used to be a hand-rolled bucket with an injected clock. x/time/rate is the
+// same algorithm with the accounting already reviewed, so what is left here is
+// the part that is specific to this link: the quantum.
 type bulkLimiter struct {
 	bytesPerSec int
 	burst       int
-
-	mu     sync.Mutex
-	tokens float64
-	last   time.Time
-
-	// now is swapped in tests so a rate can be asserted without waiting for it.
-	now func() time.Time
-	// sleep is swapped in tests for the same reason.
-	sleep func(time.Duration)
+	quantum     int
+	lim         *rate.Limiter
 }
 
 // newBulkLimiter returns a limiter, or nil when bytesPerSec is not positive.
@@ -63,16 +62,15 @@ func newBulkLimiter(bytesPerSec int) *bulkLimiter {
 	if bytesPerSec <= 0 {
 		return nil
 	}
+	// One second's worth of burst. Enough that a small file completes without
+	// being shaped, small enough that a bulk transfer cannot open a gap wide
+	// enough to matter at 115 kbit/s.
+	burst := bytesPerSec
 	return &bulkLimiter{
 		bytesPerSec: bytesPerSec,
-		// One second's worth of burst. Enough that a small file completes without
-		// being shaped, small enough that a bulk transfer cannot open a gap wide
-		// enough to matter at 115 kbit/s.
-		burst:  bytesPerSec,
-		tokens: float64(bytesPerSec),
-		last:   time.Now(),
-		now:    time.Now,
-		sleep:  time.Sleep,
+		burst:       burst,
+		quantum:     quantumFor(bytesPerSec),
+		lim:         rate.NewLimiter(rate.Limit(bytesPerSec), burst),
 	}
 }
 
@@ -93,76 +91,36 @@ func (lr *limitedReader) Read(p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
 	}
-	// Loop until the bucket yields something. Returning (0, nil) instead would
-	// make io.Copy call straight back in -- it treats a zero-length read with no
-	// error as "try again" -- so a drained bucket would spin the CPU at 100%
-	// rather than sleeping.
-	for {
-		if n := lr.lim.take(len(p)); n > 0 {
-			return lr.r.Read(p[:n])
-		}
-		lr.lim.wait()
+	// Take a quantum, not len(p). io.Copy hands over a 32 KiB buffer, and waiting
+	// for all of it at the configured 8 KiB/s would mean a four-second stall
+	// before the client's first bytes, on a link where the client is waiting on
+	// us.
+	//
+	// The quantum must also not exceed the burst. WaitN rejects n > burst rather
+	// than granting it, and at a rate below the quantum floor -- a rate the
+	// configuration allows -- the burst IS the smaller number, so capping here is
+	// what keeps a slow configured rate from becoming an error.
+	n := min(len(p), lr.lim.quantum, lr.lim.burst)
+	if err := lr.lim.lim.WaitN(context.Background(), n); err != nil {
+		// Unreachable: n is capped at the burst above. Returning the error beats
+		// silently truncating a download, and a caller that reaches this line
+		// wants to know that the cap stopped being true.
+		return 0, fmt.Errorf("transport: wait for %d bytes: %w", n, err)
 	}
+	return lr.r.Read(p[:n])
 }
 
-// quantum is the smallest grant.
+// quantumFor is the smallest grant, in bytes.
 //
-// Without it the pacing degenerates. The bucket refills continuously, so the
-// first moment it holds a single byte it grants exactly one byte, and the next
-// Read finds an empty bucket again: 8 KiB/s becomes 8192 one-byte reads and 8192
-// syscalls a second, which is slower than the unshaped path it was added to
+// Without a floor the pacing degenerates. The bucket refills continuously, so
+// the first moment it holds a single byte it grants exactly one byte, and the
+// next Read finds an empty bucket again: 8 KiB/s becomes 8192 one-byte reads and
+// 8192 syscalls a second, which is slower than the unshaped path it was added to
 // improve. A grant of roughly 50 ms worth keeps the syscall rate around 20/s at
-// any configured rate, and the floor stops a very low rate from regressing to
+// any configured rate, and the 512 floor stops a very low rate from regressing to
 // byte-at-a-time.
-func (l *bulkLimiter) quantum() int {
-	q := l.bytesPerSec / 20
-	if q < 512 {
-		q = 512
-	}
-	return q
-}
-
-// take consumes up to want bytes from the bucket and returns how many were
-// granted: a whole quantum, or less if that is all the caller asked for, or 0
-// when the bucket has not accumulated enough yet.
-func (l *bulkLimiter) take(want int) int {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
-	now := l.now()
-	if elapsed := now.Sub(l.last); elapsed > 0 {
-		l.tokens += elapsed.Seconds() * float64(l.bytesPerSec)
-		if l.tokens > float64(l.burst) {
-			l.tokens = float64(l.burst)
-		}
-	}
-	l.last = now
-
-	q := l.quantum()
-	if l.tokens < float64(q) {
-		return 0
-	}
-	granted := q
-	if want < granted {
-		granted = want
-	}
-	l.tokens -= float64(granted)
-	return granted
-}
-
-// wait sleeps for the time it takes the bucket to refill one quantum.
-//
-// Derived from the configured rate rather than hardcoded, so it stays correct if
-// the rate changes, and bounded below so a pathologically small rate cannot turn
-// this into a spin.
-func (l *bulkLimiter) wait() {
-	l.mu.Lock()
-	perQuantum := time.Duration(int64(time.Second) * int64(l.quantum()) / int64(l.bytesPerSec))
-	l.mu.Unlock()
-	if perQuantum < time.Millisecond {
-		perQuantum = time.Millisecond
-	}
-	l.sleep(perQuantum)
+func quantumFor(bytesPerSec int) int {
+	return max(bytesPerSec/20, 512)
 }
 
 // String describes the limit for logs and telemetry.

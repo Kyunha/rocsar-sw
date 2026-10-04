@@ -1,14 +1,19 @@
 // Command gs_cli is the operator console for the OBC, from a terminal.
 //
 // Everything else in tools/ talks to hardware directly. This is the one tool that
-// speaks to the server, and it is here because the Ground Station -- a PySide6
-// application on a laptop -- is not written yet, and until it is, there is no way
-// to see or drive the system except by hand.
+// speaks to the server, and it exists because a laptop with no webkit still has to
+// be able to see and drive the system.
+//
+// The link itself lives in internal/client, which the Wails console in cmd/gs
+// also uses. This is the presentation and the argument parsing; the sockets, the
+// framing, the validation and the artefact transfer are the shared package's. One
+// client against the OBC rather than two, because two would be two things to
+// disagree with the server about the frame layout -- and the frame layout has
+// already cost an afternoon once, see internal/client.
 //
 // It shares api/rocsar/v1 with the OBC, so there is one schema and one set of
 // generated bindings across both sides rather than a Go and a Python copy of the
-// same contract that can disagree. tools/gs_probe.py proved the wire works from
-// pyzmq; this proves it from the same binding the server uses.
+// same contract that can disagree.
 //
 //	gs_cli watch                 follow telemetry
 //	gs_cli status                one telemetry frame and exit
@@ -22,13 +27,18 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
+
+	rocsarv1 "github.com/rocsar/obc/api/rocsar/v1"
+	"github.com/rocsar/obc/internal/client"
 )
 
 // firstFlag returns the index of the first argument that looks like a flag, or -1.
@@ -58,6 +68,12 @@ func (v flagValue) Set(s string) error {
 		*p = s == "true" || s == "1"
 	}
 	return nil
+}
+
+// console is this tool's view of the shared client: the client plus the handful of
+// settings that are about output rather than about the link.
+type console struct {
+	cli *client.Client
 }
 
 func main() {
@@ -121,7 +137,12 @@ func run() error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	c := &client{control: *control, telemetry: *telemetry, http: *httpAddr, topic: *topic}
+	c := &console{cli: client.New(client.Config{
+		Control:   *control,
+		Telemetry: *telemetry,
+		HTTP:      *httpAddr,
+		Topic:     *topic,
+	})}
 
 	switch args[0] {
 	case "watch":
@@ -137,7 +158,7 @@ func run() error {
 		printCommands()
 		return nil
 	case "ls":
-		return c.list(ctx)
+		return c.list(ctx, "")
 	case "fetch":
 		if len(args) < 2 {
 			return errors.New("fetch needs an artefact name; try `gs_cli ls`")
@@ -159,7 +180,7 @@ func usage() {
   status               print one telemetry frame and exit
   cmd <name> [args]    send one command
   commands             list the command names cmd accepts
-  ls                   list the artefacts on the OBC
+  ls [path]            list the artefacts on the OBC
   fetch <artefact>     download an artefact over HTTP
 
 flags:
@@ -167,27 +188,181 @@ flags:
 	flag.PrintDefaults()
 }
 
+// printCommands lists what `cmd` accepts.
+//
+// The names come from the shared client rather than from a table kept here, so
+// this listing cannot drift from what cmd actually accepts -- the window in
+// cmd/gs reads the same list.
 func printCommands() {
-	fmt.Println(`commands, by the name "cmd" takes:
-
-  query                        the OBC's own status
-  photo                        capture one photograph
-  gnss <receiver-id>           select a GNSS receiver
-  heading <degrees>            point both antenna axes at a bearing
-  jog <servo-id> <tick>        move one axis to an absolute tick
-  zero                         centre both axes
-  mount <servo-id> <degrees>   set an axis's mount offset
-  dir <servo-id> <+1|-1>       set an axis's direction
-  heater <1|2> <on|off>        switch a heater
-  stop <servo-id|all>          stop one axis, or every axis
-  pico-status                  ask the flight controller to re-announce itself
-  sdr-probe                    run uhd_usrp_probe
-  sdr-connect                  start the acquisition program
-  sdr-reset-usb                power-cycle the SDR's USB port
-  link <kbit>                  set the link rate limit
-  reboot                       restart the OBC
-
+	help := map[string]string{
+		"query":         "the OBC's own status",
+		"photo":         "capture one photograph",
+		"gnss":          "<receiver-id>       select a GNSS receiver",
+		"heading":       "<degrees>          point both antenna axes at a bearing",
+		"jog":           "<servo-id> <tick>   move one axis to an absolute tick",
+		"zero":          "[<servo-id>]        centre one axis, or both",
+		"mount":         "<servo-id> <deg>    set an axis's mount offset",
+		"dir":           "<servo-id> <+1|-1>  set an axis's direction",
+		"heater":        "<1|2> <on|off>     switch a heater",
+		"stop":          "<servo-id|all>     stop one axis, or every axis",
+		"pico-status":   "ask the flight controller to re-announce itself",
+		"sdr-probe":     "run uhd_usrp_probe",
+		"sdr-connect":   "start the acquisition program",
+		"sdr-reset-usb": "power-cycle the SDR's USB port",
+		"link":          "<kbit>             set the link rate limit",
+		"reboot":        "restart the OBC",
+	}
+	for _, name := range client.Names() {
+		if h, ok := help[name]; ok {
+			fmt.Printf("  %-28s %s\n", name, h)
+			continue
+		}
+		fmt.Printf("  %s\n", name)
+	}
+	fmt.Print(`
 There is no arm gate. That was removed deliberately: it added a step between an
 operator and a command without making anything safer, because the one consumer
-that had it was a bench tool.`)
+that had it was a bench tool. The window in cmd/gs does require confirmation for
+motion, for reasons that do not transfer to a terminal -- see GUI_ARCHITECTURE.md
+section 10.`)
+}
+
+// ---------------------------------------------------------------------------
+// Telemetry
+// ---------------------------------------------------------------------------
+
+// watch follows telemetry until interrupted.
+func (c *console) watch(ctx context.Context, raw bool) error {
+	s, err := c.cli.Subscribe()
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+
+	fmt.Printf("following %s; Ctrl-C to stop\n\n", c.cli.Config().Telemetry)
+	return c.pump(ctx, s, raw, true)
+}
+
+// status prints one frame.
+func (c *console) status(ctx context.Context, raw bool) error {
+	s, err := c.cli.Subscribe()
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+
+	return c.pump(ctx, s, raw, false)
+}
+
+func (c *console) pump(ctx context.Context, s *client.Subscription, raw, forever bool) error {
+	for {
+		frame, err := s.Recv(client.SubTimeout())
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			return err
+		}
+		if raw {
+			b, _ := jsonFrame(frame)
+			fmt.Println(string(b))
+		} else {
+			printTelemetry(frame)
+		}
+		if !forever {
+			return nil
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Commands
+// ---------------------------------------------------------------------------
+
+// command sends one request and waits for its reply.
+func (c *console) command(ctx context.Context, name string, args []string) error {
+	reqs, err := client.BuildRequests(name, args)
+	if err != nil {
+		return err
+	}
+
+	for i, req := range reqs {
+		resp, err := c.cli.Send(ctx, req)
+		if err != nil {
+			if i == 0 {
+				return err
+			}
+			// A multi-axis command that got partway must say which axis it reached,
+			// or the operator retries `zero` and cannot tell what is already centred.
+			return fmt.Errorf("%w (axis %d of %d had already been sent)", err, i, len(reqs))
+		}
+		fmt.Printf("%s: success=%v error=%s\n", name, resp.GetSuccess(), resp.GetError())
+		if m := resp.GetMessage(); m != "" {
+			fmt.Printf("  %s\n", m)
+		}
+		if n := resp.GetArtefactName(); n != "" {
+			fmt.Printf("  artefact   %s (%d bytes, %s) -- gs_cli fetch %s\n",
+				n, resp.GetArtefactSizeBytes(), resp.GetArtefactKind(), n)
+		}
+		if !resp.GetSuccess() {
+			return fmt.Errorf("the OBC refused: %s", resp.GetError())
+		}
+	}
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Artefacts
+// ---------------------------------------------------------------------------
+
+func (c *console) list(ctx context.Context, path string) error {
+	listing, err := c.cli.List(ctx, path)
+	if err != nil {
+		return err
+	}
+	if len(listing.Files) == 0 {
+		fmt.Println("no artefacts")
+		return nil
+	}
+	for _, e := range listing.Files {
+		if e.Directory {
+			fmt.Printf("%-44s %-8s %10s\n", e.Name+"/", "dir", "-")
+			continue
+		}
+		fmt.Printf("%-44s %-8s %10d\n", e.Name, e.Kind, e.SizeBytes)
+	}
+	return nil
+}
+
+// fetch downloads an artefact.
+//
+// Every line of narration goes to stderr, and that is not tidiness. With no -o,
+// the artefact itself goes to stdout -- `gs_cli fetch photo.jpg > out.jpg` is the
+// obvious invocation -- so a single status line printed to stdout lands in the
+// middle of the file and produces something that is not a JPEG, with no error
+// anywhere to explain it. The tool had exactly that bug: it printed
+// "<name>: <n> bytes" to stdout while fetching to stdout.
+func (c *console) fetch(ctx context.Context, name, out string, resume bool) error {
+	x, err := c.cli.Fetch(ctx, name, out, resume, client.FetchHooks{
+		Note: func(s string) { fmt.Fprintln(os.Stderr, s) },
+	})
+	if err != nil {
+		return err
+	}
+
+	where := out
+	if where == "" {
+		where = "stdout"
+	} else {
+		where = filepath.Base(where)
+	}
+	fmt.Fprintf(os.Stderr, "wrote %s: %d bytes in %.1fs (%.1f kB/s)\n",
+		where, x.Bytes, x.Elapsed.Seconds(), x.Rate())
+	return nil
+}
+
+// jsonFrame is kept here rather than in internal/client so the client package has
+// no opinion about how a console prints.
+func jsonFrame(f *rocsarv1.TelemetryFrame) ([]byte, error) {
+	return json.Marshal(f)
 }

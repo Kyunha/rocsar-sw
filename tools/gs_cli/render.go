@@ -1,18 +1,20 @@
 package main
 
 import (
-	"context"
-	"errors"
 	"fmt"
-	"io"
-	"net/http"
-	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
 	rocsarv1 "github.com/rocsar/obc/api/rocsar/v1"
 )
+
+// This file is presentation and nothing else.
+//
+// It is the terminal's rendering of a telemetry frame. The equivalent for the
+// window in cmd/gs is internal/gsview, which produces structs rather than text
+// and is testable without a screen. Neither is the place where a value is
+// decoded, validated or fetched -- that is internal/client, which both consoles
+// share. What lives here is only the question of what a human reads.
 
 // printTelemetry renders one frame as a fixed-shape block.
 //
@@ -21,9 +23,9 @@ import (
 // conditional layout defeats that.
 //
 // Every value is qualified. A reading that is absent, held or simulated says so,
-// because a bare number is indistinguishable from a real one -- and a Ground
-// Station that renders a held value as a live one is the failure this project
-// exists to prevent.
+// because a bare number is indistinguishable from a real one -- and a console
+// that renders a held value as a live one is the failure this project exists to
+// prevent.
 func printTelemetry(f *rocsarv1.TelemetryFrame) {
 	s := f.System
 	up := time.Duration(s.GetUptimeS()) * time.Second
@@ -115,6 +117,9 @@ func printTelemetry(f *rocsarv1.TelemetryFrame) {
 	fmt.Println()
 }
 
+// measuredOrHeld distinguishes a reading from a bearing the flight controller is
+// holding because the IMU has gone quiet. imu_present is the only thing that
+// separates the two, and a heading shown without it is a guess.
 func measuredOrHeld(present bool) string {
 	if present {
 		return "MEASURED"
@@ -129,6 +134,13 @@ func onOff(b bool) string {
 	return "off"
 }
 
+// feedbackName renders feedback_state, which is an int32 on the wire rather than
+// the enum, so that a value from a future firmware decodes to a plain integer
+// instead of failing the whole frame. See api/rocsar/v1/common.proto and
+// test/schema_test.go, which fails to compile if that ever becomes an enum.
+//
+// The unknown case is deliberate: a number the operator has never seen is more
+// useful than a name we guessed.
 func feedbackName(v int32) string {
 	switch v {
 	case 1:
@@ -140,133 +152,4 @@ func feedbackName(v int32) string {
 	default:
 		return fmt.Sprintf("state %d", v)
 	}
-}
-
-// fetch downloads an artefact.
-//
-// Two things it does that a bare GET does not:
-//
-//   - It resumes. The link is 115 kbit/s and the files are tens of megabytes, so
-//     an interrupted download is the normal case rather than the exceptional one.
-//     The server answers a Range request with 206, and this asks for the remainder.
-//   - It writes to a temporary file and renames, so an interrupted transfer never
-//     leaves a truncated file that looks complete. A partial photograph that looks
-//     whole is worse than no photograph.
-func (c *client) fetch(ctx context.Context, name, out string, resume bool) error {
-	// Validate the name before it becomes part of a URL and a filesystem path.
-	//
-	// Subdirectories are ALLOWED, and they have to be: the listing reports names
-	// like `photos/camera-20261004-223347.jpg`, so a stricter rule here makes
-	// `gs_cli ls` output impossible to paste straight into `gs_cli fetch`. The first
-	// version of this rejected every "/" and so refused the exact names the tool one
-	// line earlier had printed.
-	//
-	// Refused is anything that could leave the artefact root: a parent traversal, a
-	// leading slash, a backslash, or an empty component. The server validates this
-	// properly too; refusing here means the tool says so itself rather than relying
-	// on the far side.
-	if name == "" {
-		return errors.New("no artefact name given; `gs_cli ls` lists them")
-	}
-	if strings.Contains(name, "..") || strings.HasPrefix(name, "/") ||
-		strings.Contains(name, "\\") || strings.Contains(name, "//") {
-		return fmt.Errorf("%q is not an artefact name inside the data root", name)
-	}
-
-	url := c.http + "/" + name
-
-	// Resume: find out how much of the partial file is already there.
-	var have int64
-	partial := out + ".part"
-	if resume {
-		if st, err := os.Stat(partial); err == nil {
-			have = st.Size()
-			fmt.Printf("resuming at %d bytes\n", have)
-		}
-	}
-	if !resume {
-		_ = os.Remove(partial)
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return err
-	}
-	if have > 0 {
-		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", have))
-	}
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("fetch %s: %w", name, err)
-	}
-	defer resp.Body.Close()
-
-	// A server that ignored the Range answers 200 with the whole body. Appending
-	// that to the partial file would silently corrupt it.
-	truncated := have > 0 && resp.StatusCode != http.StatusPartialContent
-	if truncated {
-		fmt.Printf("server ignored the Range (HTTP %d); starting over\n", resp.StatusCode)
-		have = 0
-	}
-
-	switch resp.StatusCode {
-	case http.StatusOK, http.StatusPartialContent:
-	default:
-		return fmt.Errorf("fetch %s: HTTP %d", name, resp.StatusCode)
-	}
-
-	if total := resp.ContentLength; total > 0 && resp.StatusCode != http.StatusPartialContent {
-		fmt.Printf("%s: %d bytes\n", name, total)
-	}
-
-	dst := os.Stdout
-	var f *os.File
-	if out != "" {
-		flags := os.O_CREATE | os.O_WRONLY
-		if have > 0 {
-			flags |= os.O_APPEND
-		} else {
-			flags |= os.O_TRUNC
-		}
-		f, err = os.OpenFile(partial, flags, 0o644)
-		if err != nil {
-			return err
-		}
-		defer f.Close()
-		dst = f
-	}
-
-	start := time.Now()
-	written, err := io.Copy(dst, resp.Body)
-	if err != nil {
-		return fmt.Errorf("%s: interrupted after %d bytes: %w", name, written, err)
-	}
-	if f != nil {
-		if err := f.Close(); err != nil {
-			return err
-		}
-		if err := os.Rename(partial, out); err != nil {
-			return err
-		}
-	}
-
-	total := have + written
-	el := time.Since(start).Seconds()
-	where := out
-	if where == "" {
-		where = "stdout"
-	} else {
-		where = filepath.Base(where)
-	}
-	fmt.Fprintf(os.Stderr, "wrote %s: %d bytes in %.1fs (%.1f kB/s)\n",
-		where, total, el, float64(total)/1024/maxf(el, 0.001))
-	return nil
-}
-
-func maxf(a, b float64) float64 {
-	if a > b {
-		return a
-	}
-	return b
 }

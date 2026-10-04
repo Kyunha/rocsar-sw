@@ -90,21 +90,8 @@ var subsystemOwners = map[string][]string{
 		"internal/sdr",
 		// Runs tc to shape the link.
 		"internal/qos",
-		// Runs fswebcam.
-		//
-		// The third entry, and the only one added by asking rather than by
-		// accident. The hand-written V4L2 path in this package negotiates the
-		// camera correctly and then never receives a frame on the target hardware:
-		// every ioctl succeeds and poll() returns POLLERR immediately after
-		// STREAMON, at every resolution and pixel format, with and without
-		// O_NONBLOCK, S_INPUT or a settle delay, via both mmap/DQBUF and read().
-		// fswebcam photographs the same node at the same moment and works.
-		//
-		// So the working mechanism is used and the built-in one is kept for when
-		// fswebcam is absent. This is the same shape as the qos.Limiter deletion:
-		// code is justified by having a caller and being verified, not by being
-		// written here.
-		"internal/camera",
+	// Runs fswebcam to photograph the camera.
+	"internal/camera",
 	},
 }
 
@@ -147,11 +134,6 @@ func TestSubprocessIsConfinedToItsOwners(t *testing.T) {
 		// Test files are not in the shipped binary, so what they import is not a
 		// property of the system this rule exists to constrain.
 		//
-		// internal/camera shells out from v4l2_test.go to compile a C probe
-		// against videodev2.h and compare the real VIDIOC codes with ours. That is
-		// verification, not a runtime dependency, and internal/camera still
-		// imports no os/exec at all.
-		//
 		// The alternative -- letting a test reach outside the layering rules --
 		// would be worse than useless, because the rules are only worth having
 		// while something is allowed to break them.
@@ -187,7 +169,7 @@ func TestGeneratedProtobufIsConfinedToCodecPackages(t *testing.T) {
 	root := moduleRoot(t)
 	const genPath = "github.com/rocsar/obc/api/rocsar/v1"
 
-	// The four places where the wire and the domain meet, and nowhere else.
+	// The five places where the wire and the domain meet, and nowhere else.
 	allowed := map[string]bool{
 		// transport encodes and decodes the frames.
 		"internal/transport": true,
@@ -200,6 +182,19 @@ func TestGeneratedProtobufIsConfinedToCodecPackages(t *testing.T) {
 		"internal/command": true,
 		// the composition root wires concrete implementations together.
 		"cmd/obc": true,
+		// client is the Ground Station's end of the same wire: it encodes
+		// CommandRequest and decodes TelemetryFrame. It was promoted out of
+		// tools/gs_cli, which escaped this rule only because allGoFiles never
+		// looked at tools/ -- so the entry below is not a loosening, it is the
+		// first time this package has been checked at all.
+		//
+		// The same reasoning as internal/command applies and no further: it
+		// converts at the socket edge and nothing below that point touches
+		// protobuf. It does NOT reach into internal/domain, because domain
+		// types describe what the OBC saw, and this side of the link never saw
+		// any of it -- it has a TelemetryFrame and that is the whole of its
+		// knowledge.
+		"internal/client": true,
 	}
 
 	for _, f := range allGoFiles(t, root) {

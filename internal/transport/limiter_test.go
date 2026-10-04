@@ -16,148 +16,97 @@ import (
 // was shipped, asserted by a test, and never classified a single packet (three
 // separate faults, ARCHITECTURE.md 6.6). So the bound has to be asserted here, or
 // it is not asserted at all.
+//
+// What is NOT tested here is the token arithmetic. It belongs to x/time/rate and
+// has more users than this project. What is tested is the part specific to this
+// link: the quantum, and the fact that a paced reader blocks and returns whole
+// bytes.
 
 // A rate that is actually applied.
 //
-// Without a fake clock this would have to transfer a megabyte to measure, so the
-// clock is injected and the arithmetic is checked directly.
-func TestBulkLimiterGrantsAtTheConfiguredRate(t *testing.T) {
-	// 1000 B/s. Burst and initial fill are both 1000, and the quantum is the
-	// 512 floor (1000/20 would be 50).
-	l := newBulkLimiter(1000)
-	quantum := l.quantum()
-	if quantum != 512 {
-		t.Fatalf("quantum = %d, want 512; this test's arithmetic assumes it", quantum)
-	}
-
-	now := time.Unix(0, 0)
-	l.now = func() time.Time { return now }
-	var slept []time.Duration
-	l.sleep = func(d time.Duration) { slept = append(slept, d) }
-
-	// Start full: one quantum, then nothing until time passes.
-	if got := l.take(1 << 20); got != quantum {
-		t.Fatalf("first grant = %d, want one quantum (%d)", got, quantum)
-	}
-	if got := l.take(1 << 20); got != 0 {
-		t.Errorf("a drained bucket granted %d bytes; it should grant nothing until it refills", got)
-	}
-
-	// Measure the refill from empty. Draining by calling take() does not work:
-	// take() returns 0 while the bucket is below the quantum, so it cannot consume
-	// the remainder. Zero it directly instead -- this is a white-box test and a
-	// deterministic starting state is worth more here than exercising the drain.
-	l.mu.Lock()
-	l.tokens = 0
-	l.last = now
-	l.mu.Unlock()
-
-	// Short of a quantum: 400 ms refills 400 of the 512 needed.
-	now = now.Add(400 * time.Millisecond)
-	if got := l.take(1 << 20); got != 0 {
-		t.Errorf("at 400 tokens the grant was %d, want 0 -- the quantum is %d", got, quantum)
-	}
-
-	// Another 200 ms crosses it.
-	now = now.Add(200 * time.Millisecond)
-	if got := l.take(1 << 20); got != quantum {
-		t.Errorf("at 600 tokens the grant was %d, want one quantum (%d)", got, quantum)
-	}
-
-	// It must never grant more than the caller asked for, or a small remaining
-	// range read would be padded. Refill past the quantum first.
-	now = now.Add(time.Second)
-	if got := l.take(10); got != 10 {
-		t.Errorf("a request for 10 bytes was granted %d, want 10", got)
-	}
-	_ = slept // asserted at the reader level, where the loop that would spin lives
-}
-
-// The reader must not busy-loop when the bucket is empty.
-//
-// io.Copy treats a zero-length read with no error as "call me again", so a reader
-// that returned (0, nil) instead of waiting would spin the CPU at 100% -- on the
-// flight computer, while holding a socket the radio link depends on. This
-// exercises the loop that actually runs.
+// Measured rather than computed, because the bucket is now the library's and its
+// internals are not ours to assert. What matters is that a reader which runs past
+// the burst takes real time to get the rest, and returns the right bytes.
 func TestBoundedReaderWaitsInsteadOfSpinning(t *testing.T) {
-	l := newBulkLimiter(1000)
-
-	now := time.Unix(0, 0)
-	l.now = func() time.Time { return now }
-
-	var sleeps []time.Duration
-	l.sleep = func(d time.Duration) {
-		sleeps = append(sleeps, d)
-		// Advance the clock so the loop terminates; real time would do this.
-		now = now.Add(d)
+	// Burst 4096, quantum 512. The first 4096 bytes are banked; the 1536 after
+	// them have to be earned at 4096 B/s, which is 375 ms.
+	l := newBulkLimiter(4096)
+	if l.quantum != 512 {
+		t.Fatalf("quantum = %d, want 512; this test's arithmetic assumes it", l.quantum)
 	}
 
-	// Empty the bucket so the first Read has to wait.
-	l.mu.Lock()
-	l.tokens = 0
-	l.last = now
-	l.mu.Unlock()
+	body := strings.Repeat("x", 4096+1536)
+	src := strings.NewReader(body)
 
-	src := strings.NewReader("0123456789")
-	buf := make([]byte, 4)
-
-	n, err := l.reader(src).Read(buf)
+	start := time.Now()
+	got, err := io.ReadAll(l.reader(src))
+	elapsed := time.Since(start)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if n != 4 {
-		t.Fatalf("read %d bytes, want 4", n)
+	if string(got) != body {
+		t.Fatalf("read %d bytes, want %d intact", len(got), len(body))
 	}
-	if len(sleeps) == 0 {
-		t.Fatal("the reader returned without sleeping; a drained bucket would spin")
-	}
-	// A quantum at 1000 B/s is 512 ms. Sleeping one byte-time instead would mean
-	// 8192 syscalls a second at the configured 8 KiB/s.
-	if sleeps[0] != 512*time.Millisecond {
-		t.Errorf("waited %s, want 512ms -- one quantum at 1000 B/s", sleeps[0])
+
+	// Half the expected wait, to stay honest about how long this takes. The point
+	// is that it is not instant: io.Copy treats (0, nil) as "call me again", so a
+	// reader that returned without blocking would spin the CPU at 100% on the
+	// flight computer while holding a socket the radio link depends on.
+	if want := 375 * time.Millisecond / 2; elapsed < want {
+		t.Errorf("read %d bytes past a 4096 B/s burst in %s, want at least %s -- "+
+			"the reader is not waiting", len(got), elapsed, want)
 	}
 }
 
-// The bucket is capped at one second's worth, so a long idle period does not
-// bank credit that lets the next download run wide open.
-func TestBulkLimiterCapsTheBurst(t *testing.T) {
-	l := newBulkLimiter(1000)
-
-	now := time.Unix(0, 0)
-	l.now = func() time.Time { return now }
-	l.sleep = func(time.Duration) {}
-
-	// An hour of idleness.
-	now = now.Add(time.Hour)
-
-	// Burst is 1000, so at most 1000 bytes are available however long we waited.
-	total := 0
-	for {
-		n := l.take(1 << 20)
-		if n == 0 {
-			break
+// A grant must fit inside the burst, or WaitN rejects it.
+//
+// This is a regression test, not a restatement of the code. The quantum has a 512
+// byte floor and the burst is one second's worth, so any rate below 512 B/s has a
+// quantum larger than its burst. The previous hand-rolled bucket could never
+// accumulate a full quantum at such a rate -- tokens capped at the burst, take()
+// returned 0, and the reader looped forever. Capping the grant at the burst is
+// what makes a slow configured rate work at all.
+func TestGrantIsCappedAtTheBurstAtLowRates(t *testing.T) {
+	for _, rate := range []int{1, 100, 512} {
+		l := newBulkLimiter(rate)
+		if l.quantum <= l.burst {
+			continue // no capping needed at this rate; nothing to prove
 		}
-		total += n
-	}
-	if total > 1000 {
-		t.Errorf("an hour of idleness banked %d bytes; the burst cap is 1000", total)
+
+		// A reader that reports the size of the buffer it was handed, so the grant
+		// is observed rather than inferred.
+		sized := &sizeReportingReader{r: strings.NewReader("some bytes to read")}
+
+		start := time.Now()
+		n, err := l.reader(sized).Read(make([]byte, 4096))
+		if err != nil {
+			t.Fatalf("rate %d: %v", rate, err)
+		}
+		elapsed := time.Since(start)
+
+		if sized.got > l.burst {
+			t.Errorf("rate %d: granted a read of %d bytes, above the burst of %d",
+				rate, sized.got, l.burst)
+		}
+		if n == 0 {
+			t.Errorf("rate %d: the reader returned 0 bytes rather than blocking until it could", rate)
+		}
+		// A rate of 1 B/s and a burst of 1 means this genuinely waits. Only assert
+		// it moved at all, to keep the test quick.
+		if elapsed <= 0 {
+			t.Errorf("rate %d: the read took no time at all", rate)
+		}
 	}
 }
 
-// Two downloads share one rate, because the constraint is the link and not the
-// request. Separate buckets would let N concurrent fetches through at N times the
-// configured rate, which is the failure this was added to prevent.
-func TestTwoConcurrentDownloadsShareOneRate(t *testing.T) {
-	l := newBulkLimiter(1000)
+type sizeReportingReader struct {
+	r   io.Reader
+	got int
+}
 
-	now := time.Unix(0, 0)
-	l.now = func() time.Time { return now }
-	l.sleep = func(time.Duration) {}
-
-	if a, b := l.take(1<<20), l.take(1<<20); a+b > 1000 {
-		t.Errorf("two readers were granted %d+%d = %d bytes at once; the burst is 1000",
-			a, b, a+b)
-	}
+func (s *sizeReportingReader) Read(p []byte) (int, error) {
+	s.got = len(p)
+	return s.r.Read(p)
 }
 
 // zero means unbounded, and must be usable without a nil check at every call
@@ -185,15 +134,17 @@ func TestZeroBytesPerSecondIsUnbounded(t *testing.T) {
 // all: 8 KiB/s becomes 8192 one-byte reads and 8192 syscalls a second.
 func TestQuantumKeepsTheSyscallRateSane(t *testing.T) {
 	for _, rate := range []int{1, 100, 1000, 8192, 1024 * 1024} {
-		l := newBulkLimiter(rate)
-		q := l.quantum()
+		q := quantumFor(rate)
 		if q < 512 {
 			t.Errorf("rate %d: quantum is %d, below the 512 floor", rate, q)
 		}
-		readsPerSecond := rate / q
+		// The syscall rate is governed by min(quantum, burst), because that is what
+		// is actually granted.
+		perRead := min(q, rate)
+		readsPerSecond := rate / perRead
 		if readsPerSecond > 64 {
 			t.Errorf("rate %d: quantum %d means %d reads/second, which is too many",
-				rate, q, readsPerSecond)
+				rate, perRead, readsPerSecond)
 		}
 	}
 }

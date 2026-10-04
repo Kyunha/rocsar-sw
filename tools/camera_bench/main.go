@@ -4,15 +4,14 @@
 //	camera_bench -device /dev/video1   against another node
 //	camera_bench -out /tmp/shot.jpg    keep a copy
 //
-// It composes internal/camera, so it negotiates the format exactly as the server
-// does. What it adds is the part the server cannot do: it DECODES the JPEG it
-// just wrote and checks the dimensions match what was negotiated.
+// It composes internal/camera, so it captures exactly as the server does. What
+// it adds is the part the server cannot do: it DECODES the JPEG it just wrote
+// and checks the dimensions are usable.
 //
-// That check is the point. A V4L2 camera silently ignores S_FMT requests it
-// cannot satisfy and gives you a different resolution than the one asked for, so
-// a snapshot can succeed, be written, be fetchable over HTTP, and be the wrong
-// picture -- and every layer above reports success. Asserting that what came back
-// is a real JPEG of the size we negotiated is what catches it.
+// That check is the point. A camera can silently give you a different resolution
+// than the one asked for, so a snapshot can succeed, be written, be fetchable
+// over HTTP, and be the wrong picture -- and every layer above reports success.
+// Asserting that what came back is a real JPEG of a usable size is what catches it.
 //
 // There is no live stream: the camera is snapshot-only, and a stream would
 // consume bandwidth the 115 kbit/s link does not have.
@@ -40,11 +39,10 @@ func main() {
 
 func run() error {
 	var (
-		device  = flag.String("device", "/dev/video0", "V4L2 video node")
-		dir     = flag.String("dir", "/mnt/rocsar/data", "data directory")
-		sub     = flag.String("sub", "photos", "subdirectory within the data directory")
-		quality = flag.Int("quality", 85, "JPEG quality when the camera gives us raw YUYV")
-		out     = flag.String("out", "", "also copy the JPEG here")
+		device = flag.String("device", "/dev/video0", "video device node")
+		dir    = flag.String("dir", "/mnt/rocsar/data", "data directory")
+		sub    = flag.String("sub", "photos", "subdirectory within the data directory")
+		out    = flag.String("out", "", "also copy the JPEG here")
 	)
 	flag.Parse()
 
@@ -57,7 +55,7 @@ func run() error {
 		return fmt.Errorf("data directory: %w", err)
 	}
 
-	cam := camera.NewCapture(*device, *sub, store, *quality)
+	cam := camera.NewCapture(*device, *sub, store, 85)
 
 	fmt.Printf("device %s\n", *device)
 	fmt.Println("capturing...")

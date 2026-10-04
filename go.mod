@@ -11,7 +11,10 @@ require (
 
 require (
 	github.com/go-zeromq/goczmq/v4 v4.2.2 // indirect
+	github.com/vishvananda/netlink v1.3.1 // indirect
+	github.com/vishvananda/netns v0.0.5 // indirect
 	golang.org/x/sync v0.7.0 // indirect
 	golang.org/x/sys v0.43.0 // indirect
 	golang.org/x/text v0.15.0 // indirect
+	golang.org/x/time v0.16.0 // indirect
 )

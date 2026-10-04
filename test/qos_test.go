@@ -2,51 +2,85 @@ package test
 
 import (
 	"context"
-	"errors"
+	"fmt"
 	"io"
 	"log/slog"
-	"os/exec"
 	"strings"
+	"sync"
+	"syscall"
 	"testing"
 
+	"github.com/rocsar/obc/internal/domain"
 	"github.com/rocsar/obc/internal/qos"
 )
 
-// fakeExec records the tc invocations and returns canned output.
-type fakeExec struct {
-	calls [][]string
-	// respond maps a substring of the joined command to a canned result.
-	respond func(joined string) (string, error)
+// fakeOps records the traffic control calls Apply makes and can fail any of them.
+//
+// It replaces a fake that recorded tc command lines. The calls are recorded as
+// structured values rather than as rendered text, so a test asserts the hierarchy
+// itself -- handle, parent, rate, ceiling -- instead of matching a command string.
+type fakeOps struct {
+	mu    sync.Mutex
+	calls []string
+
+	// failOn, if non-empty, is a substring of the call that should fail.
+	failOn string
+	err    error
 }
 
-func (f *fakeExec) run(ctx context.Context, name string, args ...string) (string, error) {
-	f.calls = append(f.calls, append([]string{name}, args...))
-	joined := strings.Join(args, " ")
-	if f.respond != nil {
-		if out, err := f.respond(joined); err != nil || out != "" {
-			return out, err
+func (f *fakeOps) record(call string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, call)
+	if f.failOn != "" && strings.Contains(call, f.failOn) {
+		return f.err
+	}
+	return nil
+}
+
+func (f *fakeOps) recorded() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.calls...)
+}
+
+func (f *fakeOps) ClearRoot(device string) error {
+	return f.record("clear " + device)
+}
+
+func (f *fakeOps) AddRootHTB(device string) error {
+	return f.record("root-htb " + device)
+}
+
+func (f *fakeOps) AddClass(device string, classid, parent uint32, rateKbps, ceilKbps uint32) error {
+	return f.record(fmt.Sprintf("class %s parent %s rate %d ceil %d",
+		qos.HandleString(classid), qos.HandleString(parent), rateKbps, ceilKbps))
+}
+
+func (f *fakeOps) AddLeaf(device string, parent, leaf uint32) error {
+	return f.record(fmt.Sprintf("leaf %s under %s", qos.HandleString(leaf), qos.HandleString(parent)))
+}
+
+func (f *fakeOps) Present(device string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, c := range f.calls {
+		if c == "root-htb "+device {
+			return true, nil
 		}
 	}
-	return "", nil
+	return false, nil
 }
 
-func (f *fakeExec) joined() []string {
-	out := make([]string, 0, len(f.calls))
-	for _, c := range f.calls {
-		out = append(out, strings.Join(c, " "))
-	}
-	return out
-}
-
-func newTestShaper(f *fakeExec) *qos.Shaper {
-	return qos.NewShaper(slog.New(slog.NewTextHandler(io.Discard, nil)), f.run)
+func newTestShaper(f *fakeOps) *qos.Shaper {
+	return qos.NewShaper(slog.New(slog.NewTextHandler(io.Discard, nil)), f)
 }
 
 // Apply must install the hierarchy the ARCHITECTURE.md 6.6 specifies: HTB root,
 // a priority class with a floor and a ceiling at the full link, and a bulk class
 // for everything else.
 func TestShaperInstallsTheSpecifiedHierarchy(t *testing.T) {
-	f := &fakeExec{}
+	f := &fakeOps{}
 	s := newTestShaper(f)
 
 	ok, reason := s.Apply(context.Background(), "eth0", 115)
@@ -54,24 +88,49 @@ func TestShaperInstallsTheSpecifiedHierarchy(t *testing.T) {
 		t.Fatalf("Apply failed: %s", reason)
 	}
 
-	joined := strings.Join(f.joined(), "\n")
-
+	got := strings.Join(f.recorded(), "\n")
 	for _, want := range []string{
-		"qdisc add dev eth0 root handle 1: htb default 10",
-		"class add dev eth0 parent 1: classid 1:10 htb rate 41kbit ceil 115kbit",
-		"class add dev eth0 parent 1: classid 1:20 htb rate 74kbit ceil 74kbit",
-		"qdisc add dev eth0 parent 1:10 handle 110: pfifo",
-		"qdisc add dev eth0 parent 1:20 handle 120: pfifo",
+		"clear eth0",
+		"root-htb eth0",
+		"class 1:a parent 1: rate 41 ceil 115",
+		"class 1:14 parent 1: rate 74 ceil 74",
+		"leaf 6e: under 1:a",
+		"leaf 78: under 1:14",
 	} {
-		if !strings.Contains(joined, want) {
-			t.Errorf("missing tc invocation:\n  %s\ngot:\n  %s", want, joined)
+		if !strings.Contains(got, want) {
+			t.Errorf("missing traffic control call %q; got:\n%s", want, got)
 		}
 	}
 
-	// The prior hierarchy is cleared first, or `class add` fails on the second
+	// The prior hierarchy is cleared first, or the class adds fail on the second
 	// start and shaping silently degrades.
-	if len(f.calls) == 0 || strings.Join(f.calls[0], " ") != "tc qdisc del dev eth0 root" {
-		t.Errorf("the existing qdisc was not cleared first; first call was %v", f.calls[0])
+	if first := f.recorded()[0]; first != "clear eth0" {
+		t.Errorf("the existing qdisc was not cleared first; first call was %q", first)
+	}
+}
+
+// The handles are exported and asserted directly, because they are the documented
+// shape of the link and a refactor that renumbered them would silently move
+// traffic between classes.
+func TestHierarchyHandlesMatchTheDocumentedLink(t *testing.T) {
+	for _, c := range []struct {
+		got  uint32
+		want string
+	}{
+		{qos.RootHandle, "1:"},
+		{qos.PriorityClass, "1:a"},
+		{qos.BulkClass, "1:14"},
+		{qos.PriorityLeaf, "6e:"},
+		{qos.BulkLeaf, "78:"},
+	} {
+		if s := qos.HandleString(c.got); s != c.want {
+			t.Errorf("handle = %s, want %s", s, c.want)
+		}
+	}
+	// Unclassified traffic must default to the priority class, not the bulk one.
+	if qos.DefaultClassMinor != 10 {
+		t.Errorf("default class minor = %d, want 10 -- with default 20 every "+
+			"unclassified packet goes to bulk and telemetry is unreachable", qos.DefaultClassMinor)
 	}
 }
 
@@ -84,32 +143,36 @@ func TestShaperInstallsTheSpecifiedHierarchy(t *testing.T) {
 // unclassified traffic to the BULK class and made the priority class unreachable.
 // Fixing all three problems still did not make it match on the target.
 //
-// So this asserts two things instead: that no filter is installed (adding one
-// back without reading the note in shaper.go would be a regression, not a fix),
-// and that telemetry never claims more than a rate cap.
+// This asserts the parts that remain: that unclassified traffic still defaults to
+// the priority class, that the rate cap is still there, and that telemetry never
+// claims more than a rate cap. Adding a filter back is now structurally harder than
+// it was -- qos.KernelOps has no method that installs one -- but the reason string
+// is what an operator reads, so it is asserted here.
 func TestNoClassificationFilterIsInstalled(t *testing.T) {
-	f := &fakeExec{}
+	f := &fakeOps{}
 	s := newTestShaper(f)
 	ok, reason := s.Apply(context.Background(), "eth0", 115)
 	if !ok {
 		t.Fatalf("Apply failed: %s", reason)
 	}
 
-	joined := strings.Join(f.joined(), "\n")
-	if strings.Contains(joined, "flower") || strings.Contains(joined, "filter") {
-		t.Errorf("a classification filter was installed; it does not work on this "+
-			"interface and re-adding it will look like a fix while bulk traffic "+
-			"still shares the priority class:\n%s", joined)
+	joined := strings.Join(f.recorded(), "\n")
+	for _, forbidden := range []string{"filter", "flower", "u32", "net_cls", "nftables"} {
+		if strings.Contains(joined, forbidden) {
+			t.Errorf("something matching %q was installed; classification does not work "+
+				"on this interface and re-adding it will look like a fix while bulk traffic "+
+				"still shares the priority class:\n%s", forbidden, joined)
+		}
 	}
 
 	// The default must be the priority class. With `default 20` every
 	// unclassified packet went to bulk and nothing could reach 1:10 at all.
-	if !strings.Contains(joined, "htb default 10") {
-		t.Errorf("unclassified traffic does not default to the priority class:\n%s", joined)
+	if qos.DefaultClassMinor != 10 {
+		t.Errorf("unclassified traffic does not default to the priority class")
 	}
 
 	// The rate cap is the part that works, so it must still be there.
-	for _, want := range []string{"rate 41kbit ceil 115kbit", "rate 74kbit"} {
+	for _, want := range []string{"rate 41 ceil 115", "rate 74 ceil 74"} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("the rate cap lost %q:\n%s", want, joined)
 		}
@@ -138,41 +201,37 @@ func TestNoClassificationFilterIsInstalled(t *testing.T) {
 	}
 }
 
-// `tc qdisc del` on a device with no qdisc returns an error, and for us that is
-// SUCCESS. Anchored on the exact text, because the message for a missing tc
-// binary also contains "not found" and would otherwise read as "nothing to
-// delete" -- reporting success when tc is not installed at all, and then nothing
-// is shaped.
-func TestDeletingAnAbsentQdiscIsSuccessButAMissingTcIsNot(t *testing.T) {
+// Clearing a device with no hierarchy of ours is success. There are two ways the
+// kernel says so -- ENOENT when there is no qdisc at that handle, and EINVAL when
+// the device's root qdisc has handle zero, which is what every fresh interface
+// carries. The tc implementation had to match both as text.
+func TestClearingAnAbsentQdiscIsSuccessButAPermissionFailureIsNot(t *testing.T) {
 	cases := []struct {
 		name    string
-		out     string
 		err     error
-		wantOK  bool // did Apply report success?
+		wantOK  bool
 		comment string
 	}{
 		{
-			name:   "no qdisc present",
-			out:    "RTNETLINK answers: No such file or directory",
-			err:    errors.New("exit status 2"),
+			name:   "no qdisc at that handle",
+			err:    syscall.ENOENT,
 			wantOK: true,
 		},
 		{
-			name:   "tc not installed",
-			out:    `exec: "tc": executable file not found in $PATH`,
-			err:    errors.New("executable file not found"),
+			name:   "root qdisc has handle zero",
+			err:    syscall.EINVAL,
+			wantOK: true,
+		},
+		{
+			name:   "no capability",
+			err:    syscall.EPERM,
 			wantOK: false,
 		},
 	}
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			f := &fakeExec{respond: func(joined string) (string, error) {
-				if strings.Contains(joined, "qdisc del") {
-					return c.out, c.err
-				}
-				return "", nil
-			}}
+			f := &fakeOps{failOn: "clear eth0", err: c.err}
 			s := newTestShaper(f)
 			ok, reason := s.Apply(context.Background(), "eth0", 115)
 			if ok != c.wantOK {
@@ -185,30 +244,33 @@ func TestDeletingAnAbsentQdiscIsSuccessButAMissingTcIsNot(t *testing.T) {
 	}
 }
 
-// tc failing must never take down a telemetry server, and the reason must reach
-// telemetry so the operator can act on it.
+// Traffic control failing must never take down a telemetry server, and the reason
+// must reach telemetry so the operator can act on it.
 func TestShaperNeverPanicsAndAlwaysExplainsItself(t *testing.T) {
 	cases := []struct {
 		name       string
 		device     string
 		rate       uint32
-		execErr    error
-		execOut    string
+		failOn     string
+		err        error
 		wantOK     bool
 		wantSubstr string
 	}{
-		{"tc missing entirely", "eth0", 115, exec.ErrNotFound, "", false, "tc"},
-		{"sudo needs a password", "eth0", 115, errors.New("exit status 1"), "sudo: a password is required", false, "sudo"},
-		{"wrong interface", "eth0", 115, errors.New("exit status 1"), "Cannot find device \"eth0\"", false, "Cannot find device"},
-		{"kernel without htb", "eth0", 115, errors.New("exit status 2"), "Specified qdisc kind is unknown", false, "unknown"},
-		{"empty device", "", 115, nil, "", false, "device"},
-		{"zero rate", "eth0", 0, nil, "", false, "greater than zero"},
-		{"rate too low to shape", "eth0", 1, nil, "", false, "too low"},
+		// The two that used to be tc-specific, now expressed as what the kernel
+		// actually returns. "sudo needs a password" is gone as a concept: there is
+		// no sudo, and the failure is a capability the unit either has or does not.
+		{"no capability", "eth0", 115, "clear eth0", syscall.EPERM, false, "CAP_NET_ADMIN"},
+		{"wrong interface", "eth0", 115, "root-htb eth0", syscall.ENODEV, false, "no such network device"},
+		{"kernel without htb", "eth0", 115, "root-htb eth0", syscall.EOPNOTSUPP, false, "traffic control"},
+
+		{"empty device", "", 115, "", nil, false, "device"},
+		{"zero rate", "eth0", 0, "", nil, false, "greater than zero"},
+		{"rate too low to shape", "eth0", 1, "", nil, false, "too low"},
 	}
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			f := &fakeExec{respond: func(string) (string, error) { return c.execOut, c.execErr }}
+			f := &fakeOps{failOn: c.failOn, err: c.err}
 			s := newTestShaper(f)
 
 			ok, reason := s.Apply(context.Background(), c.device, c.rate)
@@ -233,8 +295,29 @@ func TestShaperNeverPanicsAndAlwaysExplainsItself(t *testing.T) {
 	}
 }
 
-// "tc unavailable", "no permission" and "disabled by configuration" are three
-// different operator actions and must not be collapsed into one boolean.
+// A failure partway through must not be reported as shaping being in force.
+//
+// This is the case where the kernel accepted the root qdisc and then refused a
+// class. The device is left half-shaped, and telemetry claiming "active" would be
+// the wrong answer in a way that is hard to notice.
+func TestPartialInstallIsNotReportedAsActive(t *testing.T) {
+	f := &fakeOps{failOn: "class 1:14", err: syscall.EPERM}
+	s := newTestShaper(f)
+
+	ok, reason := s.Apply(context.Background(), "eth0", 115)
+	if ok {
+		t.Fatal("Apply reported success after the bulk class was refused")
+	}
+	if s.Active() {
+		t.Error("Active() is true after a partial install")
+	}
+	if !strings.Contains(reason, "bulk") && !strings.Contains(reason, "class") {
+		t.Errorf("reason %q does not say which step failed", reason)
+	}
+}
+
+// "disabled by configuration" and "the kernel refused us" are two different
+// operator actions and must not be collapsed into one boolean.
 func TestInactiveReasonDistinguishesCauses(t *testing.T) {
 	// Shaping off by configuration.
 	null := qos.NewNullShaper("link shaping disabled by configuration")
@@ -246,15 +329,15 @@ func TestInactiveReasonDistinguishesCauses(t *testing.T) {
 		t.Errorf("reason %q does not say shaping was disabled deliberately", st.InactiveReason)
 	}
 
-	// Shaping on but tc missing.
-	f := &fakeExec{respond: func(string) (string, error) { return "", exec.ErrNotFound }}
+	// Shaping on but the kernel refused.
+	f := &fakeOps{failOn: "clear eth0", err: syscall.EPERM}
 	s := newTestShaper(f)
 	ok, reason := s.Apply(context.Background(), "eth0", 115)
 	if ok || reason == "" {
 		t.Fatalf("expected failure, got ok=%v reason=%q", ok, reason)
 	}
 	if strings.Contains(reason, "configuration") {
-		t.Error("a missing tc was reported as a configuration decision")
+		t.Error("a permission failure was reported as a configuration decision")
 	}
 }
 
@@ -276,3 +359,8 @@ func TestPriorityClassIsDerivedNotConfigured(t *testing.T) {
 		}
 	}
 }
+
+// The shaper must satisfy the port it is published behind, so a signature change
+// here cannot land without the composition root noticing.
+var _ domain.LinkShaper = (*qos.Shaper)(nil)
+var _ domain.LinkShaper = (*qos.NullShaper)(nil)

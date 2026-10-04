@@ -11,13 +11,6 @@ let
     mypy
     ruff
   ]);
-
-  # libzmq for cgo. Nixpkgs ships it under `zeromq`; the pkg-config file it
-  # installs calls itself `libzmq`, so the attribute name and the library name
-  # differ. Resolved here rather than interpolated into the shellHook, because
-  # a Nix interpolation buried in the middle of an indented bash string is
-  # exactly the kind of thing an editor's Nix parser gets wrong.
-  libzmqPkgConfigPath = "${pkgs.zeromq}/lib/pkgconfig";
 in
 pkgs.mkShell {
   packages = with pkgs; [
@@ -26,23 +19,34 @@ pkgs.mkShell {
     go
     git
     fish
+  ];
 
-    # ---------------------------------------------------------------------
-    # Ground Station (cmd/gs) toolchain. See GUI_ARCHITECTURE.md section 12.
-    #
-    # Every name here was checked against nixpkgs rather than assumed. The
-    # two that are easy to get wrong:
-    #
-    #   - the WebKitGTK attribute is `webkitgtk_4_1`, NOT `webkit2gtk_4_1`.
-    #     The latter does not exist and a shell that lists it fails to realise
-    #     with an unhelpful "attribute not found" rather than a build error.
-    #   - `wails` is the CLI and is currently 2.16.0, which is the version
-    #     GUI_ARCHITECTURE.md pins. There is no `wails-cli` attribute; asking
-    #     for one produces the same unhelpful failure.
-    #
-    # `zeromq` is here for cgo. go-zeromq/zmq4 links against libzmq, so both
-    # the OBC and the GS client need it present at compile time -- a laptop
-    # with no system libzmq cannot build either.
+  # -----------------------------------------------------------------------
+  # Ground Station (cmd/gs) toolchain. See GUI_ARCHITECTURE.md section 12.
+  #
+  # nativeBuildInputs, NOT packages, and that distinction is the whole reason
+  # this list is separate. `packages` only prepends to PATH; `nativeBuildInputs`
+  # additionally runs each derivation's setup hooks, and pkg-config's setup hook
+  # is what puts a library's .pc files on the search path. With webkitgtk in
+  # `packages`, `pkg-config --modversion webkit2gtk-4.1` reports "not found"
+  # while the library is sitting in the store fully downloaded -- a failure that
+  # reads like a missing dependency and is really a misplaced list.
+  #
+  # Every attribute name here was checked against nixpkgs rather than assumed.
+  # The two that are easy to get wrong:
+  #
+  #   - it is `webkitgtk_4_1`, not `webkit2gtk_4_1`. The latter does not exist,
+  #     and a shell naming it fails to evaluate with an unhelpful
+  #     "attribute not found" instead of a build error.
+  #   - `wails` is the CLI and is currently 2.16.0, which is the version
+  #     GUI_ARCHITECTURE.md pins. There is no `wails-cli` attribute; asking for
+  #     one fails the same unhelpful way.
+  #
+  # `zeromq` is here for cgo, not for a human: go-zeromq/zmq4 links against
+  # libzmq, so the OBC and the GS client both need it present at compile time.
+  # The attribute is `zeromq` and the .pc file it installs calls itself
+  # `libzmq`; the two names differ.
+  nativeBuildInputs = with pkgs; [
     wails
     nodejs
     pkg-config
@@ -54,30 +58,35 @@ pkgs.mkShell {
     echo "ROCSAR GroundStation -- development shell"
     python --version
 
-    # Wails v2's Linux frontend has two implementations behind build tags:
-    # the default is the WebKit2GTK 4.0 API, `webkit2_41` selects 4.1. Current
-    # distributions -- and webkitgtk_4_1 -- ship only 4.1, so without the tag
-    # cgo fails looking for `webkit2gtk-4.0` pkg-config modules that do not
-    # exist. The failure names a package that was never going to be installed,
-    # which is why this is set here rather than left to each build command.
+    # NOTE: the `webkit2_41` build tag does NOT belong here.
     #
-    # GOFLAGS rather than a `wails build -tags` alias: `wails build` and
-    # `wails dev` both shell out to `go build`/`go run`, so this is the one
-    # place that covers every path, including a bare `go build ./...`.
-    # Set outright rather than appended to. `nix-shell` starts from a clean
-    # environment, so there is no inherited GOFLAGS worth preserving, and the
-    # append form needs a literal `${` that has to be escaped for Nix --
-    # `''${` -- inside an already-quoted indented string. Not worth the
-    # confusion. If you need extra flags, add them here, in one place.
-    export GOFLAGS="-tags=webkit2_41"
+    # It was tried here first, in GOFLAGS, and it does not work. `wails build`
+    # and `wails dev` assemble their own tag list -- output type, mode,
+    # obfuscation, plus whatever you pass to `-tags` -- and always pass it as an
+    # explicit `-tags` on the `go build` command line. A command-line -tags
+    # overrides GOFLAGS, so the tag was silently dropped and the build died in
+    # cgo looking for `webkit2gtk-4.0`, a pkg-config module that does not exist
+    # on any current distribution. `wails build` prints its compiled tag list,
+    # and it read `Tags | []`.
+    #
+    # The tag lives in cmd/gs/wails.json as "build:tags", which is the one place
+    # both `build` and `dev` read it from. See GUI_ARCHITECTURE.md section 12.
+    #
+    # It is also not needed for a bare `go build ./...`: the webview packages
+    # hang off the `desktop` tag, which only wails sets, so without it they are
+    # never reached and cgo is never invoked. That is why the repo-wide
+    # compile check works in a plain shell with no webkit at all.
 
-    # See the note on libzmqPkgConfigPath above for why this is a plain
-    # assignment and not an append: the shell is entered fresh from a clean
-    # environment, so there is nothing to preserve and an append would only
-    # risk a second, stale path shadowing the right one.
-    export PKG_CONFIG_PATH="${libzmqPkgConfigPath}"
+    # A missing prerequisite is worth saying out loud. `wails build` fails
+    # deep inside cgo otherwise, with a message about pkg-config.
+    if ! pkg-config --exists webkit2gtk-4.1; then
+      echo "WARNING: webkit2gtk-4.1 not found; the Ground Station will not link." >&2
+    fi
+    if ! pkg-config --exists libzmq; then
+      echo "WARNING: libzmq not found; go-zeromq/zmq4 will not link." >&2
+    fi
 
-    echo "wails $(wails version 2>/dev/null | head -1), node $(node --version)"
+    echo "wails $(wails version 2>/dev/null | tail -1), node $(node --version)"
 
     if [[ $- == *i* ]]; then
       exec ${pkgs.fish}/bin/fish

@@ -1,4 +1,4 @@
-package main
+package client
 
 import (
 	"strings"
@@ -6,6 +6,10 @@ import (
 
 	rocsarv1 "github.com/rocsar/obc/api/rocsar/v1"
 )
+
+// Moved here from tools/gs_cli unchanged when the client was promoted out of
+// package main. The cases were written against real commands reaching real
+// servos; none of them is decorative.
 
 // Arguments are validated before a command is sent, not after.
 //
@@ -31,7 +35,7 @@ func TestArgumentsAreRefusedBeforeSending(t *testing.T) {
 		{"unknown command", "teleport", nil, "unknown command"},
 		{"heading is not a number", "heading", []string{"north"}, "not a number"},
 	} {
-		_, err := buildRequests(tc.cmd, tc.args)
+		_, err := BuildRequests(tc.cmd, tc.args)
 		if err == nil {
 			t.Errorf("%s: %s %v was accepted", tc.name, tc.cmd, tc.args)
 			continue
@@ -95,7 +99,7 @@ func TestValidArgumentsBuildTheRightCommand(t *testing.T) {
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			reqs, err := buildRequests(tc.cmd, tc.args)
+			reqs, err := BuildRequests(tc.cmd, tc.args)
 			if err != nil {
 				t.Fatalf("%s %v: %v", tc.cmd, tc.args, err)
 			}
@@ -113,7 +117,7 @@ func TestValidArgumentsBuildTheRightCommand(t *testing.T) {
 // `zero` centres both axes, which is two commands. Collapsing it into one would
 // centre a single axis and report success, which is worse than doing nothing.
 func TestZeroIsOneRequestPerAxis(t *testing.T) {
-	reqs, err := buildRequests("zero", nil)
+	reqs, err := BuildRequests("zero", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -140,7 +144,7 @@ func TestZeroIsOneRequestPerAxis(t *testing.T) {
 	}
 
 	// And a named axis sends exactly one.
-	reqs, err = buildRequests("zero", []string{"2"})
+	reqs, err = BuildRequests("zero", []string{"2"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -154,7 +158,7 @@ func TestZeroIsOneRequestPerAxis(t *testing.T) {
 func TestRequestIDsAreDistinct(t *testing.T) {
 	seen := map[string]bool{}
 	for i := 0; i < 50; i++ {
-		reqs, err := buildRequests("query", nil)
+		reqs, err := BuildRequests("query", nil)
 		if err != nil {
 			t.Fatal(err)
 		}
