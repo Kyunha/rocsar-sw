@@ -2,9 +2,16 @@
 
 // Host-testable model of the gondola's kinematics and command handling.
 //
-// Nothing here touches hardware, so tests/firmware_encoder_probe.cpp can drive
-// the exact logic the sketch runs and the controller can assert on the result.
-// The .ino keeps only the parts that need pins, timers, and the UART.
+// Nothing here touches hardware, which is the only reason the split exists: the
+// kinematics, the command rules and the ST3215 status parser are plain functions
+// over plain structs, so they can be compiled and driven on a host, and the .ino
+// keeps only what needs pins, timers and the UART.
+//
+// The split is still worth maintaining without a test suite attached to it. A
+// policy written in the .ino is a policy that can only be checked by flashing a
+// board and reading a serial console, and nothing about this project runs that
+// often enough to rely on. Enforcement is the compile gate and review; this file
+// is arranged so that those are enough.
 
 #include <math.h>
 #include <stddef.h>
@@ -26,8 +33,8 @@
 //
 // This assert covers the dangerous direction. The other direction (max_count
 // raised to 3 with NUM_ANTENNAS left at 2) makes the third antenna silently
-// unreportable, which no assert in this header can see -- tests/test_firmware_commands.py
-// pins the two together for that.
+// unreportable, which no assert in this header can see. The static_assert below
+// catches it at build time instead, which is the only enforcement there is.
 static_assert(NUM_ANTENNAS <=
                   sizeof(((rocsar_v1_PicoTelemetry*)0)->antennas) /
                       sizeof(((rocsar_v1_PicoTelemetry*)0)->antennas[0]),
@@ -35,9 +42,10 @@ static_assert(NUM_ANTENNAS <=
               "shared/pico_protocol.options");
 
 // EMA weight for the gondola heading. It lives here rather than in the sketch
-// because applyImuHeading() below is where it is used, and the host tests must
-// integrate with the same constant the firmware does -- a test that hardcoded
-// its own alpha would assert a different filter from the one that flies.
+// because applyImuHeading() below is where it is used. A second filter declared
+// here would stack with that one: two EMAs give an effective weight of
+// 1-(1-a)^2, which is 0.28 and not the 0.15 written down here, and nobody reading
+// either file would see it.
 #define IMU_ALPHA 0.15f
 
 // How often the sketch re-probes for a BNO055 that was absent at boot. The
@@ -48,11 +56,15 @@ static_assert(NUM_ANTENNAS <=
 // The servo ids each antenna axis speaks to on the ST3215 bus. Overridable at
 // build time (arduino-cli --build-property compiler.cpp.extra_flags=-DANTENNA_0_SERVO_ID=3)
 // so a bench rig with different servo ids needs no source change; the defaults
-// are the flight configuration the host tests assert on. They are 1 and 2: the
-// servos are the only two on the bus, and a firmware that addresses 5/10 would
-// be talking to nobody. Note that tests/test_firmware_commands.py uses these
-// ids literally rather than as arbitrary values, so a default change moves
-// those tests with it.
+// are the flight configuration. They are 1 and 2: the servos are the only two on
+// the bus, and a firmware that addresses 5/10 would be talking to nobody.
+//
+// Overridable at build time for a bench with different addressing:
+//   arduino-cli compile --build-property
+//     compiler.cpp.extra_flags=-DANTENNA_0_SERVO_ID=3 firmware/
+// Check what the board actually reports with `pico_bench status` before
+// assuming these are right -- an axis that never appears in telemetry with
+// FEEDBACK_MEASURED is almost always an id mismatch rather than a dead servo.
 #ifndef ANTENNA_0_SERVO_ID
 #define ANTENNA_0_SERVO_ID 1
 #endif
@@ -194,8 +206,8 @@ inline bool shouldSendServoTick(uint16_t lastSent, uint16_t target) {
 // could not represent at all.
 //
 // These live here rather than in the sketch because they are part of the framing
-// contract the tests pin, and a test cannot assert on a #define in a file it can
-// only read.
+// contract, and a #define inside the .ino can only be read, not checked against
+// the code that uses it.
 #define SERVO_STATUS_WAIT_MS 5
 #define SERVO_STATUS_BUFFER_LEN 40
 
@@ -562,10 +574,9 @@ struct GondolaState {
 };
 
 // Projects the model onto the wire message. The whole mapping lives here so the
-// host tests drive the same code the firmware does: `telemetry_to_dict` on the Pi
-// and this function are the two ends of the same contract, and a field that
-// exists in one and is filled differently in the other used to be visible only as
-// a plausible-looking number on the GUI.
+// this function and the OBC's decoder are the two ends of the same contract, and a
+// field that exists in one and is filled differently in the other is visible only
+// as a plausible-looking number in the console.
 //
 // The caller owns the envelope (sequence, timestamp, which_payload) -- those
 // come from the sketch's clock and transport -- and is responsible for sending
@@ -646,10 +657,10 @@ inline void initGondolaState(GondolaState& state) {
 // missing was the *visibility* that a held bearing is not a reading, and that is
 // what `imuPresent` now carries.
 //
-// It lives in this header rather than the sketch so the host tests can drive the
-// policy. The probe TU compiles only this file and pico_wire.h, so a policy
-// written in the .ino is a policy nothing can test -- which is how the original
-// unguarded read survived a green suite.
+// It lives in this header rather than the sketch so the policy is one function
+// rather than something split across two files. See the note at the top: this
+// file is arranged to be compilable and drivable on a host, and a policy written
+// into the .ino forfeits that.
 inline ImuSample applyImuHeading(GondolaState& state, float sampleDeg, bool sensorPresent) {
   state.imuPresent = sensorPresent;
 

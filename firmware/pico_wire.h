@@ -2,9 +2,10 @@
 
 // Single source of truth for the Pico wire encoding.
 //
-// The Arduino sketch and the host-side test harness both include this file so
-// that a change to the framing cannot land on one side only. The .ino only adds
-// "write the bytes to Serial" on top of encodePicoFrame().
+// One encoder, one framing. The sketch includes this and then does nothing but
+// "write the bytes to Serial" on top of encodePicoFrame(); anything that encodes
+// a frame -- the sketch, a host probe, a future tool -- goes through here, so a
+// change to the framing cannot land on one side only.
 
 #include <stddef.h>
 #include <stdint.h>
