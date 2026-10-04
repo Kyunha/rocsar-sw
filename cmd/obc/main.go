@@ -168,8 +168,44 @@ func run() error {
 	if mocked["pico"] {
 		log.Warn("using a simulated flight controller")
 	} else {
+		// The Link is a protocol layer. It does not open the port and it does not
+		// close it: NewSerialTransport returns an unopened port precisely so the
+		// composition root decides when the device is touched, and Link.Shutdown
+		// stops the protocol without reaching past its transport.
+		//
+		// That separation is only worth anything if both halves are actually
+		// called. OpenPort was missing, so the link handshook with a port it never
+		// opened and every start degraded with "serial transport is not open" --
+		// which reads like a missing device and is not one.
 		serial := pico.NewSerialTransport(cfg.Pico.Port, cfg.Pico.Baudrate)
-		if serial.Exists() {
+
+		switch {
+		case !serial.Exists():
+			msg := fmt.Sprintf("no flight controller at %s", cfg.Pico.Port)
+			if cfg.RequireHardware {
+				return errors.New(msg)
+			}
+			log.Error(msg + "; continuing degraded")
+
+		default:
+			// A node that exists but will not open is a different fault from a
+			// node that is not there: wrong permissions, already in use, or it
+			// enumerated as something else. It gets its own message because the
+			// operator action is different.
+			if err := serial.OpenPort(); err != nil {
+				msg := fmt.Sprintf("cannot open flight controller at %s: %v", cfg.Pico.Port, err)
+				if cfg.RequireHardware {
+					return errors.New(msg)
+				}
+				log.Error(msg + "; continuing degraded")
+				break
+			}
+			// Registered before the link so the port is closed after it, not
+			// before. Both are idempotent, so shutdown order is not load-bearing,
+			// but a port closed out from under a running read loop is a race
+			// nobody needs to have.
+			defer func() { _ = serial.Close() }()
+
 			link := pico.NewLink(serial, log)
 			if err := link.Open(ctx); err != nil {
 				// Degrade rather than abort, unless the operator asked otherwise.
@@ -184,12 +220,6 @@ func run() error {
 				log.Info("flight controller connected", "port", cfg.Pico.Port, "baud", cfg.Pico.Baudrate)
 			}
 			picoPort = link
-		} else {
-			msg := fmt.Sprintf("no flight controller at %s", cfg.Pico.Port)
-			if cfg.RequireHardware {
-				return errors.New(msg)
-			}
-			log.Error(msg + "; continuing degraded")
 		}
 	}
 

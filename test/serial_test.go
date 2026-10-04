@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -561,4 +562,58 @@ func decodeCommandFrame(cobsBlock []byte) (*rocsarv1.PicoCommand, error) {
 		return nil, fmt.Errorf("command has no payload")
 	}
 	return cmd, nil
+}
+
+// The order is OpenPort, then Link.Open. Getting it wrong has to be obvious.
+//
+// The OBC ran for a while with the OpenPort call missing from its composition
+// root, so every start logged "flight controller did not answer; continuing
+// degraded: serial transport is not open" -- with /dev/ttyACM0 present and
+// healthy. That reads like a hardware fault, and it was diagnosed as one twice
+// before the missing line was found. The message now names OpenPort, and this
+// is what holds it to that.
+//
+// The happy path is TestPicoLinkOverARealSerialPort. This is the other half: the
+// precondition has a name, and a caller who violates it gets told which call to
+// add rather than being left to infer it.
+func TestUnopenedPortSaysWhichCallIsMissing(t *testing.T) {
+	pt := newPTY(t)
+
+	tr := pico.NewSerialTransport(pt.Path, pico.DefaultBaudrate)
+
+	// Deliberately NOT OpenPort().
+	link := pico.NewLink(tr, quietLogger(), pico.WithAckTimeout(time.Second))
+	t.Cleanup(func() { _ = link.Close() })
+
+	err := link.Open(context.Background())
+	if err == nil {
+		t.Fatal("Open succeeded on a port that was never opened")
+	}
+
+	for _, want := range []string{"OpenPort", pt.Path} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error does not mention %q, so it cannot be acted on:\n  %v",
+				want, err)
+		}
+	}
+
+	// Nothing reached the flight controller. Write is the only path from the Link
+	// to the wire, and it is guarded, so this is asserted on the transport rather
+	// than by draining the PTY: a read deadline on one end of a pseudo-terminal
+	// pair does not reliably stop a blocked read on the other, and an assertion
+	// that can hang the suite is worse than no assertion.
+	if _, err := tr.Write(probeFrame()); err == nil {
+		t.Error("writing to an unopened transport succeeded")
+	} else if !strings.Contains(err.Error(), "OpenPort") {
+		t.Errorf("Write does not name OpenPort, so it cannot be acted on:\n  %v", err)
+	}
+}
+
+// probeFrame is a well-formed frame that is never sent, only offered.
+func probeFrame() []byte {
+	b, err := pico.EncodeTelemetryRequest(1)
+	if err != nil {
+		panic(err)
+	}
+	return b
 }

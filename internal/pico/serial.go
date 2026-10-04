@@ -57,7 +57,14 @@ func (s *SerialTransport) OpenPort() error {
 
 func (s *SerialTransport) requireOpen(op string) error {
 	if s.port == nil {
-		return fmt.Errorf("cannot %s: serial transport is not open", op)
+		// Name the fix, not just the symptom. The OBC shipped for a while
+		// handshaking with a port it never opened, and the resulting message --
+		// "cannot write: serial transport is not open" -- reads like a missing
+		// device, so it was diagnosed as a hardware problem twice before anyone
+		// found the missing OpenPort call. An error that can be acted on is worth
+		// four extra words.
+		return fmt.Errorf("cannot %s: %s was never opened, so there is nothing to %s "+
+			"(the composition root must call OpenPort before Link.Open)", s.path, op, op)
 	}
 	return nil
 }
