@@ -23,6 +23,16 @@ import (
 //
 // Everything it holds is an interface from internal/domain, so this package is
 // the whole surface between the wire and the hardware.
+
+// maxCommandOutput caps what a command may put in a reply message.
+//
+// Artefact bytes go over HTTP, not in the ACK, so this is not about size limits
+// on the protocol -- it is that an ACK is a human-readable line and a runaway
+// command output should not become a multi-megabyte string on a 115 kbit/s link.
+// Truncated loudly rather than silently, because a partial result that looks
+// complete is worse than a short one.
+const maxCommandOutput = 8192
+
 type Dispatcher struct {
 	pico   domain.Pico
 	gnss   *gnss.Bank
@@ -299,8 +309,8 @@ func (d *Dispatcher) sdrProbe(ctx context.Context, requestID string) *rocsarv1.C
 	if err != nil {
 		return fail(requestID, classify(err), err.Error())
 	}
-	if len(out) > 8192 {
-		out = out[:8192] + "\n[truncated]"
+	if len(out) > maxCommandOutput {
+		out = out[:maxCommandOutput] + "\n[truncated]"
 	}
 	return ok(requestID, out)
 }

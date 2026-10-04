@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"strconv"
 	"strings"
@@ -143,7 +144,7 @@ func (c *Config) assign(key string, raw any) error {
 			if !ok {
 				return nil, fmt.Errorf("expected a port number, got %T", e)
 			}
-			if n < 1 || n > 65535 {
+			if n < 1 || n > math.MaxUint16 {
 				return nil, fmt.Errorf("port %d out of range", n)
 			}
 			out = append(out, int(n))

@@ -135,13 +135,21 @@ type Fix struct {
 
 // Valid reports whether the fix is usable right now.
 //
+// Coordinate bounds, exported because gnss.Validate checks the same thing and
+// two private copies of "90" in two packages is exactly the drift this project
+// is trying to avoid: change one and the decoder rejects what the domain accepts.
+const (
+	MaxLatitudeDeg  = 90
+	MaxLongitudeDeg = 180
+)
+
 // An out-of-range coordinate is not a valid fix at any age. Publishing
 // lat=90, lon=1e300 is worse than publishing nothing, because the Ground
 // Station cannot tell it apart from a real reading and the operator would act
 // on it.
 func (f Fix) Valid() bool {
-	return f.LatitudeDeg >= -90 && f.LatitudeDeg <= 90 &&
-		f.LongitudeDeg >= -180 && f.LongitudeDeg <= 180
+	return f.LatitudeDeg >= -MaxLatitudeDeg && f.LatitudeDeg <= MaxLatitudeDeg &&
+		f.LongitudeDeg >= -MaxLongitudeDeg && f.LongitudeDeg <= MaxLongitudeDeg
 }
 
 // ReceiverStatus is one GNSS receiver's health, reported whether or not it is

@@ -27,6 +27,12 @@ import (
 // Responsibilities kept together because they are one mechanism split across
 // three files would be three places to look: the port, the COBS framing, the
 // command sequence, the ACK correlation and the telemetry fan-out.
+
+// maxProtocolErrs bounds the protocol-error ring. A flapping link produces one
+// of these per frame, so an unbounded list is a memory leak wearing the costume
+// of a working telemetry stream.
+const maxProtocolErrs = 16
+
 type Link struct {
 	transport Transport
 	log       *slog.Logger
@@ -507,8 +513,8 @@ func (l *Link) recordError(err error) {
 	// Bounded ring. An unbounded error log on a flapping link is a memory leak
 	// that looks like telemetry working perfectly.
 	l.protocolErrs = append(l.protocolErrs, err)
-	if len(l.protocolErrs) > 16 {
-		l.protocolErrs = l.protocolErrs[len(l.protocolErrs)-16:]
+	if len(l.protocolErrs) > maxProtocolErrs {
+		l.protocolErrs = l.protocolErrs[len(l.protocolErrs)-maxProtocolErrs:]
 	}
 	l.log.Debug("link protocol error", "err", err)
 }

@@ -13,6 +13,8 @@ import (
 	"fmt"
 	"math"
 	"time"
+
+	"github.com/rocsar/obc/internal/domain"
 )
 
 // DatagramSize is the exact length of a UDP_message.
@@ -28,6 +30,11 @@ const (
 	StartMarker = 0xAA
 	EndMarker   = 0x99
 )
+
+// Coordinate bounds come from domain, because the decoder and Fix.Valid() are
+// two answers to the same question and must not disagree. Geophysical rather than
+// a choice: there is no latitude 91, so a value past the pole means a byte was
+// mis-parsed, not that somewhere unusual was measured.
 
 // RawFix is the payload of a UDP_message, in the order the producer writes it.
 //
@@ -255,10 +262,10 @@ func validate(f RawFix) error {
 			return ErrNotFinite
 		}
 	}
-	if f.Latitude < -90 || f.Latitude > 90 {
+	if f.Latitude < -domain.MaxLatitudeDeg || f.Latitude > domain.MaxLatitudeDeg {
 		return fmt.Errorf("%w: latitude %v", ErrOutOfRange, f.Latitude)
 	}
-	if f.Longitude < -180 || f.Longitude > 180 {
+	if f.Longitude < -domain.MaxLongitudeDeg || f.Longitude > domain.MaxLongitudeDeg {
 		return fmt.Errorf("%w: longitude %v", ErrOutOfRange, f.Longitude)
 	}
 	return nil

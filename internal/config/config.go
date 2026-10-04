@@ -26,6 +26,24 @@ import (
 	"time"
 )
 
+// The link rate and the GNSS port block are named rather than written inline
+// because ARCHITECTURE.md makes them load-bearing in more than one place.
+//
+// gnssPortBase in particular: the three receivers are gnssPortBase..+2 and the
+// telemetry topic prefixes are derived from them, so a change to the base has to
+// move the topics with it. Written as bare literals three times, that coupling
+// is invisible until a receiver's data arrives under a topic nobody subscribed
+// to.
+//
+// They are DEFAULTS, not constants -- config precedence means rocsar.toml or the
+// environment can override every one of them, and none of these is a second home
+// for a fact.
+const (
+	defaultLinkRateKbps = 115 // the whole point of the project: 115 kbit/s, not WiFi
+	picoBaudrate        = 115200
+	gnssPortBase        = 2001
+)
+
 // EnvPrefix is prepended to a key to form its environment variable name:
 // [link] rate_kbps becomes ROCSAR_LINK_RATE_KBPS.
 const EnvPrefix = "ROCSAR_"
@@ -137,11 +155,11 @@ func Defaults() Config {
 	c.HTTP.Addr = ":5557"
 	c.HTTP.Root = "/mnt/rocsar/data"
 	c.Link.Device = "eth0"
-	c.Link.RateKbps = 115
+	c.Link.RateKbps = defaultLinkRateKbps
 	c.Link.Shaping = true
 	c.Pico.Port = "/dev/ttyACM0"
-	c.Pico.Baudrate = 115200
-	c.GNSS.Ports = []int{2001, 2002, 2003}
+	c.Pico.Baudrate = picoBaudrate
+	c.GNSS.Ports = []int{gnssPortBase, gnssPortBase + 1, gnssPortBase + 2}
 	c.GNSS.Selected = 1
 	c.GNSS.StaleAfter = 2 * time.Second
 	c.Camera.Device = "/dev/video0"

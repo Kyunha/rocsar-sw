@@ -68,6 +68,27 @@ const (
 	pixelFormatYUYV  = 0x56595559 // 'YUYV'
 )
 
+// V4L2 constants used in expressions rather than as an ioctl request code, from
+// linux/videodev2.h. These were bare numbers at their use sites, which is the
+// worst place for a number whose only meaning is in a header nobody has open.
+const (
+	capVideoCapture = 0x00000001 // V4L2_CAP_VIDEO_CAPTURE
+
+	bufTypeVideoCapture = 1 // V4L2_BUF_TYPE_VIDEO_CAPTURE
+	memoryMmap          = 1 // V4L2_MEMORY_MMAP
+
+	// queueBuffers is VIDIOC_REQBUFS's count. Four is a compromise, not a
+	// constant from anywhere: one buffer is being filled while another is being
+	// drained, and a driver that grants fewer than two stalls before the first
+	// frame ever arrives.
+	queueBuffers = 4
+
+	// minQueueableBuffers is the smallest count that can stream at all. Below
+	// this the setup fails rather than trying: a driver that grants one buffer
+	// will hand back a frame and then never another.
+	minQueueableBuffers = 2
+)
+
 type v4l2Capability struct {
 	Driver       [16]uint8
 	Card         [32]uint8
@@ -262,7 +283,7 @@ func (c *Capture) setup(fd int) (uint32, error) {
 	if err := ioctl(fd, vidiocQueryCap, unsafe.Pointer(&cap)); err != nil {
 		return 0, fmt.Errorf("camera: VIDIOC_QUERYCAP: %w", err)
 	}
-	if cap.Capabilities&0x00000001 == 0 { // V4L2_CAP_VIDEO_CAPTURE
+	if cap.Capabilities&capVideoCapture == 0 {
 		return 0, fmt.Errorf("camera: %s is not a capture device", c.device)
 	}
 
@@ -289,15 +310,15 @@ func (c *Capture) setup(fd int) (uint32, error) {
 	}
 
 	var req v4l2ReqBufs
-	req.Count = 4
-	req.Memory = 1 // V4L2_MEMORY_MMAP
+	req.Count = queueBuffers
+	req.Memory = memoryMmap
 	if err := ioctl(fd, vidiocReqBufs, unsafe.Pointer(&req)); err != nil {
 		return 0, fmt.Errorf("camera: VIDIOC_REQBUFS: %w", err)
 	}
-	if req.Count < 2 {
+	if req.Count < minQueueableBuffers {
 		// The driver must keep at least one buffer queued while one is being
 		// dequeued, or the stream stalls before the first frame.
-		return 0, fmt.Errorf("camera: driver granted only %d of 4 buffers", req.Count)
+		return 0, fmt.Errorf("camera: driver granted only %d of %d buffers", req.Count, queueBuffers)
 	}
 	return f.PixelFormat, nil
 }
@@ -305,8 +326,8 @@ func (c *Capture) setup(fd int) (uint32, error) {
 // readFrame dequeues one frame, copies it out and re-queues the buffer.
 func (c *Capture) readFrame(fd int) ([]byte, error) {
 	var typ v4l2BufType
-	typ.Type = 1 // V4L2_BUF_TYPE_VIDEO_CAPTURE
-	typ.Memory = 1
+	typ.Type = bufTypeVideoCapture
+	typ.Memory = memoryMmap
 	if err := ioctl(fd, vidiocStreamOn, unsafe.Pointer(&typ)); err != nil {
 		return nil, fmt.Errorf("camera: VIDIOC_STREAMON: %w", err)
 	}
