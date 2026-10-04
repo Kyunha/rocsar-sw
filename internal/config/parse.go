@@ -4,8 +4,6 @@ import (
 	"fmt"
 	"math"
 	"os"
-	"strconv"
-	"strings"
 	"time"
 
 	"github.com/pelletier/go-toml/v2"
@@ -240,40 +238,5 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("gnss.selected is %d, but gnss.ports lists %d receiver(s) (valid IDs are 1..%d)",
 			c.GNSS.Selected, len(c.GNSS.Ports), len(c.GNSS.Ports))
 	}
-
-	// The HTTP port and the tc flower filter are the same fact in two places.
-	// They are configured independently -- one in the HTTP server, one in the
-	// kernel -- and if they disagree the failure is silent: downloads fall into
-	// the priority class, the priority class starves, and nothing reports an
-	// error. See ARCHITECTURE.md 11.
-	if port, ok := portOf(c.HTTP.Addr); ok && c.Link.Shaping {
-		if port != BulkPort {
-			return fmt.Errorf(
-				"http.addr port %d does not match the traffic shaper's flower filter port %d; "+
-					"bulk traffic would silently join the priority class and starve the control channel",
-				port, BulkPort)
-		}
-	}
-
 	return nil
-}
-
-// BulkPort is the TCP port the kernel flower filter classifies bulk traffic on.
-//
-// It is a constant and not a configuration key precisely because it must agree
-// with [http] addr, and two independent homes for one fact is how they stop
-// agreeing. Changing it means changing the filter.
-const BulkPort = 5557
-
-// portOf extracts the port from a listen address such as ":5557" or "0.0.0.0:5557".
-func portOf(addr string) (int, bool) {
-	i := strings.LastIndex(addr, ":")
-	if i < 0 {
-		return 0, false
-	}
-	n, err := strconv.Atoi(addr[i+1:])
-	if err != nil {
-		return 0, false
-	}
-	return n, true
 }

@@ -9,7 +9,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/rocsar/obc/internal/config"
 	"github.com/rocsar/obc/internal/qos"
 )
 
@@ -275,26 +274,5 @@ func TestPriorityClassIsDerivedNotConfigured(t *testing.T) {
 		if got := qos.PriorityKbps(c.rate); got != c.want {
 			t.Errorf("PriorityKbps(%d) = %d, want %d", c.rate, got, c.want)
 		}
-	}
-}
-
-// config.BulkPort is still load-bearing, and no longer for the reason it was.
-//
-// It used to be the dst_port in a tc filter, and ARCHITECTURE.md called the
-// coupling silent: change the HTTP port and bulk traffic stops being classified,
-// downloads join the priority class, and telemetry starves with nothing reporting
-// an error. There is no filter now, so that particular silence is gone.
-//
-// What remains is that BulkPort names the HTTP artefact port for the in-process
-// limiter and for anything that reasons about which traffic is bulk. So it still
-// has to equal the port the HTTP server actually listens on -- startup refuses a
-// mismatched pair rather than discovering it in flight, and this is the test
-// behind that refusal.
-func TestBulkPortStillMatchesTheHTTPArtefactPort(t *testing.T) {
-	const httpAddr = ":5557"
-	if got := config.BulkPort; got != 5557 {
-		t.Errorf("config.BulkPort = %d, but the artefact server listens on %s. "+
-			"Anything reasoning about which traffic is bulk would be reasoning "+
-			"about the wrong port", got, httpAddr)
 	}
 }

@@ -71,7 +71,7 @@ func (h *HTTP) Start(ctx context.Context) error {
 	}()
 
 	h.log.Info("HTTP artefact server bound", "addr", h.addr, "root", h.store.Root(),
-		"note", "the port here is what the tc flower filter classifies on; it must equal config.BulkPort")
+		"note", "artefact bytes are served here, and this is the bulk path the in-process limiter bounds")
 	return nil
 }
 

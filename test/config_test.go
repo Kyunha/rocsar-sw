@@ -101,29 +101,6 @@ func TestShippedConfigTypesResolve(t *testing.T) {
 	}
 }
 
-// The HTTP port and the tc flower filter port are one fact in two places. A
-// mismatch fails silently at run time, so it is refused at startup.
-func TestHTTPPortMustMatchFlowerFilterPort(t *testing.T) {
-	cfg := config.Defaults()
-
-	cfg.HTTP.Addr = ":9999"
-	if err := cfg.Validate(); err == nil {
-		t.Fatal("Validate accepted an http.addr port that does not match the flower filter port")
-	}
-
-	cfg.HTTP.Addr = ":5557"
-	if err := cfg.Validate(); err != nil {
-		t.Fatalf("Validate rejected the matching port: %v", err)
-	}
-
-	// With shaping off there is no filter to disagree with, so the port is free.
-	cfg.HTTP.Addr = ":9999"
-	cfg.Link.Shaping = false
-	if err := cfg.Validate(); err != nil {
-		t.Fatalf("Validate rejected a free port with shaping disabled: %v", err)
-	}
-}
-
 func TestValidateRejectsImpossibleGNSSSelection(t *testing.T) {
 	cfg := config.Defaults()
 

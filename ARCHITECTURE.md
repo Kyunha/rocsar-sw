@@ -700,9 +700,16 @@ becomes a second home for a fact, and two homes drift.
 | `[sdr]` | `program` | `third_party/sdr-ettus-b200mini` |
 | `[telemetry]` | `interval` | `1s` |
 
-`http.addr`'s **port is load-bearing**: it names which traffic is bulk, for
-`dst_port 5557`. Change the port and you must change the filter, or bulk traffic
-silently joins the priority class. This coupling is asserted by a test.
+`http.addr` used to be load-bearing: the `tc` flower filter classified on
+`dst_port 5557`, so changing the port meant the filter silently stopped matching
+and downloads joined the priority class. There is no filter now, and
+`config.BulkPort` is gone with it.
+
+The in-process limiter bounds the artefact handler wholesale rather than matching
+a port, which is one less concept and cannot be defeated by changing the port.
+`Validate` no longer refuses a mismatched pair, because nothing mismatches any
+more: a wrong port used to be a silent starvation, and now it is a different
+number.
 
 ---
 
@@ -733,7 +740,7 @@ describing a wire format is a guess until something reads it:
 | `TestTelemetryFrameUnderBudget` | the frame outgrowing the priority class |
 | `TestFlowerFilterPresent` | the silent `tc` classification failure |
 | `TestFirmwareExcludesGroundStationTypes` | a ground-station message reaching the RP2040 |
-| `TestBulkPortStillMatchesTheHTTPArtefactPort` | the port/bulk coupling in §11 |
+| `TestNoClassificationFilterIsInstalled` | §6.6 ships no filter, and says so |
 | `TestSDRParamsAtomicWrite` | a half-written `params.json` |
 
 ---
