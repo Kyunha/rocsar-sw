@@ -63,9 +63,25 @@ device = "eth0"
 # radio, not a tuning knob. Re-applied at every start, so restarting the OBC
 # returns to the launch value.
 rate_kbps = 115
-# Needs CAP_NET_ADMIN. Set false on a laptop or in CI -- a bare run on a
-# developer machine would otherwise try to reshape a real NIC.
-shaping = true
+# Needs CAP_NET_ADMIN.
+#
+# OFF by default, and the reason matters. This installs an HTB hierarchy that
+# genuinely caps the link -- measured on the target at a 41 kbit/s priority floor
+# with a 115 kbit/s ceiling -- and that part works.
+#
+# What does NOT work is telling bulk traffic apart from priority traffic. The tc
+# flower filter that was meant to do it had no classid, so it matched packets and
+# diverted nothing; the root default was the bulk class, so the priority class was
+# unreachable; and after fixing both, on a classful tree with GRO/GSO disabled, a
+# 30 KB artefact fetch still landed in the priority class and the bulk class stayed
+# at zero packets. Re-adding a filter without reading internal/qos/shaper.go would
+# look like a fix while bulk downloads still shared bandwidth with telemetry.
+#
+# Artefact downloads are bounded in-process instead, by qos.bulk_rate_bps below.
+# That covers the traffic that was actually starving telemetry. It does not cover
+# the SDR or any other producer, which is why proper link constraint is deferred
+# to its own module rather than declared finished here.
+shaping = false
 
 [pico]
 port = "/dev/ttyACM0"

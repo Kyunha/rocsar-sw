@@ -401,10 +401,48 @@ root htb
 └── 1:20  bulk       rate <link_rate - 41.4>bit        ← artefacts, HTTP
 ```
 
-with a **flower filter on the bulk TCP port** so HTTP downloads classify into
-1:20. The flower filter is load-bearing and its absence is a *silent* failure:
-traffic falls through to the default class, the priority class starves, and
-nothing reports an error. A test asserts the filter exists after the shaper runs.
+Unclassified traffic defaults to **1:10**, so a device with no classifier still
+gives telemetry a floor rather than dumping everything into the class named
+"bulk".
+
+#### No classifier ships
+
+There is **no filter**, and that is a measured result rather than an omission.
+A `tc flower` filter on the bulk TCP port was implemented, described here as
+load-bearing, and asserted by a test that passed. It did not classify anything.
+Three separate faults, found in sequence on the target:
+
+1. **No `classid`.** A flower filter with a match and no classid inspects
+   packets and then does nothing with them. Bulk traffic went wherever the root
+   default sent it, filter or no filter.
+2. **Root default was `20`** — the bulk class. So *every* unclassified packet went
+   to bulk and **1:10 was unreachable**; nothing could land there, telemetry
+   included.
+3. With the classid added, a proper classful tree (explicit root class `1:1`,
+   children parented to it, `default 10`) and `GRO`/`GSO` disabled so packets
+   reached the filter layer un-coalesced, a 30 KB ranged fetch of a real artefact
+   **still landed in 1:10** at 41 kbit/s while 1:20 stayed at zero packets.
+
+A separate real defect was fixed on the way and is worth keeping: `dst_port`
+alone is rejected outright by tc (`Illegal "dst_port"`) because a layer-4 match
+has no meaning until the transport is known, so `ip_proto tcp` is required
+first. `tc-flower(8)` says so.
+
+The rate cap is kept because it works, and is measured working: 41 kbit/s floor,
+115 kbit/s ceiling, bulk 74 kbit/s. Telemetry reports *"rate limited to N kbit/s;
+traffic is NOT classified"* so that `shaping_active` is never mistaken for a
+priority class that does something.
+
+**What replaced it for the minimal system:** artefact downloads are bounded
+**in-process**, by a token bucket on the HTTP copy path driven by
+`qos.bulk_rate_bps`. That is the traffic that was actually starving telemetry. It
+is not link shaping — it cannot constrain the SDR, a system service, or anything
+else on the box, and it back-pressures rather than prevents.
+
+**Deferred to its own module.** Per-class link constraint needs a classifier that
+demonstrably matches on this interface. Candidates, none yet proven here: `u32`
+on the TCP port, `net_cls` on the artefact server's cgroup, or nftables. Choosing
+between them by guesswork is how the flower filter came to be written.
 
 `tc` fails for dozens of reasons unrelated to our logic — no passwordless sudo,
 `tc` absent, wrong interface, kernel without HTB. **None of them justify taking
@@ -662,7 +700,7 @@ becomes a second home for a fact, and two homes drift.
 | `[sdr]` | `program` | `third_party/sdr-ettus-b200mini` |
 | `[telemetry]` | `interval` | `1s` |
 
-`http.addr`'s **port is load-bearing**: the `tc` flower filter classifies on
+`http.addr`'s **port is load-bearing**: it names which traffic is bulk, for
 `dst_port 5557`. Change the port and you must change the filter, or bulk traffic
 silently joins the priority class. This coupling is asserted by a test.
 
@@ -695,7 +733,7 @@ describing a wire format is a guess until something reads it:
 | `TestTelemetryFrameUnderBudget` | the frame outgrowing the priority class |
 | `TestFlowerFilterPresent` | the silent `tc` classification failure |
 | `TestFirmwareExcludesGroundStationTypes` | a ground-station message reaching the RP2040 |
-| `TestHTTPBulkPortMatchesFlowerFilter` | the port/filter coupling in §11 |
+| `TestBulkPortStillMatchesTheHTTPArtefactPort` | the port/bulk coupling in §11 |
 | `TestSDRParamsAtomicWrite` | a half-written `params.json` |
 
 ---

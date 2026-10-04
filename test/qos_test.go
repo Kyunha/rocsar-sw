@@ -3,7 +3,6 @@ package test
 import (
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"log/slog"
 	"os/exec"
@@ -11,16 +10,12 @@ import (
 	"testing"
 
 	"github.com/rocsar/obc/internal/config"
-	"github.com/rocsar/obc/internal/domain"
 	"github.com/rocsar/obc/internal/qos"
 )
 
 // fakeExec records the tc invocations and returns canned output.
 type fakeExec struct {
 	calls [][]string
-	// filterAddFailed makes `tc filter add` fail, so the filter genuinely does
-	// not exist and `filter show` reports nothing.
-	filterAddFailed bool
 	// respond maps a substring of the joined command to a canned result.
 	respond func(joined string) (string, error)
 }
@@ -33,27 +28,8 @@ func (f *fakeExec) run(ctx context.Context, name string, args ...string) (string
 			return out, err
 		}
 	}
-	// `tc filter show` answers with whatever is on the device. The default is the
-	// real output captured on the Pi after this shaper installs the filter, so the
-	// read-back verification is checked against bytes tc actually printed rather
-	// than against a hand-written approximation of them.
-	if joined == "filter show dev eth0" && !f.filterAddFailed {
-		return filterShowInstalled, nil
-	}
 	return "", nil
 }
-
-// Verbatim from `tc filter show dev eth0` on the Pi, after the filter this
-// package installs. Note `ip_proto tcp` and `dst_port 5557` on separate lines --
-// that is tc's own layout, and a check written against a single-line guess would
-// not match it.
-const filterShowInstalled = `filter parent 1: protocol ip pref 20 flower chain 0
-filter parent 1: protocol ip pref 20 flower chain 0 handle 0x1
-  eth_type ipv4
-  ip_proto tcp
-  dst_port 5557
-  not_in_hw
-`
 
 func (f *fakeExec) joined() []string {
 	out := make([]string, 0, len(f.calls))
@@ -82,7 +58,7 @@ func TestShaperInstallsTheSpecifiedHierarchy(t *testing.T) {
 	joined := strings.Join(f.joined(), "\n")
 
 	for _, want := range []string{
-		"qdisc add dev eth0 root handle 1: htb default 20",
+		"qdisc add dev eth0 root handle 1: htb default 10",
 		"class add dev eth0 parent 1: classid 1:10 htb rate 41kbit ceil 115kbit",
 		"class add dev eth0 parent 1: classid 1:20 htb rate 74kbit ceil 74kbit",
 		"qdisc add dev eth0 parent 1:10 handle 110: pfifo",
@@ -102,51 +78,64 @@ func TestShaperInstallsTheSpecifiedHierarchy(t *testing.T) {
 
 // THE silent-failure trap.
 //
-// The flower filter is what makes bulk traffic land in the bulk class. Without
-// it every command still succeeds, telemetry still says shaping is active, and
-// the only symptom is that telemetry slows down when a file moves. This asserts
-// the filter is installed AND that its absence is reported rather than swallowed.
-func TestBulkFlowerFilterIsInstalledAndItsAbsenceIsReported(t *testing.T) {
-	// With the filter working.
+// There is no classification filter, and the reason has to survive that.
+//
+// A filter was shipped here for a long time and never worked: it had no classid,
+// so it matched packets and diverted nothing, while the root default sent
+// unclassified traffic to the BULK class and made the priority class unreachable.
+// Fixing all three problems still did not make it match on the target.
+//
+// So this asserts two things instead: that no filter is installed (adding one
+// back without reading the note in shaper.go would be a regression, not a fix),
+// and that telemetry never claims more than a rate cap.
+func TestNoClassificationFilterIsInstalled(t *testing.T) {
 	f := &fakeExec{}
 	s := newTestShaper(f)
 	ok, reason := s.Apply(context.Background(), "eth0", 115)
 	if !ok {
 		t.Fatalf("Apply failed: %s", reason)
 	}
+
 	joined := strings.Join(f.joined(), "\n")
-	if !strings.Contains(joined, "flower ip_proto tcp dst_port 5557") {
-		t.Errorf("the bulk flower filter was not installed; bulk traffic would fall through to the default class.\ngot:\n%s", joined)
-	}
-	if !strings.Contains(joined, "parent 1:") || !strings.Contains(joined, "prio 20") {
-		t.Errorf("the filter is not attached to the HTB root with a distinct priority:\n%s", joined)
-	}
-	if reason != "" {
-		t.Errorf("a fully successful Apply reported a reason: %s", reason)
+	if strings.Contains(joined, "flower") || strings.Contains(joined, "filter") {
+		t.Errorf("a classification filter was installed; it does not work on this "+
+			"interface and re-adding it will look like a fix while bulk traffic "+
+			"still shares the priority class:\n%s", joined)
 	}
 
-	// With the filter failing. Shaping still holds; the classification does not.
-	f2 := &fakeExec{respond: func(joined string) (string, error) {
-		if strings.Contains(joined, "filter") {
-			return "Error: Cannot add filter", errors.New("exit status 1")
+	// The default must be the priority class. With `default 20` every
+	// unclassified packet went to bulk and nothing could reach 1:10 at all.
+	if !strings.Contains(joined, "htb default 10") {
+		t.Errorf("unclassified traffic does not default to the priority class:\n%s", joined)
+	}
+
+	// The rate cap is the part that works, so it must still be there.
+	for _, want := range []string{"rate 41kbit ceil 115kbit", "rate 74kbit"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("the rate cap lost %q:\n%s", want, joined)
 		}
-		return "", nil
-	}}
-	s2 := newTestShaper(f2)
-	ok2, reason2 := s2.Apply(context.Background(), "eth0", 115)
-	if !ok2 {
-		t.Errorf("a missing filter made Apply report shaping as entirely off (%s); shaping IS in force, the classification is not", reason2)
 	}
-	if !strings.Contains(reason2, "filter") {
-		t.Errorf("a missing bulk filter was not explained: %q", reason2)
+
+	// And the reason must say what is and is not happening. An empty reason here
+	// is how "shaping: active" came to mean "a rate cap exists", which is what an
+	// operator has to be told the difference between.
+	if reason == "" {
+		t.Fatal("Apply reported no reason; telemetry would read as fully shaped")
 	}
-	// And it must not read as a healthy system.
-	st := s2.Status()
-	if st.State == domain.SubsystemReady {
-		t.Error("Status reports READY with a missing bulk filter")
+	for _, want := range []string{"rate limited", "NOT classified"} {
+		if !strings.Contains(reason, want) {
+			t.Errorf("the reason does not mention %q, so it cannot be acted on: %q", want, reason)
+		}
 	}
+
+	// Shaping is genuinely in force, so it must not report itself inactive --
+	// that would make the link look unprotected when it is capped.
+	st := s.Status()
 	if !st.ShapingActive {
-		t.Error("Status reports shaping inactive, but it is in force")
+		t.Error("Status reports shaping inactive, but the rate cap is in force")
+	}
+	if !strings.Contains(st.InactiveReason, "NOT classified") {
+		t.Errorf("Status does not carry the caveat to telemetry: %q", st.InactiveReason)
 	}
 }
 
@@ -289,18 +278,23 @@ func TestPriorityClassIsDerivedNotConfigured(t *testing.T) {
 	}
 }
 
-// The flower's dst_port and the HTTP server's port are one fact in two places.
-// The shaper is built from the constant, and the config validation refuses a
-// mismatched pair, so the two cannot silently disagree.
-func TestShaperFilterPortMatchesTheHTTPBulkPort(t *testing.T) {
-	f := &fakeExec{}
-	s := newTestShaper(f)
-	if _, reason := s.Apply(context.Background(), "eth0", 115); !strings.Contains(reason, "") || reason != "" {
-		t.Fatalf("unexpected reason: %s", reason)
-	}
-	joined := strings.Join(f.joined(), "\n")
-	want := fmt.Sprintf("dst_port %d", config.BulkPort)
-	if !strings.Contains(joined, want) {
-		t.Errorf("the filter does not use config.BulkPort (%d):\n%s", config.BulkPort, joined)
+// config.BulkPort is still load-bearing, and no longer for the reason it was.
+//
+// It used to be the dst_port in a tc filter, and ARCHITECTURE.md called the
+// coupling silent: change the HTTP port and bulk traffic stops being classified,
+// downloads join the priority class, and telemetry starves with nothing reporting
+// an error. There is no filter now, so that particular silence is gone.
+//
+// What remains is that BulkPort names the HTTP artefact port for the in-process
+// limiter and for anything that reasons about which traffic is bulk. So it still
+// has to equal the port the HTTP server actually listens on -- startup refuses a
+// mismatched pair rather than discovering it in flight, and this is the test
+// behind that refusal.
+func TestBulkPortStillMatchesTheHTTPArtefactPort(t *testing.T) {
+	const httpAddr = ":5557"
+	if got := config.BulkPort; got != 5557 {
+		t.Errorf("config.BulkPort = %d, but the artefact server listens on %s. "+
+			"Anything reasoning about which traffic is bulk would be reasoning "+
+			"about the wrong port", got, httpAddr)
 	}
 }

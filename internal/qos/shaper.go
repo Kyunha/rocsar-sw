@@ -20,12 +20,10 @@ import (
 	"fmt"
 	"log/slog"
 	"os/exec"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/rocsar/obc/internal/config"
 	"github.com/rocsar/obc/internal/domain"
 )
 
@@ -125,7 +123,10 @@ func (s *Shaper) Apply(ctx context.Context, device string, rateKbps uint32) (boo
 		what string
 		args []string
 	}{
-		{"root HTB", []string{"qdisc", "add", "dev", device, "root", "handle", "1:", "htb", "default", "20"}},
+		// default 10, not 20: unclassified traffic belongs in the class with a
+		// guaranteed floor, so a device with no classifier still protects
+		// telemetry rather than the other way round.
+		{"root HTB", []string{"qdisc", "add", "dev", device, "root", "handle", "1:", "htb", "default", "10"}},
 
 		// Priority class: a guaranteed floor at prio, free to borrow up to the
 		// full link when nothing else wants it.
@@ -150,60 +151,55 @@ func (s *Shaper) Apply(ctx context.Context, device string, rateKbps uint32) (boo
 		}
 	}
 
-	// The flower filter is what makes bulk traffic actually land in the bulk
-	// class, and its absence is a SILENT failure: the commands above all
-	// succeed, telemetry reports shaping as active, and downloads fall through
-	// to the default class and starve the priority one. There is no error
-	// anywhere -- the symptom is just that telemetry gets slower when a file
-	// moves. It is installed last and verified by reading the qdisc back.
+	// NO CLASSIFICATION FILTER. This is a rate cap and nothing more, and the
+	// reason is written down here so nobody re-adds a filter without reading it.
 	//
-	// `ip_proto tcp` is not optional. tc-flower's dst_port is a layer-4 match and
-	// has no meaning without knowing the transport protocol, so the parser
-	// rejects it outright:
+	// The design was: HTB with a priority class for telemetry and a bulk class for
+	// artefact downloads, and a tc flower filter on dst_port 5557 to put HTTP
+	// traffic in the bulk class. Three separate things were wrong, and fixing all
+	// three was still not enough.
 	//
-	//	$ tc filter add dev eth0 parent 1: protocol ip prio 20 flower dst_port 5557
-	//	Illegal "dst_port"
+	// 1. The filter had no classid. A flower filter with a match and no classid
+	//    classifies nothing -- it inspects packets and then does nothing with
+	//    them. Bulk traffic went wherever the root default sent it, filter or no
+	//    filter.
 	//
-	// Reproduced on the target, and the same command with `ip_proto tcp` in front
-	// is accepted and reads back correctly. Verified against tc-flower(8): "dst_port
-	// and src_port depend on ip_proto being set to tcp, udp or sctp". The bulk
-	// traffic is HTTP, so tcp.
-	filterOut, filterErr := s.exec(ctx, "tc", bulkFilterArgs(device, config.BulkPort)...)
-	if filterErr != nil {
-		// Not fatal on its own: shaping is still in force, the filter is not.
-		// But it is reported, loudly, because the consequence is invisible.
-		s.set(device, rateKbps, prio, true,
-			fmt.Sprintf("bulk filter not installed (%v): bulk traffic will join the priority class and may starve it",
-				oneLine(filterOut)))
-		s.log.Warn("bulk flower filter not installed; the link is shaped but unclassified",
-			"device", device, "port", config.BulkPort, "err", filterErr)
-		return true, s.reasonLocked()
-	}
-
-	// Read it back. `tc filter add` returning zero means the command was accepted,
-	// which is not the same as the filter being there: a parent that does not
-	// exist yet, or a handle the kernel quietly dropped, both exit 0 on some
-	// paths and leave bulk traffic unclassified with shaping reported as active.
-	// The comment above has claimed this verification since before it existed.
-	showOut, showErr := s.exec(ctx, "tc", "filter", "show", "dev", device)
-	if showErr != nil || !filterInstalled(showOut, config.BulkPort) {
-		why := oneLine(showOut)
-		if showErr != nil {
-			why = fmt.Sprintf("%v: %s", showErr, why)
-		}
-		s.set(device, rateKbps, prio, true,
-			fmt.Sprintf("bulk filter not confirmed on %s (%s): bulk traffic will join the priority class and may starve it",
-				device, why))
-		s.log.Warn("bulk flower filter did not read back; the link is shaped but unclassified",
-			"device", device, "port", config.BulkPort, "tc_filter_show", why)
-		return true, s.reasonLocked()
-	}
-
-	s.set(device, rateKbps, prio, true, "")
-	s.log.Info("link shaping applied",
-		"device", device, "rate_kbps", rateKbps, "priority_kbps", prio, "bulk_kbps", bulk,
-		"bulk_filter_port", config.BulkPort)
-	return true, ""
+	// 2. The root HTB was `default 20`, which is the BULK class. So every
+	//    unclassified packet went to bulk and the priority class was
+	//    unreachable -- nothing could ever land in 1:10, telemetry included.
+	//
+	// 3. With the classid added, a proper classful tree (explicit root class 1:1,
+	//    children parented to it, default 10) and GRO/GSO turned off so packets
+	//    reached the filter layer un-coalesced, a 30 KB ranged fetch of a real
+	//    artefact still landed in the PRIORITY class at 41 kbit/s and the bulk
+	//    class stayed at zero packets.
+	//
+	// So: the rate cap works and is kept, because a shared 115 kbit/s radio link
+	// genuinely should be capped and the HTB classes demonstrably enforce it
+	// (measured on the target: 41 kbit/s floor, 115 kbit/s ceiling, bulk 74).
+	// Classification does not work on this interface and is not shipped as though
+	// it did.
+	//
+	// What replaces it in the minimal system is a limiter in THIS process on the
+	// artefact HTTP path, driven by qos.bulk_rate_bps. That bounds the traffic we
+	// produce, which is the traffic that was actually starving telemetry. It is
+	// not link shaping and does not pretend to be: it cannot constrain the SDR, a
+	// system service, or anything else on the box.
+	//
+	// Proper per-class link constraint is deferred to its own module. It needs a
+	// working classifier on this interface, and finding one is a piece of work in
+	// its own right -- u32 on the TCP port, net_cls on the listener's cgroup, or
+	// nftables. Guessing between those from here is how the current filter got
+	// written.
+	//
+	// The default is now the priority class, so an unconfigured device caps the
+	// whole link rather than dumping everything into a class named "bulk" that
+	// nothing is being deliberately steered into.
+	s.set(device, rateKbps, prio, true, unclassifiedReason(rateKbps, prio))
+	s.log.Info("link rate applied; traffic is NOT classified",
+		"device", device, "rate_kbps", rateKbps, "priority_kbps", prio,
+		"unclassified_default", "1:10")
+	return true, s.reasonLocked()
 }
 
 func (s *Shaper) set(device string, rateKbps, prioKbps uint32, active bool, reason string) {
@@ -337,65 +333,16 @@ func (n *NullShaper) Status() domain.LinkStatus {
 	}
 }
 
-// bulkFilterArgs builds the `tc filter add` argument list that classifies bulk
-// traffic into the bulk class.
+// unclassifiedReason is what telemetry reports when the rate cap is in force but
+// nothing is steering traffic between classes.
 //
-// ip_proto comes before dst_port and is not optional. tc's flower parser treats
-// dst_port as a layer-4 match and has nothing to match against without knowing
-// the transport protocol:
-//
-//	tc filter add dev eth0 parent 1: protocol ip prio 20 flower dst_port 5557
-//	Illegal "dst_port"
-//
-// Reproduced on the target; the same command with `ip_proto tcp` in front is
-// accepted and reads back correctly. tc-flower(8) says the same: "dst_port and
-// src_port depend on ip_proto being set to tcp, udp or sctp". The bulk traffic is
-// HTTP, so tcp.
-//
-// This is a function rather than an inline literal so a test can assert on the
-// argument list. Asserting on the source text instead would match the first
-// "dst_port" anywhere in the file, which is not this command.
-func bulkFilterArgs(device string, port int) []string {
-	return []string{"filter", "add",
-		"dev", device,
-		"parent", "1:",
-		"protocol", "ip",
-		"prio", "20",
-		"flower",
-		"ip_proto", "tcp",
-		"dst_port", strconv.Itoa(port),
-	}
-}
-
-// filterInstalled reports whether `tc filter show` printed a flower filter
-// matching the bulk port.
-//
-// Both halves have to be present. A flower filter without the port matches
-// nothing useful, and a port in the output without ip_proto would mean the
-// filter is classifying something other than what it was added for -- the exact
-// ambiguity the ip_proto fix removed on the way in.
-func filterInstalled(out string, port int) bool {
-	hasFlower, hasPort, hasProto := false, false, false
-	want := "dst_port"
-
-	for _, line := range strings.Split(out, "\n") {
-		line = strings.TrimSpace(line)
-		if strings.Contains(line, "flower") {
-			hasFlower = true
-		}
-		if strings.Contains(line, "ip_proto tcp") {
-			hasProto = true
-		}
-		// Field-by-field, not a substring test: "dst_port 5557" is a prefix of
-		// "dst_port 55570", so a contains check would call a filter on the wrong
-		// port a success. That is the same class of silent misclassification this
-		// function exists to prevent.
-		fields := strings.Fields(line)
-		for i := 0; i+1 < len(fields); i++ {
-			if fields[i] == want && fields[i+1] == strconv.Itoa(port) {
-				hasPort = true
-			}
-		}
-	}
-	return hasFlower && hasPort && hasProto
+// It exists so that "shaping" never reads as more than it is. The previous
+// version of this code reported shaping as active with no reason at all, while
+// the filter that was supposed to classify bulk traffic silently did nothing --
+// so an operator reading telemetry had no way to tell a working priority class
+// from a decorative one.
+func unclassifiedReason(rateKbps, prioKbps uint32) string {
+	return fmt.Sprintf("rate limited to %d kbit/s (%d kbit/s priority floor); "+
+		"traffic is NOT classified -- a download shares the priority class with telemetry",
+		rateKbps, prioKbps)
 }

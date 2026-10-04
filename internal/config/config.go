@@ -156,7 +156,7 @@ func Defaults() Config {
 	c.HTTP.Root = "/mnt/rocsar/data"
 	c.Link.Device = "eth0"
 	c.Link.RateKbps = defaultLinkRateKbps
-	c.Link.Shaping = true
+	c.Link.Shaping = false
 	c.Pico.Port = "/dev/ttyACM0"
 	c.Pico.Baudrate = picoBaudrate
 	c.GNSS.Ports = []int{gnssPortBase, gnssPortBase + 1, gnssPortBase + 2}
