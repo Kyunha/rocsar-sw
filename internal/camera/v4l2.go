@@ -53,11 +53,9 @@ func ioc(dir, typ, nr, size uintptr) uintptr {
 // per-target values and not compile-time constants.
 var (
 	vidiocQueryCap  = ioc(iocRead|iocWrite, 'V', 0, unsafe.Sizeof(v4l2Capability{}))
-	vidiocEnumFmt   = ioc(iocRead|iocWrite, 'V', 1, unsafe.Sizeof(v4l2Fmtdesc{}))
 	vidiocG_Fmt     = ioc(iocRead|iocWrite, 'V', 4, unsafe.Sizeof(v4l2Format{}))
 	vidiocS_Fmt     = ioc(iocRead|iocWrite, 'V', 5, unsafe.Sizeof(v4l2Format{}))
 	vidiocReqBufs   = ioc(iocRead|iocWrite, 'V', 8, unsafe.Sizeof(v4l2ReqBufs{}))
-	vidiocQueryBuf  = ioc(iocRead|iocWrite, 'V', 9, unsafe.Sizeof(v4l2Buffer{}))
 	vidiocQBUF      = ioc(iocRead|iocWrite, 'V', 11, unsafe.Sizeof(v4l2Buffer{}))
 	vidiocDQBUF     = ioc(iocRead|iocWrite, 'V', 13, unsafe.Sizeof(v4l2Buffer{}))
 	vidiocStreamOn  = ioc(iocRead|iocWrite, 'V', 18, unsafe.Sizeof(v4l2BufType{}))
@@ -70,11 +68,6 @@ const (
 	pixelFormatYUYV  = 0x56595559 // 'YUYV'
 )
 
-// Memory-mapped buffer flags.
-const (
-	bufferFlagMapped = 0x0001
-)
-
 type v4l2Capability struct {
 	Driver       [16]uint8
 	Card         [32]uint8
@@ -83,15 +76,6 @@ type v4l2Capability struct {
 	Capabilities uint32
 	DeviceCaps   uint32
 	Reserved     [3]uint32
-}
-
-type v4l2Fmtdesc struct {
-	Index       uint32
-	Description [32]uint8
-	PixelFormat uint32
-	Flags       uint32
-	MbusFrame   [4]uint32
-	Reserved    [3]uint32
 }
 
 type v4l2Format struct {
@@ -255,7 +239,7 @@ func (c *Capture) captureOnce(ctx context.Context) (*domain.Photo, error) {
 		}
 	}
 
-	name := storage.NameFor(storage.KindCamera, "jpg", "")
+	name := storage.NameFor(storage.KindCamera, "jpg")
 	sub, err := c.store.Sub(c.dir)
 	if err != nil {
 		return nil, err

@@ -24,41 +24,15 @@ type Mock struct {
 	mu           sync.Mutex
 	telemetry    domain.PicoTelemetry
 	hasTelemetry bool
-	// failWith, when non-nil, is returned by every command. Used to exercise
-	// the degraded path without unplugging anything.
-	failWith *rocsarv1.PicoAck
-
-	connected bool
-	opened    int
-	closed    int
-
-	// echoTelemetry makes every command produce a telemetry frame, which is what
-	// the real flight controller does at 50 Hz regardless of what it is sent.
-	echoTelemetry bool
-	// silent suppresses acknowledgements, to exercise the ACK timeout path.
-	silent bool
+	connected    bool
+	opened       int
+	closed       int
 
 	now func() time.Time
 }
 
 // MockOption configures a Mock.
 type MockOption func(*Mock)
-
-// MockSilent makes the mock never acknowledge, so a caller times out.
-func MockSilent(v bool) MockOption { return func(m *Mock) { m.silent = v } }
-
-// MockEchoTelemetry makes the mock emit a telemetry frame per command.
-func MockEchoTelemetry(v bool) MockOption { return func(m *Mock) { m.echoTelemetry = v } }
-
-// MockFailsWith makes every command fail with the given code.
-func MockFailsWith(code rocsarv1.ErrorCode) MockOption {
-	return func(m *Mock) { m.failWith = &rocsarv1.PicoAck{Success: false, Error: code} }
-}
-
-// MockTelemetry seeds the telemetry the mock reports.
-func MockTelemetry(t domain.PicoTelemetry) MockOption {
-	return func(m *Mock) { m.telemetry = t; m.hasTelemetry = true }
-}
 
 func NewMock(opts ...MockOption) *Mock {
 	m := &Mock{connected: true, now: time.Now}
@@ -119,23 +93,6 @@ func (m *Mock) respond(cmd *rocsarv1.PicoCommand) (*domain.Ack, error) {
 		return nil, fmt.Errorf("mock: a command frame decoded as an envelope")
 	}
 
-	m.mu.Lock()
-	silent, fail := m.silent, m.failWith
-	m.mu.Unlock()
-
-	if silent {
-		// The real link would simply not answer. Returning nil with no error
-		// makes the caller's timeout fire, which is what we want to exercise.
-		return nil, nil
-	}
-	if fail != nil {
-		return &domain.Ack{
-			CommandSequence: cmd.GetSequence(),
-			Success:         false,
-			Error:           domain.ErrorCode(fail.GetError()),
-			At:              m.now(),
-		}, nil
-	}
 	return &domain.Ack{CommandSequence: cmd.GetSequence(), Success: true, At: m.now()}, nil
 }
 
@@ -205,7 +162,6 @@ func (m *Mock) Stop(ctx context.Context, servoID uint32) (*domain.Ack, error) {
 	})
 }
 
-func (m *Mock) OnTelemetry(fn func(domain.PicoTelemetry)) {}
 func (m *Mock) Telemetry() (domain.PicoTelemetry, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -217,11 +173,4 @@ func (m *Mock) State() domain.SubsystemState {
 		return domain.SubsystemReady
 	}
 	return domain.SubsystemDisconnected
-}
-
-func (m *Mock) SetTelemetry(t domain.PicoTelemetry) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.telemetry = t
-	m.hasTelemetry = true
 }

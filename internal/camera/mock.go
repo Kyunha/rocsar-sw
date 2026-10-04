@@ -76,7 +76,7 @@ func (m *Mock) Capture(ctx context.Context) (*domain.Photo, error) {
 		return nil, err
 	}
 
-	name := storage.NameFor(storage.KindCamera, "jpg", "mock")
+	name := storage.NameFor(storage.KindCamera, "jpg")
 	sub, err := m.store.Sub(m.dir)
 	if err != nil {
 		return nil, err

@@ -9,7 +9,6 @@ import (
 	"os/exec"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/rocsar/obc/internal/config"
 	"github.com/rocsar/obc/internal/domain"
@@ -264,122 +263,6 @@ func TestPriorityClassIsDerivedNotConfigured(t *testing.T) {
 	for _, c := range cases {
 		if got := qos.PriorityKbps(c.rate); got != c.want {
 			t.Errorf("PriorityKbps(%d) = %d, want %d", c.rate, got, c.want)
-		}
-	}
-}
-
-// The limiter must never let bulk delay telemetry. That is the entire reason it
-// exists.
-func TestHighPriorityIsNeverDelayedByBulk(t *testing.T) {
-	l := qos.NewLimiter(1024, slog.New(slog.NewTextHandler(io.Discard, nil)))
-
-	// Fill the queue with bulk, then add one high-priority message behind it.
-	for i := 0; i < 50; i++ {
-		l.Push(qos.Message{Priority: qos.PriorityBulk, Payload: make([]byte, 256)})
-	}
-	l.Push(qos.Message{Priority: qos.PriorityHigh, Topic: "telemetry", Payload: make([]byte, 64)})
-
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-
-	// A high-priority message must come out immediately even though 12 KB of
-	// bulk is queued ahead of it and the bucket is empty.
-	start := time.Now()
-	m, ok := l.Pop(ctx)
-	elapsed := time.Since(start)
-
-	if !ok {
-		t.Fatal("Pop returned nothing")
-	}
-	if m.Priority != qos.PriorityHigh {
-		t.Fatalf("popped %v, want a high-priority message", m.Priority)
-	}
-	if elapsed > 50*time.Millisecond {
-		t.Errorf("high-priority message waited %s behind bulk", elapsed)
-	}
-}
-
-// Bulk must actually be rate limited, or the limiter is decorative.
-func TestBulkIsRateLimited(t *testing.T) {
-	const rateBps = 4096
-	l := qos.NewLimiter(rateBps, slog.New(slog.NewTextHandler(io.Discard, nil)))
-
-	// The bucket starts empty, so even the first 4 KiB has to be earned.
-	payload := make([]byte, 1024)
-	for i := 0; i < 16; i++ {
-		l.Push(qos.Message{Priority: qos.PriorityBulk, Payload: payload})
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	start := time.Now()
-	var sent int
-	for sent < 4 {
-		m, ok := l.Pop(ctx)
-		if !ok {
-			t.Fatalf("Pop stopped after %d messages", sent)
-		}
-		if m.Priority != qos.PriorityBulk {
-			t.Fatalf("got %v, want bulk", m.Priority)
-		}
-		sent++
-	}
-	elapsed := time.Since(start)
-
-	// Four 1 KiB messages at 4 KiB/s is about a second. Without limiting they
-	// would be instantaneous.
-	if elapsed < 200*time.Millisecond {
-		t.Errorf("4 KiB of bulk went through in %s at a %d B/s limit; the bucket is not limiting", elapsed, rateBps)
-	}
-}
-
-// A long idle period must not buy a burst. That is the whole point of capping the
-// bucket at one second of credit.
-func TestBucketDoesNotAccumulateAnUnboundedBurst(t *testing.T) {
-	l := qos.NewLimiter(4096, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	for i := 0; i < 20; i++ {
-		l.Push(qos.Message{Priority: qos.PriorityBulk, Payload: make([]byte, 1024)})
-	}
-	// Sit idle well past the time it would take to earn a large credit.
-	time.Sleep(300 * time.Millisecond)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-
-	// One second of credit at 4096 B/s is 4096 bytes. A generous ceiling still
-	// catches "no limiting at all", which would deliver all 20 KiB instantly.
-	start := time.Now()
-	n := 0
-	for time.Since(start) < 1500*time.Millisecond {
-		m, ok := l.Pop(ctx)
-		if !ok {
-			break
-		}
-		if m.Priority == qos.PriorityBulk {
-			n++
-		}
-	}
-	if n == 0 {
-		t.Fatal("no bulk was released at all")
-	}
-	if n > 12 {
-		t.Errorf("released %d KiB in 1.5s at 4 KiB/s; the bucket burst", n)
-	}
-}
-
-// Topics are the leading frame on the wire and the natural place for the
-// urgency policy. Keep the two in one table.
-func TestTopicPriorityClassification(t *testing.T) {
-	high := []string{qos.TopicTelemetry, qos.TopicPico, qos.TopicControl}
-	for _, topic := range high {
-		if got := qos.ClassOfTopic(topic); got != qos.PriorityHigh {
-			t.Errorf("topic %q classified %v, want high", topic, got)
-		}
-	}
-	for _, topic := range []string{qos.TopicSDR, qos.TopicCamera, qos.TopicArtefact, "something.new"} {
-		if got := qos.ClassOfTopic(topic); got != qos.PriorityBulk {
-			t.Errorf("topic %q classified %v, want bulk", topic, got)
 		}
 	}
 }

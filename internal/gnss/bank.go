@@ -144,9 +144,6 @@ func (b *Bank) Close() error {
 	return firstErr
 }
 
-// Fixes is the merged stream from every receiver, tagged with its ID.
-func (b *Bank) Fixes() <-chan domain.Fix { return b.fixes }
-
 // Select makes receiverID the trusted one. The previous selection is marked
 // unselected rather than removed, so telemetry keeps reporting all three.
 func (b *Bank) Select(receiverID int) error {
@@ -220,6 +217,3 @@ func (b *Bank) Status() []domain.ReceiverStatus {
 	sort.Slice(out, func(i, j int) bool { return out[i].ReceiverID < out[j].ReceiverID })
 	return out
 }
-
-// Shutdown satisfies domain.Shutdown.
-func (b *Bank) Shutdown(ctx context.Context) error { return b.Close() }

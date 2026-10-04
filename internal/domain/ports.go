@@ -35,11 +35,13 @@ type Pico interface {
 	SetHeater(ctx context.Context, heaterID uint32, on bool) (*Ack, error)
 	Stop(ctx context.Context, servoID uint32) (*Ack, error)
 
-	// OnTelemetry registers a callback invoked on the receive goroutine for
-	// every telemetry frame. Callbacks must not block: they run in the path
-	// that reads the serial port.
-	OnTelemetry(fn func(PicoTelemetry))
-	// Telemetry returns the most recent frame and when it arrived.
+	// Telemetry returns the most recent frame and whether one has ever arrived.
+	//
+	// Polled, not pushed. A callback would run on the goroutine that owns the
+	// serial port, so a listener that blocked would delay the next read and
+	// eventually overrun the device's buffer. Telemetry is consumed at 1 Hz and
+	// a frame is 20 ms old at worst, so the push buys nothing and costs a
+	// lifetime of listener bookkeeping.
 	Telemetry() (PicoTelemetry, bool)
 }
 
@@ -49,25 +51,6 @@ type Ack struct {
 	Success         bool
 	Error           ErrorCode
 	At              time.Time
-}
-
-// GnssReceiver is one passive u-blox receiver.
-//
-// Passive means it binds and reads; it never connects. A connected UDP socket
-// only receives from a peer that was already talking to it, which is the
-// classic bug that makes a feed look dead.
-type GnssReceiver interface {
-	// Open binds the UDP port. It does not wait for a sender.
-	Open(ctx context.Context) error
-	Close() error
-
-	// Fixes delivers every accepted fix. Only validated datagrams arrive here;
-	// rejects are counted and not forwarded.
-	Fixes() <-chan Fix
-
-	// Status reports health for telemetry, including the selected flag which
-	// the Bank owns rather than the receiver.
-	Status() ReceiverStatus
 }
 
 // Camera is the USB camera.

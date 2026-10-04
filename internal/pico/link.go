@@ -384,17 +384,7 @@ func (l *Link) handleTelemetry(tel *rocsarv1.PicoTelemetry) {
 	l.telemetry = d
 	l.haveTelemetry = true
 	l.lastTelemetryAt = l.now()
-	listeners := make([]func(domain.PicoTelemetry), len(l.listeners))
-	copy(listeners, l.listeners)
 	l.mu.Unlock()
-
-	// Listeners run on the receive goroutine, which is the goroutine that owns
-	// the port. A listener that blocks delays the next read and eventually
-	// overruns the device's buffer. That contract is why telemetry assembly
-	// lives in its own package and does no I/O.
-	for _, fn := range listeners {
-		fn(d)
-	}
 }
 
 // exchange is the one path every command takes: assign a sequence, register a
@@ -528,31 +518,6 @@ func (l *Link) Connected() bool {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 	return l.connected
-}
-
-// OnTelemetry registers a callback. It runs on the receive goroutine and must
-// not block.
-func (l *Link) OnTelemetry(fn func(domain.PicoTelemetry)) {
-	l.mu.Lock()
-	l.listeners = append(l.listeners, fn)
-	l.mu.Unlock()
-}
-
-// RemoveTelemetryListener unregisters fn. Safe to call for a listener that was
-// never added, so a deferred removal in a test needs no guard.
-func (l *Link) RemoveTelemetryListener(fn func(domain.PicoTelemetry)) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	for i, f := range l.listeners {
-		if sameFunc(f, fn) {
-			l.listeners = append(l.listeners[:i], l.listeners[i+1:]...)
-			return
-		}
-	}
-}
-
-func sameFunc(a, b func(domain.PicoTelemetry)) bool {
-	return fmt.Sprintf("%p", a) == fmt.Sprintf("%p", b)
 }
 
 // Telemetry returns the most recent frame and whether one has ever arrived.

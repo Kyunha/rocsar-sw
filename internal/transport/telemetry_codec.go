@@ -78,9 +78,11 @@ func EncodeTelemetry(s telemetry.Snapshot) *rocsarv1.TelemetryFrame {
 	}
 
 	// GNSS: every receiver, so the redundancy is visible and the operator knows
-	// which one is trusted. Satellites is left unset because Read_uB's 142-byte
-	// packet does not carry it -- claiming a satellite count we never received
-	// would be the kind of plausible-looking fabrication this project avoids.
+	// which one is trusted.
+	//
+	// There is no satellite count anywhere in this conversion, deliberately: the
+	// 142-byte UDP_message does not carry one. See GnssReceiverStatus in
+	// telemetry.proto.
 	for _, r := range s.GNSS {
 		g := &rocsarv1.GnssReceiverStatus{
 			ReceiverId:      uint32(r.ReceiverID),

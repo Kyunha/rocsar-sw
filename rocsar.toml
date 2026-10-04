@@ -42,7 +42,7 @@ telemetry_endpoint = "tcp://192.168.1.50:5556"
 
 [http]
 addr = ":5557"
-root = "/mnt/rocsar/data"
+root = "/mnt/ssd/data"
 # The port in `addr` is load-bearing. The kernel's flower filter classifies bulk
 # traffic on `dst_port 5557`, and it is a constant (config.BulkPort), not a key
 # here. If the two disagree the failure is silent: downloads join the priority

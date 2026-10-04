@@ -24,7 +24,6 @@ var (
 	ErrCobsEmpty     = errors.New("pico/cobs: empty frame")
 	ErrCobsZeroByte  = errors.New("pico/cobs: zero byte inside a COBS frame")
 	ErrCobsTruncated = errors.New("pico/cobs: truncated COBS frame")
-	ErrCobsOverflow  = errors.New("pico/cobs: output buffer too small")
 )
 
 // COBS overhead.

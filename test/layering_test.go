@@ -272,18 +272,22 @@ func sortStrings(s []string) {
 	}
 }
 
-// assertionRegex matches the compile-time satisfaction idiom:
+// assertionRegex matches the compile-time satisfaction idiom, in both forms Go
+// programmers actually write:
 //
-//	var _ domain.Pico = (*Link)(nil)
+//	var _ domain.Pico = (*Link)(nil)          // one line
+//	var (                                     // or grouped, with no `var`
+//	    _ domain.Pico = (*Link)(nil)
+//	)
 //
-// Group 1 is the qualifier, group 2 the interface, group 3 the concrete type.
+// Group 1 is the interface, group 2 the concrete type.
 //
-// There is deliberately no `var` keyword in the pattern. Assertions are almost
-// always written inside a grouped `var ( ... )` block, where each line is just
-// `_ domain.Pico = (*Link)(nil)` with no `var` in front of it -- and a pattern
-// that requires one silently matches nothing, which is indistinguishable from
+// `var` is OPTIONAL and that is the whole point. Requiring it silently misses
+// every grouped block, which is the majority of them; forbidding it silently
+// misses every one-line assertion. Both spellings are common, so the pattern
+// accepts both. Getting this wrong in either direction looks exactly like
 // "nobody has implemented this port".
-var assertionRegex = regexp.MustCompile(`(?m)^\s*_\s+\w+\.(\w+)\s*=\s*\(\*(\w+)\)`)
+var assertionRegex = regexp.MustCompile(`(?m)^\s*(?:var\s+)?_\s+\w+\.(\w+)\s*=\s*\(\*(\w+)\)`)
 
 // doublePrefixes name the types this test counts as test doubles.
 //

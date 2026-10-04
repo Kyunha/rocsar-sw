@@ -21,7 +21,6 @@ type Mock struct {
 	pid      int64
 	acquires int
 	lastLog  string
-	failWith error
 	probeOut string
 }
 
@@ -35,12 +34,6 @@ func NewMock() *Mock {
 	}
 }
 
-// MockFailWith makes Connect fail.
-func MockFailWith(err error) func(*Mock) { return func(m *Mock) { m.failWith = err } }
-
-// MockProbeOutput replaces the probe output.
-func MockProbeOutput(s string) func(*Mock) { return func(m *Mock) { m.probeOut = s } }
-
 func (m *Mock) Params(ctx context.Context) (domain.SdrParams, error) {
 	return domain.SdrParams{PRFHz: 2750, SampleRateHz: 31.251e6, TxFreqHz: 5.8e9}, nil
 }
@@ -51,10 +44,6 @@ func (m *Mock) Connect(ctx context.Context) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if m.failWith != nil {
-		m.state = domain.SubsystemError
-		return m.failWith
-	}
 	if m.running {
 		return ErrAlreadyRunning
 	}
@@ -114,10 +103,3 @@ func (m *Mock) Stop(ctx context.Context) error {
 }
 
 func (m *Mock) Close() error { return nil }
-
-// Acquisitions reports how many acquisitions were started, for tests.
-func (m *Mock) Acquisitions() int {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.acquires
-}

@@ -26,7 +26,20 @@ message GnssReceiverStatus {
   double altitude_m = 6;
   double ground_speed_mps = 7;
   double course_deg = 8;
-  uint32 satellites = 9;
+
+  // There is deliberately no satellite count.
+  //
+  // The frozen 142-byte UDP_message does not carry one -- it has 17 fields and
+  // none of them is a fix quality indicator. A field here would have to be
+  // filled with a constant or left at zero, and a Ground Station rendering
+  // "0 satellites" next to a valid position is worse than one that does not
+  // claim to know. The 420-byte NavData datagram does carry flags and a stage,
+  // and reading that is the only way to get this honestly. See NOTES.md.
+  //
+  // 9 is reserved rather than reused: a Ground Station built against the earlier
+  // schema may still be carrying a wire that puts a varint there, and a field
+  // number is the wire.
+  reserved 9;
 
   // Seconds since the last accepted datagram, and -1 if there never was one.
   // Negative and zero are different states and are not collapsed.

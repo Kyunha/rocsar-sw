@@ -366,12 +366,6 @@ func (s *Service) Stop(ctx context.Context) error {
 // Close satisfies domain.Shutdown.
 func (s *Service) Close() error { return s.Stop(context.Background()) }
 
-func (s *Service) SetState(st domain.SubsystemState) {
-	s.mu.Lock()
-	s.state = st
-	s.mu.Unlock()
-}
-
 // processAlive reports whether a PID is running.
 //
 // Signal 0 performs the permission and existence checks without delivering

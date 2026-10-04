@@ -281,15 +281,12 @@ func (s *Store) FreeSpace() (uint64, error) {
 	return uint64(st.Bavail) * uint64(st.Bsize), nil
 }
 
-// NameFor builds a sortable, unique artefact name.
+// NameFor builds a sortable, unique artefact name: "<kind>-<timestamp>.<ext>".
 //
 // The timestamp is local and formatted for lexical ordering, which is why it is
-// not RFC3339: `20261003-142530.jpg` sorts correctly as a string and
-// `2026-10-03T14:25:30Z.jpg` does not compare usefully against anything.
-func NameFor(kind, ext string, prefix string) string {
-	ts := time.Now().Format("20060102-150405")
-	if prefix == "" {
-		return fmt.Sprintf("%s-%s.%s", kind, ts, ext)
-	}
-	return fmt.Sprintf("%s-%s-%s.%s", prefix, kind, ts, ext)
+// not RFC3339. `camera-20261003-142530.jpg` sorts correctly as a plain string
+// comparison; `camera-2026-10-03T14:25:30Z.jpg` does not compare usefully
+// against anything.
+func NameFor(kind, ext string) string {
+	return fmt.Sprintf("%s-%s.%s", kind, time.Now().Format("20060102-150405"), ext)
 }

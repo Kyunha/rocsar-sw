@@ -155,11 +155,18 @@ real implementation and a mock; a test asserts both exist.
 | Port | Real adapter | Mock |
 | :--- | :--- | :--- |
 | `Pico` | `pico.Link` | `pico.Mock` |
-| `GnssReceiver` | `gnss.Receiver` | `gnss.Mock` |
-| `Camera` | `camera.V4L2` | `camera.Mock` |
+| `Camera` | `camera.Capture` | `camera.Mock` |
 | `Sdr` | `sdr.Service` | `sdr.Mock` |
 | `LinkShaper` | `qos.TcShaper` | `qos.NullShaper` |
-| `Clock` | `domain.RealClock` | `domain.FakeClock` |
+| `Shutdown` | `pico.Link` | *(none — see below)* |
+
+There is no `GnssReceiver` port. It was declared, nothing consumed it — the bank
+holds concrete `*gnss.Receiver` — and an interface with one implementation is a
+class with no seam. It went when the GNSS mock did.
+
+`Shutdown` is excluded from the mock rule: it is a lifecycle constraint, not a
+hardware port. There is nothing to disagree about — either a type can be closed
+or it cannot — and a `MockShutdown` that recorded `Close` calls would be theatre.
 
 ---
 
@@ -386,18 +393,7 @@ commands.
 
 ### 6.6 QoS and link shaping
 
-Two layers, because they solve different problems.
-
-**Userspace (`internal/qos`).** A priority queue with two classes feeding the ZMQ
-PUB socket:
-
-- *Priority* — telemetry and command responses. Bypasses the limiter.
-- *Bulk* — artefact-adjacent traffic. Token-bucket limited at `bulk_rate_bps`.
-
-The limiter exists so that a bulk transfer cannot monopolise the socket's send
-path even before the kernel sees the traffic.
-
-**Kernel (`internal/qos`, `TcShaper`).** One HTB hierarchy on the link device:
+**One layer today: the kernel.** An HTB hierarchy on the link device:
 
 ```
 root htb
@@ -425,6 +421,27 @@ as "there was no rule", reporting success when `tc` does not exist at all.
 
 The shaper requires `CAP_NET_ADMIN`. The systemd unit carries it. Without it the
 OBC runs unshaped and says so in telemetry rather than refusing to start.
+
+**There is no userspace priority queue, and this section previously claimed
+there was.** A two-class limiter (`PriorityHigh` bypass, `PriorityBulk`
+token-bucket) was written, tested and then deleted, because it had no second
+class with a producer:
+
+- artefact bytes go over **HTTP**, not ZeroMQ — see §5.1;
+- the camera is **snapshot only**, and `take_photo` returns a name and a size
+  rather than an image — see §6.3.
+
+So there is no ZeroMQ bulk traffic, the priority class is the only class, and a
+limiter with one class is a token bucket around everything. The kernel hierarchy
+is the only thing doing useful work, and it is the only thing that can: it shapes
+traffic this process does not own.
+
+If a bulk publisher ever appears on the ZeroMQ socket, the userspace queue comes
+back — the seam is `qos.Limiter` and the reason it was removed is recorded here
+rather than left as an absence nobody can explain.
+
+The published topic vocabulary (`qos.TopicTelemetry`, `qos.TopicControl`) stays:
+it is the wire contract in §5.1, not part of the limiter.
 
 ### 6.7 Storage
 
@@ -555,6 +572,26 @@ Three modes, and no fourth:
 - **degraded** — no mock, hardware absent. Reports `DISCONNECTED`, server runs.
 
 There is no fallback-to-mock. If you want mock, you ask for it.
+
+**`--mock-gnss` existed and was a lie; it is deleted.** It set `mocked = [gnss]`
+while `gnss.NewBank` went ahead and constructed real `gnss.Receiver`s bound to
+real UDP ports — so the OBC announced a simulation while three live receivers
+were listening. That is the failure mode this section exists to prevent, running
+in the opposite direction, and nothing in telemetry could distinguish it.
+
+The GNSS bank always binds real receivers. To exercise the decoder without a
+receiver, use `tools/gnss_bench inject`, which builds a real 142-byte datagram
+and runs it through the real decoder — that tests the thing that was broken, and
+it cannot be mistaken for a simulation of it.
+
+The remaining flags are `--mock-pico`, `--mock-camera` and `--mock-sdr`, and each
+one actually substitutes the implementation it names. `test/layering_test.go`
+fails if a `domain` port loses its mock, so a new port cannot quietly arrive
+unmocked.
+
+**A flag that claims a subsystem is simulated must have a test that proves the
+implementation behind it changed.** There is not one for the three above either
+— the flags are wired in `cmd/obc/main.go` and read by eye. It is on the list.
 
 ---
 

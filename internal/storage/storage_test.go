@@ -114,8 +114,8 @@ func TestKindClassification(t *testing.T) {
 // Names must sort lexically in chronological order, which is why the format is
 // not RFC3339.
 func TestArtefactNamesSortChronologically(t *testing.T) {
-	early := NameFor(KindCamera, "jpg", "")
-	late := NameFor(KindSDR, "bin", "")
+	early := NameFor(KindCamera, "jpg")
+	late := NameFor(KindSDR, "bin")
 	if !strings.HasSuffix(early, ".jpg") || !strings.HasPrefix(early, "camera-") {
 		t.Errorf("NameFor produced %q", early)
 	}

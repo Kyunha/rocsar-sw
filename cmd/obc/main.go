@@ -54,7 +54,6 @@ func run() error {
 	var (
 		configPath  = flags.String("config", "", "path to rocsar.toml (default: $ROCSAR_CONFIG, else ./rocsar.toml)")
 		mockPico    = flags.Bool("mock-pico", false, "simulate the flight controller")
-		mockGNSS    = flags.Bool("mock-gnss", false, "simulate the GNSS receivers")
 		mockCamera  = flags.Bool("mock-camera", false, "simulate the camera")
 		mockSDR     = flags.Bool("mock-sdr", false, "simulate the SDR")
 		noShaping   = flags.Bool("no-link-shaping", false, "do not touch tc")
@@ -117,9 +116,6 @@ func run() error {
 	mocked := map[string]bool{}
 	if *mockPico {
 		mocked["pico"] = true
-	}
-	if *mockGNSS {
-		mocked["gnss"] = true
 	}
 	if *mockCamera {
 		mocked["camera"] = true

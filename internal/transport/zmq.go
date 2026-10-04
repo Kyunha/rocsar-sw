@@ -2,7 +2,6 @@ package transport
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -65,9 +64,6 @@ type outbound struct {
 	topic   string
 	payload []byte
 }
-
-// ErrZMQNotRunning is returned when a command arrives before the sockets bind.
-var ErrZMQNotRunning = errors.New("transport: ZMQ is not running")
 
 // NewZMQ creates the sockets. Start binds them.
 func NewZMQ(log *slog.Logger, handler Handler) *ZMQ {
