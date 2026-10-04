@@ -126,6 +126,21 @@ func (s *SerialTransport) Close() error {
 
 func (s *SerialTransport) Path() string { return s.path }
 
+// String identifies the link in an error message.
+//
+// Without it, %s on a *SerialTransport reflects the struct and prints the port
+// handle alongside the path: "open: &{<nil> /dev/ttyACM0 %!s(int=115200)} did
+// not answer". The handle is noise, the format complaint is worse, and both land
+// in the one message an operator reads when the flight controller is missing.
+// The baud rate is kept, because two buses on this board are both 115200 and
+// confusing them is the mistake this constant exists to prevent.
+func (s *SerialTransport) String() string {
+	if s.port == nil {
+		return fmt.Sprintf("%s (unopened, %d baud)", s.path, s.baudrate)
+	}
+	return fmt.Sprintf("%s at %d baud", s.path, s.baudrate)
+}
+
 // Exists reports whether the device node is present.
 //
 // A cheap pre-check so the composition root can say "no Pico at /dev/ttyACM0"
