@@ -354,7 +354,12 @@ func (c *Capture) setup(fd int) (uint32, error) {
 	// Named `f`, not `fmt`: a local called fmt shadows the fmt package for the
 	// whole function, and every error message below stops compiling.
 	var f v4l2Format
-	f.PixelFormat = pixelFormatMJPEG
+	// Type is not optional. It is how the kernel knows which union arm is live
+	// and whether it can service the request at all; zero is not a buffer type,
+	// and G_FMT answers EINVAL rather than guessing. This field did not exist in
+	// the first version of this struct, which is the same bug as its absence:
+	// the call failed, just one step later.
+	f.Type = bufTypeVideoCapture
 	if err := ioctl(fd, vidiocG_Fmt, unsafe.Pointer(&f)); err != nil {
 		return 0, fmt.Errorf("camera: VIDIOC_G_FMT: %w", err)
 	}
