@@ -18,6 +18,9 @@ import (
 // fakeExec records the tc invocations and returns canned output.
 type fakeExec struct {
 	calls [][]string
+	// filterAddFailed makes `tc filter add` fail, so the filter genuinely does
+	// not exist and `filter show` reports nothing.
+	filterAddFailed bool
 	// respond maps a substring of the joined command to a canned result.
 	respond func(joined string) (string, error)
 }
@@ -30,8 +33,27 @@ func (f *fakeExec) run(ctx context.Context, name string, args ...string) (string
 			return out, err
 		}
 	}
+	// `tc filter show` answers with whatever is on the device. The default is the
+	// real output captured on the Pi after this shaper installs the filter, so the
+	// read-back verification is checked against bytes tc actually printed rather
+	// than against a hand-written approximation of them.
+	if joined == "filter show dev eth0" && !f.filterAddFailed {
+		return filterShowInstalled, nil
+	}
 	return "", nil
 }
+
+// Verbatim from `tc filter show dev eth0` on the Pi, after the filter this
+// package installs. Note `ip_proto tcp` and `dst_port 5557` on separate lines --
+// that is tc's own layout, and a check written against a single-line guess would
+// not match it.
+const filterShowInstalled = `filter parent 1: protocol ip pref 20 flower chain 0
+filter parent 1: protocol ip pref 20 flower chain 0 handle 0x1
+  eth_type ipv4
+  ip_proto tcp
+  dst_port 5557
+  not_in_hw
+`
 
 func (f *fakeExec) joined() []string {
 	out := make([]string, 0, len(f.calls))
@@ -93,7 +115,7 @@ func TestBulkFlowerFilterIsInstalledAndItsAbsenceIsReported(t *testing.T) {
 		t.Fatalf("Apply failed: %s", reason)
 	}
 	joined := strings.Join(f.joined(), "\n")
-	if !strings.Contains(joined, "flower dst_port 5557") {
+	if !strings.Contains(joined, "flower ip_proto tcp dst_port 5557") {
 		t.Errorf("the bulk flower filter was not installed; bulk traffic would fall through to the default class.\ngot:\n%s", joined)
 	}
 	if !strings.Contains(joined, "parent 1:") || !strings.Contains(joined, "prio 20") {
