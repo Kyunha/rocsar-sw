@@ -76,8 +76,27 @@ mkdir -p firmware
 # include to match. A nested include would compile under protoc and fail under
 # the Arduino IDE, which is the worst way to find out.
 find "$STAGE" -name '*.pb.h' -o -name '*.pb.c' | while read -r f; do
-    sed -e 's|#include "rocsar/v1/|#include "|' "$f" > "firmware/$(basename "$f")"
+    sed -e 's|#include "rocsar/v1/|#include "|' \
+        -e 's|#include <pb\.h>|#include "pb.h"|' \
+        "$f" > "firmware/$(basename "$f")"
 done
+
+# The `<pb.h>` rewrite above is not cosmetic.
+#
+# nanopb emits `#include <pb.h>` into every generated header. That resolves when
+# pb.h is on the include path, which is true under a normal build and false here:
+# the RP2040 build compiles from firmware/ by proximity, with no -I, so angle
+# brackets search the toolchain's system directories and do not find the vendored
+# pb.h sitting next to the file that includes it.
+#
+# The result is `fatal error: pb.h: No such file or directory` from a build that
+# is otherwise perfectly configured, and the fix that is tempting -- adding -I to
+# the compile flags -- hides the real cause in a build setting instead of putting
+# it where the next reader will look. Quotes say "same folder", which is exactly
+# what is meant.
+#
+# Only pb.h is rewritten. The C++ standard headers it also includes, <stdint.h>
+# and <string.h>, genuinely are toolchain headers and must keep their brackets.
 
 # The COBS framing layer is ours, not nanopb's, and is vendored in its own
 # directory so its provenance is obvious. cobs_encode() does not bounds-check its
@@ -102,6 +121,20 @@ if ! grep -q 'antennas\[2\]' firmware/pico.pb.h; then
     echo "[gen] FAIL: PicoTelemetry.antennas is not a static [2] array." >&2
     echo "[gen]      pico.options was not applied by nanopb." >&2
     grep -n 'antennas' firmware/pico.pb.h | head >&2
+    exit 1
+fi
+
+# 1b. pb.h included by quotes, not angle brackets.
+#
+#     The build breaks on this and nothing else says why: the failure is a
+#     missing header in a build with no -I, which reads like a broken toolchain
+#     rather than an include style. Assert it here so the cause is at least
+#     visible before anyone tries to fix it with a compiler flag.
+if grep -q '#include <pb\.h>' firmware/*.pb.h 2>/dev/null; then
+    echo "[gen] FAIL: a generated header still includes <pb.h> with angle brackets." >&2
+    echo "[gen]      The RP2040 build has no -I, so this cannot resolve. Check the" >&2
+    echo "[gen]      sed rewrite for nanopb's include in this script." >&2
+    grep -n '#include <pb\.h>' firmware/*.pb.h >&2
     exit 1
 fi
 

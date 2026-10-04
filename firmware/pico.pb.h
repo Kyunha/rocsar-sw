@@ -3,7 +3,7 @@
 
 #ifndef PB_ROCSAR_V1_ROCSAR_V1_PICO_PB_H_INCLUDED
 #define PB_ROCSAR_V1_ROCSAR_V1_PICO_PB_H_INCLUDED
-#include <pb.h>
+#include "pb.h"
 #include "common.pb.h"
 
 #if PB_PROTO_HEADER_VERSION != 40
