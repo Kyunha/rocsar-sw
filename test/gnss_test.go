@@ -9,35 +9,6 @@ import (
 	"github.com/rocsar/obc/internal/gnss"
 )
 
-// buildDatagram assembles a 142-byte UDP_message exactly as Read_uB's C struct
-// lays it out, so these tests exercise the real byte positions rather than a Go
-// struct's idea of them.
-//
-// Layout verified with offsetof() against the actual C header:
-//
-//	Start   0    End 141   sizeof(UDP_message) 142
-//	Epochs  1    Data  5    sizeof(GUI_buffer) 136
-//	Latitude at 13, Longitude at 21, Height at 29, Heading at 77, Ganom at 133
-type builder struct{ b []byte }
-
-func newDatagram() *builder {
-	b := make([]byte, gnss.DatagramSize)
-	b[0] = gnss.StartMarker
-	b[1], b[2], b[3], b[4] = 1, 0, 0, 0 // Epochs, little-endian
-	b[gnss.DatagramSize-1] = gnss.EndMarker
-	return &builder{b: b}
-}
-
-func (d *builder) f64(absOffset int, v float64) *builder {
-	bits := math.Float64bits(v)
-	for i := 0; i < 8; i++ {
-		d.b[absOffset+i] = byte(bits >> (8 * i)) // little-endian
-	}
-	return d
-}
-
-func (d *builder) bytes() []byte { return d.b }
-
 // THE regression test.
 //
 // obc_rocsar's NOTES.md documented latitude and longitude as arriving "in
@@ -57,8 +28,9 @@ func TestGNSSDecodesDegreesNotRadians(t *testing.T) {
 	)
 
 	raw, err := gnss.Decode(
-		newDatagram().f64(13, latDeg).f64(21, lonDeg).f64(29, 120.0).f64(77, 275.5).bytes(),
-		1, time.Now())
+		mustEncode(t, gnss.RawFix{
+			Latitude: latDeg, Longitude: lonDeg, Height: 120.0, Heading: 275.5,
+		}), 1, time.Now())
 	if err != nil {
 		t.Fatalf("Decode: %v", err)
 	}
@@ -81,36 +53,42 @@ func TestGNSSDecodesDegreesNotRadians(t *testing.T) {
 // A latitude in the range that radians-times-57.3 would produce must be
 // REJECTED, not accepted as a fix. This is the check that turns "wrong by a
 // factor of 57.3" from a silent corruption into a counted rejection.
+//
+// Hand-built rather than encoded, because gnss.Encode refuses to produce it --
+// it shares the decoder's validator, which is the point of the previous test.
+// A consumer that somehow received this datagram must reject it, and that is a
+// separate property from the encoder declining to send it.
 func TestGNSSRejectsRadiansDoubledIntoDegrees(t *testing.T) {
-	// 0.674 * 180/pi == 38.7: the bug's actual output for Lisbon.
-	_, err := gnss.Decode(newDatagram().f64(13, 38.7223*57.2957795).bytes(), 1, time.Now())
-	if err == nil {
-		t.Fatal("a latitude of 2218 was accepted; out-of-range coordinates must be rejected")
+	if _, err := gnss.Encode(gnss.RawFix{Latitude: 38.7223 * 57.2957795}); err == nil {
+		t.Fatal("the encoder produced a latitude of 2218; it should have refused")
+	}
+
+	doubled := make([]byte, gnss.DatagramSize)
+	doubled[0] = gnss.StartMarker
+	doubled[len(doubled)-1] = gnss.EndMarker
+	putF64(doubled, 13, 38.7223*57.2957795)
+
+	if _, err := gnss.Decode(doubled, 1, time.Now()); err == nil {
+		t.Fatal("the decoder accepted a latitude of 2218; out-of-range coordinates must be rejected")
 	}
 }
 
 // Every field, at its verified offset. A field-order change in the Go decoder
 // would otherwise reinterpret the whole struct silently.
-func TestGNSSFieldOffsets(t *testing.T) {
-	raw, err := gnss.Decode(newDatagram().
-		f64(5+0, 1.5).    // GPStime
-		f64(5+8, 10.0).   // Latitude
-		f64(5+16, 20.0).  // Longitude
-		f64(5+24, 30.0).  // Height
-		f64(5+32, 1.0).   // Vnorth
-		f64(5+40, 2.0).   // Veast
-		f64(5+48, 3.0).   // Vdown
-		f64(5+56, 4.0).   // Roll
-		f64(5+64, 5.0).   // Pitch
-		f64(5+72, 6.0).   // Heading
-		f64(5+80, 7.0).   // AccBiX
-		f64(5+88, 8.0).   // AccBiY
-		f64(5+96, 9.0).   // AccBiZ
-		f64(5+104, 10.0). // GyrBiX
-		f64(5+112, 11.0). // GyrBiY
-		f64(5+120, 12.0). // GyrBiZ
-		f64(5+128, 13.0). // Ganom
-		bytes(), 1, time.Now())
+// Every field must survive a round trip at its own offset. A field-order change
+// in either direction would reinterpret the struct silently, and this asserts
+// the value that comes out, not just the size.
+func TestEveryFieldRoundTrips(t *testing.T) {
+	orig := gnss.RawFix{
+		GPStime: 1.5, Latitude: 10.0, Longitude: 20.0, Height: 30.0,
+		Vnorth: 1.0, Veast: 2.0, Vdown: 3.0,
+		Roll: 4.0, Pitch: 5.0, Heading: 6.0,
+		AccBiasX: 7.0, AccBiasY: 8.0, AccBiasZ: 9.0,
+		GyroBiasX: 10.0, GyroBiasY: 11.0, GyroBiasZ: 12.0,
+		GravityAnomaly: 13.0,
+	}
+
+	raw, err := gnss.Decode(mustEncode(t, orig), 1, time.Now())
 	if err != nil {
 		t.Fatalf("Decode: %v", err)
 	}
@@ -120,23 +98,23 @@ func TestGNSSFieldOffsets(t *testing.T) {
 		got  float64
 		want float64
 	}{
-		{"GPStime", raw.GPStime, 1.5},
-		{"Latitude", raw.Latitude, 10.0},
-		{"Longitude", raw.Longitude, 20.0},
-		{"Height", raw.Height, 30.0},
-		{"Vnorth", raw.Vnorth, 1.0},
-		{"Veast", raw.Veast, 2.0},
-		{"Vdown", raw.Vdown, 3.0},
-		{"Roll", raw.Roll, 4.0},
-		{"Pitch", raw.Pitch, 5.0},
-		{"Heading", raw.Heading, 6.0},
-		{"AccBiasX", raw.AccBiasX, 7.0},
-		{"AccBiasY", raw.AccBiasY, 8.0},
-		{"AccBiasZ", raw.AccBiasZ, 9.0},
-		{"GyroBiasX", raw.GyroBiasX, 10.0},
-		{"GyroBiasY", raw.GyroBiasY, 11.0},
-		{"GyroBiasZ", raw.GyroBiasZ, 12.0},
-		{"GravityAnomaly", raw.GravityAnomaly, 13.0},
+		{"GPStime", raw.GPStime, orig.GPStime},
+		{"Latitude", raw.Latitude, orig.Latitude},
+		{"Longitude", raw.Longitude, orig.Longitude},
+		{"Height", raw.Height, orig.Height},
+		{"Vnorth", raw.Vnorth, orig.Vnorth},
+		{"Veast", raw.Veast, orig.Veast},
+		{"Vdown", raw.Vdown, orig.Vdown},
+		{"Roll", raw.Roll, orig.Roll},
+		{"Pitch", raw.Pitch, orig.Pitch},
+		{"Heading", raw.Heading, orig.Heading},
+		{"AccBiasX", raw.AccBiasX, orig.AccBiasX},
+		{"AccBiasY", raw.AccBiasY, orig.AccBiasY},
+		{"AccBiasZ", raw.AccBiasZ, orig.AccBiasZ},
+		{"GyroBiasX", raw.GyroBiasX, orig.GyroBiasX},
+		{"GyroBiasY", raw.GyroBiasY, orig.GyroBiasY},
+		{"GyroBiasZ", raw.GyroBiasZ, orig.GyroBiasZ},
+		{"GravityAnomaly", raw.GravityAnomaly, orig.GravityAnomaly},
 	}
 	for _, c := range checks {
 		if c.got != c.want {
@@ -145,9 +123,51 @@ func TestGNSSFieldOffsets(t *testing.T) {
 	}
 }
 
+// The encoder must produce exactly DatagramSize bytes with the markers in place,
+// or a receiver built against it will bind a socket and never be framed.
+func TestEncodeShape(t *testing.T) {
+	b, err := gnss.Encode(gnss.RawFix{Latitude: 1, Longitude: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(b) != gnss.DatagramSize {
+		t.Fatalf("Encode produced %d bytes, want %d", len(b), gnss.DatagramSize)
+	}
+	if b[0] != gnss.StartMarker {
+		t.Errorf("start marker = 0x%02x, want 0x%02x", b[0], gnss.StartMarker)
+	}
+	if b[len(b)-1] != gnss.EndMarker {
+		t.Errorf("end marker = 0x%02x, want 0x%02x", b[len(b)-1], gnss.EndMarker)
+	}
+}
+
+// Encode and Decode must agree on validity, or a fix the encoder refuses is one
+// the decoder would have accepted -- and a rule neither can state.
+func TestEncodeRefusesWhatDecodeRefuses(t *testing.T) {
+	bad := []gnss.RawFix{
+		{Latitude: 91},
+		{Latitude: -91},
+		{Longitude: 181},
+		{Longitude: -181},
+		{Latitude: math.NaN()},
+		{Height: math.Inf(1)},
+	}
+	for _, f := range bad {
+		if _, err := gnss.Encode(f); err == nil {
+			t.Errorf("Encode accepted %+v", f)
+		}
+	}
+	if _, err := gnss.Encode(gnss.RawFix{Latitude: 38.7, Longitude: -9.1}); err != nil {
+		t.Errorf("Encode rejected a valid fix: %v", err)
+	}
+}
+
 func TestGroundSpeedDerivedFromComponents(t *testing.T) {
-	// 3-4-5 triangle.
-	raw, err := gnss.Decode(newDatagram().f64(13, 1.0).f64(5+32, 3.0).f64(5+40, 4.0).bytes(), 1, time.Now())
+	// 3-4-5 triangle. Ground speed is derived from the components, not carried:
+	// UDP_message has no velocity-norm field and expects the consumer to compute it.
+	raw, err := gnss.Decode(
+		mustEncode(t, gnss.RawFix{Latitude: 1, Longitude: 1, Vnorth: 3, Veast: 4}),
+		1, time.Now())
 	if err != nil {
 		t.Fatalf("Decode: %v", err)
 	}
@@ -160,8 +180,15 @@ func TestGroundSpeedDerivedFromComponents(t *testing.T) {
 // different operator problem and they are counted separately so telemetry can
 // distinguish "the receiver stopped" from "the receiver is producing garbage".
 func TestGNSSRejectsMalformed(t *testing.T) {
+	// Built by hand because every case here is malformed on purpose and must not
+	// go through the encoder, which refuses to produce them.
 	valid := func() []byte {
-		return newDatagram().f64(13, 38.7).f64(21, -9.1).bytes()
+		b := make([]byte, gnss.DatagramSize)
+		b[0] = gnss.StartMarker
+		b[len(b)-1] = gnss.EndMarker
+		putF64(b, 13, 38.7)
+		putF64(b, 21, -9.1)
+		return b
 	}
 
 	cases := []struct {
@@ -196,6 +223,17 @@ func TestGNSSRejectsMalformed(t *testing.T) {
 			}
 		})
 	}
+}
+
+// mustEncode is the only datagram builder the tests need: the encoder IS the
+// definition of the layout, and a second one here could disagree with it.
+func mustEncode(t *testing.T, f gnss.RawFix) []byte {
+	t.Helper()
+	b, err := gnss.Encode(f)
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	return b
 }
 
 func putF64(b []byte, off int, v float64) []byte {

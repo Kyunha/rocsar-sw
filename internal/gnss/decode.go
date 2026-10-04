@@ -96,8 +96,15 @@ const (
 	offGyroZ   = 120
 	offAnomaly = 128
 
-	// payloadSize must equal 136 and the header is Start(1) + Epochs(4).
+	// payloadSize is sizeof(GUI_buffer) from Read_uB.h, verified with offsetof().
 	payloadSize = 136
+
+	// headerSize is Start (1 byte) + Epochs (4 bytes), verified with offsetof().
+	headerSize = 5
+
+	// epochsSize is the uint32 epoch counter. Named because it is the reason
+	// headerSize is 5 and not 1.
+	epochsSize = 4
 )
 
 // ErrShortDatagram and friends. They are separate values so a caller can tell
@@ -132,9 +139,7 @@ func Decode(datagram []byte, receiverID int, now time.Time) (RawFix, error) {
 	// Epochs sits at offset 1, little-endian uint32. It counts epochs since the
 	// receiver started and is useful for spotting a silent restart: a counter
 	// that went backwards means the receiver rebooted.
-	epochOffset := 1
-
-	payload := datagram[epochOffset+4 : epochOffset+4+payloadSize]
+	payload := datagram[headerSize : headerSize+payloadSize]
 
 	le := binary.LittleEndian
 	f := func(off int) float64 { return math.Float64frombits(le.Uint64(payload[off : off+8])) }
@@ -153,33 +158,16 @@ func Decode(datagram []byte, receiverID int, now time.Time) (RawFix, error) {
 	out.GyroBiasX, out.GyroBiasY, out.GyroBiasZ = f(offGyroX), f(offGyroY), f(offGyroZ)
 	out.GravityAnomaly = f(offAnomaly)
 
-	// A NaN or an infinity survives a float64 round trip perfectly, so the
-	// length check alone does not make a datagram trustworthy. A corrupt or
+	// A NaN or an infinity survives a float64 round trip perfectly, so the length
+	// check alone does not make a datagram trustworthy. A corrupt or
 	// wrongly-endian payload produces values of the right type and the wrong
 	// magnitude, and the marker bytes can survive that too.
-	all := []float64{
-		out.GPStime, out.Latitude, out.Longitude, out.Height,
-		out.Vnorth, out.Veast, out.Vdown,
-		out.Roll, out.Pitch, out.Heading,
-		out.AccBiasX, out.AccBiasY, out.AccBiasZ,
-		out.GyroBiasX, out.GyroBiasY, out.GyroBiasZ,
-		out.GravityAnomaly,
-	}
-	for _, v := range all {
-		if math.IsNaN(v) || math.IsInf(v, 0) {
-			return RawFix{}, ErrNotFinite
-		}
-	}
-
-	// Degrees, and therefore bounded. A value outside these bounds is not a
-	// position on Earth. Publishing it is worse than publishing nothing,
-	// because the Ground Station has no way to distinguish it from a real fix
-	// and the operator would act on it.
-	if out.Latitude < -90 || out.Latitude > 90 {
-		return RawFix{}, fmt.Errorf("%w: latitude %v", ErrOutOfRange, out.Latitude)
-	}
-	if out.Longitude < -180 || out.Longitude > 180 {
-		return RawFix{}, fmt.Errorf("%w: longitude %v", ErrOutOfRange, out.Longitude)
+	//
+	// Shared with Encode so the two directions cannot disagree about what a valid
+	// fix is -- a decoder that accepts something its own encoder refuses to
+	// produce is a decoder with a rule nobody wrote down.
+	if err := validate(out); err != nil {
+		return RawFix{}, err
 	}
 
 	return out, nil
@@ -193,4 +181,85 @@ func Decode(datagram []byte, receiverID int, now time.Time) (RawFix, error) {
 // of the reasons the 420-byte datagram is richer -- see ARCHITECTURE.md 6.1.
 func (r RawFix) GroundSpeed() float64 {
 	return math.Sqrt(r.Vnorth*r.Vnorth + r.Veast*r.Veast)
+}
+
+// Encode builds a 142-byte UDP_message from a RawFix.
+//
+// The inverse of Decode, in the same package and beside the offsets it uses, for
+// three reasons:
+//
+//   - tools/gnss_bench needs to produce a valid datagram to prove the decoder
+//     works, and a test that builds its own datagram by hand is a second
+//     definition of the layout that can drift from this one.
+//   - It makes the wire format symmetrical to read: one file says where every
+//     byte goes in both directions.
+//   - Anything that needs a receiver to produce something -- a bench, a
+//     simulator, a test -- can do so through the same code that has to stay
+//     compatible with it.
+//
+// It writes DEGREES, because that is what the wire carries. See the note on
+// RawFix.Latitude: the bug this project shipped was a consumer converting a
+// second time, and an encoder that took radians would invite it.
+func Encode(f RawFix) ([]byte, error) {
+	out := make([]byte, DatagramSize)
+	out[0] = StartMarker
+	// Epochs counts epochs since the receiver started; 1 is the only value the
+	// shipped producer ever writes.
+	out[1], out[2], out[3], out[4] = 1, 0, 0, 0
+	out[DatagramSize-1] = EndMarker
+
+	base := headerSize
+	le := binary.LittleEndian
+	put := func(off int, v float64) {
+		le.PutUint64(out[base+off:base+off+8], math.Float64bits(v))
+	}
+
+	if err := validate(f); err != nil {
+		return nil, err
+	}
+
+	put(offGPStime, f.GPStime)
+	put(offLat, f.Latitude)
+	put(offLon, f.Longitude)
+	put(offHeight, f.Height)
+	put(offVn, f.Vnorth)
+	put(offVe, f.Veast)
+	put(offVd, f.Vdown)
+	put(offRoll, f.Roll)
+	put(offPitch, f.Pitch)
+	put(offHeading, f.Heading)
+	put(offAccX, f.AccBiasX)
+	put(offAccY, f.AccBiasY)
+	put(offAccZ, f.AccBiasZ)
+	put(offGyroX, f.GyroBiasX)
+	put(offGyroY, f.GyroBiasY)
+	put(offGyroZ, f.GyroBiasZ)
+	put(offAnomaly, f.GravityAnomaly)
+
+	return out, nil
+}
+
+// validate is the encode-side counterpart of Decode's checks, so that Encode and
+// Decode cannot disagree about what a valid fix is.
+func validate(f RawFix) error {
+	all := []float64{
+		f.GPStime, f.Latitude, f.Longitude, f.Height,
+		f.Vnorth, f.Veast, f.Vdown,
+		f.Roll, f.Pitch, f.Heading,
+		f.AccBiasX, f.AccBiasY, f.AccBiasZ,
+		f.GyroBiasX, f.GyroBiasY, f.GyroBiasZ,
+		f.GravityAnomaly,
+	}
+	for _, v := range all {
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			return ErrNotFinite
+		}
+	}
+	if f.Latitude < -90 || f.Latitude > 90 {
+		return fmt.Errorf("%w: latitude %v", ErrOutOfRange, f.Latitude)
+	}
+	if f.Longitude < -180 || f.Longitude > 180 {
+		return fmt.Errorf("%w: longitude %v", ErrOutOfRange, f.Longitude)
+	}
+	return nil
 }
