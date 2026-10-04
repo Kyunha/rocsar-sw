@@ -47,19 +47,34 @@ func ioc(dir, typ, nr, size uintptr) uintptr {
 
 // VIDIOC request codes, from linux/videodev2.h.
 //
-// Declared as `var` rather than `const` because unsafe.Sizeof is not a constant
-// expression in Go. That is also the more honest declaration: the encoded value
-// depends on the size of a struct, which is architecture-specific, so these are
-// per-target values and not compile-time constants.
+// The direction bits are PER IOCTL and are not decoration. The kernel switches
+// on the fully encoded value, so a request whose direction does not match the
+// header's is not "a query with extra bits" -- it is a different number, and
+// the driver does not recognise it:
+//
+//	VIDIOC_QUERYCAP   _IOR   -> 0x80685600   direction 2, READ only
+//	VIDIOC_STREAMON   _IOW   -> 0x40045612   direction 1, WRITE only
+//	VIDIOC_G_FMT      _IOR   direction 2, but read-modify-write in practice
+//
+// Every one of these was iocRead|iocWrite at first. QUERYCAP then failed with
+// ENOTTY on a real UVC camera, which is the only place this is detectable: the
+// numbers are computed, they are plausible, and nothing complains until a driver
+// rejects them. TestV4L2RequestCodesAgainstTheKernelHeader pins every value to
+// the header's, so this cannot come back and never needs hardware to catch.
 var (
-	vidiocQueryCap  = ioc(iocRead|iocWrite, 'V', 0, unsafe.Sizeof(v4l2Capability{}))
-	vidiocG_Fmt     = ioc(iocRead|iocWrite, 'V', 4, unsafe.Sizeof(v4l2Format{}))
-	vidiocS_Fmt     = ioc(iocRead|iocWrite, 'V', 5, unsafe.Sizeof(v4l2Format{}))
-	vidiocReqBufs   = ioc(iocRead|iocWrite, 'V', 8, unsafe.Sizeof(v4l2ReqBufs{}))
-	vidiocQBUF      = ioc(iocRead|iocWrite, 'V', 11, unsafe.Sizeof(v4l2Buffer{}))
-	vidiocDQBUF     = ioc(iocRead|iocWrite, 'V', 13, unsafe.Sizeof(v4l2Buffer{}))
-	vidiocStreamOn  = ioc(iocRead|iocWrite, 'V', 18, unsafe.Sizeof(v4l2BufType{}))
-	vidiocStreamOff = ioc(iocRead|iocWrite, 'V', 19, unsafe.Sizeof(v4l2BufType{}))
+	vidiocQueryCap = ioc(iocRead, 'V', 0, unsafe.Sizeof(v4l2Capability{}))
+	vidiocG_Fmt    = ioc(iocRead|iocWrite, 'V', 4, unsafe.Sizeof(v4l2Format{}))
+	vidiocS_Fmt    = ioc(iocRead|iocWrite, 'V', 5, unsafe.Sizeof(v4l2Format{}))
+	vidiocReqBufs  = ioc(iocRead|iocWrite, 'V', 8, unsafe.Sizeof(v4l2ReqBufs{}))
+	// nr 15 and 17, not 11 and 13. The QBUF/DQBUF numbers moved in Linux 2.6.x
+	// when the buffer struct grew a timecode; 11 and 13 are the pre-2.6 values
+	// and they are still in every V4L2 example written before that.
+	vidiocQBUF  = ioc(iocRead|iocWrite, 'V', 15, unsafe.Sizeof(v4l2Buffer{}))
+	vidiocDQBUF = ioc(iocRead|iocWrite, 'V', 17, unsafe.Sizeof(v4l2Buffer{}))
+	// _IOW('V', 18, int) -- an int, not a struct. STREAMON takes the buffer type
+	// as a bare integer, which is why the encoded size is 4.
+	vidiocStreamOn  = ioc(iocWrite, 'V', 18, unsafe.Sizeof(int32(0)))
+	vidiocStreamOff = ioc(iocWrite, 'V', 19, unsafe.Sizeof(int32(0)))
 )
 
 // V4L2 pixel formats. Only the ones a USB camera in MJPEG or YUYV mode produces.
@@ -100,22 +115,46 @@ type v4l2Capability struct {
 }
 
 type v4l2Format struct {
-	PixelFormat  uint32
-	Width        uint32
-	Height       uint32
-	BytesPerLine uint32
-	SizeImage    uint32
-	Field        uint32
-	Colorspace   uint32
-	Private      uint32
-	BytesUsed    [2]uint32
+	// Offset 0.
+	Type uint32
+
+	// Offset 4 is NOT part of the union. v4l2_format is:
+	//
+	//	__u32 type;
+	//	union { ... } fmt;
+	//
+	// and something in that union contains a __u64, so the union is 8-aligned
+	// and 4 bytes of padding sit between them. The union therefore begins at
+	// offset 8, not 4 -- and that is why pixelformat is at 16 rather than 8.
+	_ uint32
+
+	// v4l2_pix_format, at offset 8, in the kernel's order. This one was written
+	// from memory first, with BytesPerLine before SizeImage and no leading
+	// type/padding, which put every field after the first two in the wrong
+	// place.
+	Width        uint32 // 8
+	Height       uint32 // 12
+	PixelFormat  uint32 // 16
+	Field        uint32 // 20
+	BytesPerLine uint32 // 24
+	SizeImage    uint32 // 28
+
+	// The union runs to 208 bytes in total. Which arm is live depends on Type;
+	// for V4L2_BUF_TYPE_VIDEO_CAPTURE it is the v4l2_pix_format above.
+	_ [176]byte
 }
 
 type v4l2ReqBufs struct {
-	Count    uint32
-	Memory   uint32
-	Reserved [2]uint32
+	Count        uint32   // 0
+	Type         uint32   // 4  enum v4l2_buf_type -- V4L2_BUF_TYPE_VIDEO_CAPTURE
+	Memory       uint32   // 8  enum v4l2_memory  -- V4L2_MEMORY_MMAP
+	Capabilities uint32   // 12, output: what the driver supports
+	Flags        uint8    // 16
+	Reserved     [3]uint8 // 17
 }
+
+// bufTypeVideoCapture belongs in v4l2ReqBufs.Type, not in a struct of its own.
+// STREAMON takes it as a bare int.
 
 // v4l2Buffer is struct v4l2_buffer.
 //
@@ -130,28 +169,50 @@ type v4l2ReqBufs struct {
 // the union is live and that ambiguity is the entire bug surface of this
 // struct.
 type v4l2Buffer struct {
-	// Common header.
-	BytesUsed  uint32
-	BytesLeft  uint32
-	Sequence   uint32
-	Memory     uint32
-	MbufOffset uint32
-	Length     uint32
-	Field      uint32
-	Reserved   [3]uint32
+	Index     uint32 // 0
+	Type      uint32 // 4
+	BytesUsed uint32 // 8
+	Flags     uint32 // 12
+	Field     uint32 // 16
 
-	// mmap union arm.
-	MmapStart   uintptr
-	MmapLength  uint32
-	MmapPadding uint32
+	_ uint32 // 20 -- timeval below is 8-aligned
+
+	// struct timeval: two time_t. Named, not aliased to int64, because it is two
+	// 64-bit words and calling it int64 would invite someone to write
+	// Timestamp = now.Unix() instead of the seconds/nanoseconds pair it wants.
+	TimestampSec  int64 // 24
+	TimestampUsec int64 // 32
+
+	// struct v4l2_timecode: type, flags, frames, seconds.
+	TimecodeType    uint32 // 40
+	TimecodeFlags   uint32 // 44
+	TimecodeFrames  uint32 // 48
+	TimecodeSeconds uint32 // 52
+
+	Sequence uint32 // 56
+
+	// memory location. `Memory` is V4L2_MEMORY_MMAP for every buffer here.
+	Memory uint32 // 60
+
+	// The union is { __u32 offset; unsigned long userptr; struct v4l2_plane *;
+	// __s32 fd; }. `unsigned long` and the pointer are 8 bytes on any 64-bit
+	// target, which is what makes this struct 88 bytes here and 84 on a 32-bit
+	// one -- so its size, and therefore the QBUF and DQBUF request codes, are
+	// architecture-dependent. Only `offset` (the mmap arm) is used.
+	MmapOffset uint64 // 64, 8 bytes wide because of the union
+
+	Length    uint32 // 72
+	Reserved2 uint32 // 76
+	RequestFd int32  // 80
+
+	_ uint32 // 84 -- trailing alignment
 }
 
-type v4l2BufType struct {
-	Type      uint32
-	Memory    uint32
-	SizeImage uint32
-	Padding   [13]uint32
-}
+// v4l2BufType is what VIDIOC_STREAMON and _STREAMOFF actually take: an int.
+// There is no struct v4l2_buf_type in videodev2.h -- the name is an enum -- and
+// the 64-byte struct that used to stand here made every request code wrong,
+// because the size is part of the number.
+type v4l2BufType = int32
 
 // Capture is a V4L2 snapshot camera.
 //
@@ -311,6 +372,7 @@ func (c *Capture) setup(fd int) (uint32, error) {
 
 	var req v4l2ReqBufs
 	req.Count = queueBuffers
+	req.Type = bufTypeVideoCapture
 	req.Memory = memoryMmap
 	if err := ioctl(fd, vidiocReqBufs, unsafe.Pointer(&req)); err != nil {
 		return 0, fmt.Errorf("camera: VIDIOC_REQBUFS: %w", err)
@@ -325,9 +387,8 @@ func (c *Capture) setup(fd int) (uint32, error) {
 
 // readFrame dequeues one frame, copies it out and re-queues the buffer.
 func (c *Capture) readFrame(fd int) ([]byte, error) {
-	var typ v4l2BufType
-	typ.Type = bufTypeVideoCapture
-	typ.Memory = memoryMmap
+	// STREAMON carries only the buffer type, as an int.
+	typ := v4l2BufType(bufTypeVideoCapture)
 	if err := ioctl(fd, vidiocStreamOn, unsafe.Pointer(&typ)); err != nil {
 		return nil, fmt.Errorf("camera: VIDIOC_STREAMON: %w", err)
 	}
@@ -371,10 +432,12 @@ func (c *Capture) copyBuffer(fd int, b v4l2Buffer) ([]byte, error) {
 		return nil, nil
 	}
 
-	// Prefer the mmap path when the driver supports it; fall back to a plain
-	// read for drivers that do not.
-	if b.Memory == 1 && b.MmapLength > 0 {
-		m, err := syscall.Mmap(fd, 0, int(b.MmapLength), syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED)
+	// mmap arm of the union. `Length` is the buffer's length and `MmapOffset` is
+	// where the driver mapped it -- mapping from 0 rather than from MmapOffset
+	// would read the first buffer whatever buffer this actually was.
+	if b.Memory == memoryMmap && b.Length > 0 {
+		m, err := syscall.Mmap(fd, int64(b.MmapOffset), int(b.Length),
+			syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED)
 		if err == nil {
 			defer func() { _ = syscall.Munmap(m) }()
 			used := int(b.BytesUsed)
@@ -385,10 +448,13 @@ func (c *Capture) copyBuffer(fd int, b v4l2Buffer) ([]byte, error) {
 			copy(out, m[:used])
 			return out, nil
 		}
+		// Fall through to read() rather than failing: a driver that granted
+		// MMAP buffers but cannot map them is rare, and one photograph is not
+		// worth failing over when read() will do.
 	}
 
 	out := make([]byte, b.BytesUsed)
-	if _, err := syscall.Pread(fd, out, int64(b.MbufOffset)); err != nil {
+	if _, err := syscall.Pread(fd, out, int64(b.MmapOffset)); err != nil {
 		return nil, fmt.Errorf("camera: read frame: %w", err)
 	}
 	return out, nil
