@@ -117,7 +117,6 @@ type SdrParamsPatch struct {
 	TxFreqHz         *float64
 	NormalizedGainTx *float64
 	NormalizedGainRx *float64
-	PulseDurationS   *float64
 	BandwidthHz      *float64
 	SessionDurationS *uint32
 }

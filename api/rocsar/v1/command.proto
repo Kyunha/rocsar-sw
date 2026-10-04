@@ -31,9 +31,22 @@ message SdrParams {
   optional double tx_freq_hz = 3;
   optional double normalized_gain_tx = 4;
   optional double normalized_gain_rx = 5;
-  optional double pulse_duration_s = 6;
-  optional double bandwidth_hz = 7;
-  optional uint32 session_duration_s = 8;
+  optional double bandwidth_hz = 6;
+  optional uint32 session_duration_s = 7;
+
+  // There is deliberately no pulse_duration field, and field numbers are packed
+  // rather than leaving a hole at the number it would have taken.
+  //
+  // third_party/sdr-ettus-b200mini/parameters/config.hpp reads
+  // `c.pulse_duration = j.at("PULSE_DURATION")` with that line COMMENTED OUT, so
+  // the program does not read the key at all. A field here would be a control
+  // that appears to work and does nothing, which is worse than its absence. The
+  // key stays in the shipped params.json and is carried through every update
+  // untouched.
+  //
+  // Nothing has shipped against this schema, so renumbering costs nobody
+  // anything. Contrast GnssReceiverStatus, where number 9 IS reserved because a
+  // Ground Station may already carry a varint there.
 }
 
 message SdrConnectCommand {}

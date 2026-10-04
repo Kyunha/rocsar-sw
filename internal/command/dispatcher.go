@@ -255,7 +255,7 @@ func (d *Dispatcher) sdrSetParams(ctx context.Context, requestID string, cmd *ro
 	// indistinguishable from a broken button.
 	if p.PrfHz == nil && p.SampleRateHz == nil && p.TxFreqHz == nil &&
 		p.NormalizedGainTx == nil && p.NormalizedGainRx == nil &&
-		p.PulseDurationS == nil && p.BandwidthHz == nil && p.SessionDurationS == nil {
+		p.BandwidthHz == nil && p.SessionDurationS == nil {
 		return fail(requestID, rocsarv1.ErrorCode_ERROR_INVALID_PARAMETER,
 			"no parameters were set; a partial update must name at least one")
 	}
@@ -266,7 +266,6 @@ func (d *Dispatcher) sdrSetParams(ctx context.Context, requestID string, cmd *ro
 		TxFreqHz:         p.TxFreqHz,
 		NormalizedGainTx: p.NormalizedGainTx,
 		NormalizedGainRx: p.NormalizedGainRx,
-		PulseDurationS:   p.PulseDurationS,
 		BandwidthHz:      p.BandwidthHz,
 	}
 	if p.SessionDurationS != nil {

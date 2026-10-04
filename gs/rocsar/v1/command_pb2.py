@@ -26,7 +26,7 @@ from rocsar.v1 import common_pb2 as rocsar_dot_v1_dot_common__pb2
 from rocsar.v1 import pico_pb2 as rocsar_dot_v1_dot_pico__pb2
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x17rocsar/v1/command.proto\x12\trocsar.v1\x1a\x16rocsar/v1/common.proto\x1a\x14rocsar/v1/pico.proto\"\xfd\x03\n\tSdrParams\x12\x1a\n\x06prf_hz\x18\x01 \x01(\x01H\x00R\x05prfHz\x88\x01\x01\x12)\n\x0esample_rate_hz\x18\x02 \x01(\x01H\x01R\x0csampleRateHz\x88\x01\x01\x12!\n\ntx_freq_hz\x18\x03 \x01(\x01H\x02R\x08txFreqHz\x88\x01\x01\x12\x31\n\x12normalized_gain_tx\x18\x04 \x01(\x01H\x03R\x10normalizedGainTx\x88\x01\x01\x12\x31\n\x12normalized_gain_rx\x18\x05 \x01(\x01H\x04R\x10normalizedGainRx\x88\x01\x01\x12-\n\x10pulse_duration_s\x18\x06 \x01(\x01H\x05R\x0epulseDurationS\x88\x01\x01\x12&\n\x0c\x62\x61ndwidth_hz\x18\x07 \x01(\x01H\x06R\x0b\x62\x61ndwidthHz\x88\x01\x01\x12\x31\n\x12session_duration_s\x18\x08 \x01(\rH\x07R\x10sessionDurationS\x88\x01\x01\x42\t\n\x07_prf_hzB\x11\n\x0f_sample_rate_hzB\r\n\x0b_tx_freq_hzB\x15\n\x13_normalized_gain_txB\x15\n\x13_normalized_gain_rxB\x13\n\x11_pulse_duration_sB\x0f\n\r_bandwidth_hzB\x15\n\x13_session_duration_s\"\x13\n\x11SdrConnectCommand\"C\n\x13SdrSetParamsCommand\x12,\n\x06params\x18\x01 \x01(\x0b\x32\x14.rocsar.v1.SdrParamsR\x06params\"\x14\n\x12SdrResetUSBCommand\"\x11\n\x0fSdrProbeCommand\"\x12\n\x10TakePhotoCommand\"L\n\x11GnssSelectCommand\x12\x1f\n\x0breceiver_id\x18\x01 \x01(\rR\nreceiverId\x12\x16\n\x06rotate\x18\x02 \x01(\x08R\x06rotate\"2\n\x13LinkSetLimitCommand\x12\x1b\n\trate_kbps\x18\x01 \x01(\rR\x08rateKbps\"\x14\n\x12SystemResetCommand\"\x14\n\x12QueryStatusCommand\"\xc0\x05\n\x0e\x43ommandRequest\x12\x1d\n\nrequest_id\x18\x01 \x01(\tR\trequestId\x12,\n\x04pico\x18\x02 \x01(\x0b\x32\x16.rocsar.v1.PicoCommandH\x00R\x04pico\x12?\n\x0bsdr_connect\x18\x03 \x01(\x0b\x32\x1c.rocsar.v1.SdrConnectCommandH\x00R\nsdrConnect\x12\x46\n\x0esdr_set_params\x18\x04 \x01(\x0b\x32\x1e.rocsar.v1.SdrSetParamsCommandH\x00R\x0csdrSetParams\x12\x43\n\rsdr_reset_usb\x18\x05 \x01(\x0b\x32\x1d.rocsar.v1.SdrResetUSBCommandH\x00R\x0bsdrResetUsb\x12\x39\n\tsdr_probe\x18\x06 \x01(\x0b\x32\x1a.rocsar.v1.SdrProbeCommandH\x00R\x08sdrProbe\x12<\n\ntake_photo\x18\x07 \x01(\x0b\x32\x1b.rocsar.v1.TakePhotoCommandH\x00R\ttakePhoto\x12?\n\x0bgnss_select\x18\x08 \x01(\x0b\x32\x1c.rocsar.v1.GnssSelectCommandH\x00R\ngnssSelect\x12\x46\n\x0elink_set_limit\x18\t \x01(\x0b\x32\x1e.rocsar.v1.LinkSetLimitCommandH\x00R\x0clinkSetLimit\x12\x42\n\x0csystem_reset\x18\n \x01(\x0b\x32\x1d.rocsar.v1.SystemResetCommandH\x00R\x0bsystemReset\x12\x42\n\x0cquery_status\x18\x0b \x01(\x0b\x32\x1d.rocsar.v1.QueryStatusCommandH\x00R\x0bqueryStatusB\t\n\x07payload\"\xd5\x02\n\x0f\x43ommandResponse\x12\x1d\n\nrequest_id\x18\x01 \x01(\tR\trequestId\x12\x18\n\x07success\x18\x02 \x01(\x08R\x07success\x12*\n\x05\x65rror\x18\x03 \x01(\x0e\x32\x14.rocsar.v1.ErrorCodeR\x05\x65rror\x12\x18\n\x07message\x18\x04 \x01(\tR\x07message\x12(\n\rartefact_name\x18\x05 \x01(\tH\x00R\x0c\x61rtefactName\x88\x01\x01\x12\x33\n\x13\x61rtefact_size_bytes\x18\x06 \x01(\x04H\x01R\x11\x61rtefactSizeBytes\x88\x01\x01\x12(\n\rartefact_kind\x18\x07 \x01(\tH\x02R\x0c\x61rtefactKind\x88\x01\x01\x42\x10\n\x0e_artefact_nameB\x16\n\x14_artefact_size_bytesB\x10\n\x0e_artefact_kindB.Z,github.com/rocsar/obc/api/rocsar/v1;rocsarv1b\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x17rocsar/v1/command.proto\x12\trocsar.v1\x1a\x16rocsar/v1/common.proto\x1a\x14rocsar/v1/pico.proto\"\xb9\x03\n\tSdrParams\x12\x1a\n\x06prf_hz\x18\x01 \x01(\x01H\x00R\x05prfHz\x88\x01\x01\x12)\n\x0esample_rate_hz\x18\x02 \x01(\x01H\x01R\x0csampleRateHz\x88\x01\x01\x12!\n\ntx_freq_hz\x18\x03 \x01(\x01H\x02R\x08txFreqHz\x88\x01\x01\x12\x31\n\x12normalized_gain_tx\x18\x04 \x01(\x01H\x03R\x10normalizedGainTx\x88\x01\x01\x12\x31\n\x12normalized_gain_rx\x18\x05 \x01(\x01H\x04R\x10normalizedGainRx\x88\x01\x01\x12&\n\x0c\x62\x61ndwidth_hz\x18\x06 \x01(\x01H\x05R\x0b\x62\x61ndwidthHz\x88\x01\x01\x12\x31\n\x12session_duration_s\x18\x07 \x01(\rH\x06R\x10sessionDurationS\x88\x01\x01\x42\t\n\x07_prf_hzB\x11\n\x0f_sample_rate_hzB\r\n\x0b_tx_freq_hzB\x15\n\x13_normalized_gain_txB\x15\n\x13_normalized_gain_rxB\x0f\n\r_bandwidth_hzB\x15\n\x13_session_duration_s\"\x13\n\x11SdrConnectCommand\"C\n\x13SdrSetParamsCommand\x12,\n\x06params\x18\x01 \x01(\x0b\x32\x14.rocsar.v1.SdrParamsR\x06params\"\x14\n\x12SdrResetUSBCommand\"\x11\n\x0fSdrProbeCommand\"\x12\n\x10TakePhotoCommand\"L\n\x11GnssSelectCommand\x12\x1f\n\x0breceiver_id\x18\x01 \x01(\rR\nreceiverId\x12\x16\n\x06rotate\x18\x02 \x01(\x08R\x06rotate\"2\n\x13LinkSetLimitCommand\x12\x1b\n\trate_kbps\x18\x01 \x01(\rR\x08rateKbps\"\x14\n\x12SystemResetCommand\"\x14\n\x12QueryStatusCommand\"\xc0\x05\n\x0e\x43ommandRequest\x12\x1d\n\nrequest_id\x18\x01 \x01(\tR\trequestId\x12,\n\x04pico\x18\x02 \x01(\x0b\x32\x16.rocsar.v1.PicoCommandH\x00R\x04pico\x12?\n\x0bsdr_connect\x18\x03 \x01(\x0b\x32\x1c.rocsar.v1.SdrConnectCommandH\x00R\nsdrConnect\x12\x46\n\x0esdr_set_params\x18\x04 \x01(\x0b\x32\x1e.rocsar.v1.SdrSetParamsCommandH\x00R\x0csdrSetParams\x12\x43\n\rsdr_reset_usb\x18\x05 \x01(\x0b\x32\x1d.rocsar.v1.SdrResetUSBCommandH\x00R\x0bsdrResetUsb\x12\x39\n\tsdr_probe\x18\x06 \x01(\x0b\x32\x1a.rocsar.v1.SdrProbeCommandH\x00R\x08sdrProbe\x12<\n\ntake_photo\x18\x07 \x01(\x0b\x32\x1b.rocsar.v1.TakePhotoCommandH\x00R\ttakePhoto\x12?\n\x0bgnss_select\x18\x08 \x01(\x0b\x32\x1c.rocsar.v1.GnssSelectCommandH\x00R\ngnssSelect\x12\x46\n\x0elink_set_limit\x18\t \x01(\x0b\x32\x1e.rocsar.v1.LinkSetLimitCommandH\x00R\x0clinkSetLimit\x12\x42\n\x0csystem_reset\x18\n \x01(\x0b\x32\x1d.rocsar.v1.SystemResetCommandH\x00R\x0bsystemReset\x12\x42\n\x0cquery_status\x18\x0b \x01(\x0b\x32\x1d.rocsar.v1.QueryStatusCommandH\x00R\x0bqueryStatusB\t\n\x07payload\"\xd5\x02\n\x0f\x43ommandResponse\x12\x1d\n\nrequest_id\x18\x01 \x01(\tR\trequestId\x12\x18\n\x07success\x18\x02 \x01(\x08R\x07success\x12*\n\x05\x65rror\x18\x03 \x01(\x0e\x32\x14.rocsar.v1.ErrorCodeR\x05\x65rror\x12\x18\n\x07message\x18\x04 \x01(\tR\x07message\x12(\n\rartefact_name\x18\x05 \x01(\tH\x00R\x0c\x61rtefactName\x88\x01\x01\x12\x33\n\x13\x61rtefact_size_bytes\x18\x06 \x01(\x04H\x01R\x11\x61rtefactSizeBytes\x88\x01\x01\x12(\n\rartefact_kind\x18\x07 \x01(\tH\x02R\x0c\x61rtefactKind\x88\x01\x01\x42\x10\n\x0e_artefact_nameB\x16\n\x14_artefact_size_bytesB\x10\n\x0e_artefact_kindB.Z,github.com/rocsar/obc/api/rocsar/v1;rocsarv1b\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -35,27 +35,27 @@ if not _descriptor._USE_C_DESCRIPTORS:
   _globals['DESCRIPTOR']._loaded_options = None
   _globals['DESCRIPTOR']._serialized_options = b'Z,github.com/rocsar/obc/api/rocsar/v1;rocsarv1'
   _globals['_SDRPARAMS']._serialized_start=85
-  _globals['_SDRPARAMS']._serialized_end=594
-  _globals['_SDRCONNECTCOMMAND']._serialized_start=596
-  _globals['_SDRCONNECTCOMMAND']._serialized_end=615
-  _globals['_SDRSETPARAMSCOMMAND']._serialized_start=617
-  _globals['_SDRSETPARAMSCOMMAND']._serialized_end=684
-  _globals['_SDRRESETUSBCOMMAND']._serialized_start=686
-  _globals['_SDRRESETUSBCOMMAND']._serialized_end=706
-  _globals['_SDRPROBECOMMAND']._serialized_start=708
-  _globals['_SDRPROBECOMMAND']._serialized_end=725
-  _globals['_TAKEPHOTOCOMMAND']._serialized_start=727
-  _globals['_TAKEPHOTOCOMMAND']._serialized_end=745
-  _globals['_GNSSSELECTCOMMAND']._serialized_start=747
-  _globals['_GNSSSELECTCOMMAND']._serialized_end=823
-  _globals['_LINKSETLIMITCOMMAND']._serialized_start=825
-  _globals['_LINKSETLIMITCOMMAND']._serialized_end=875
-  _globals['_SYSTEMRESETCOMMAND']._serialized_start=877
-  _globals['_SYSTEMRESETCOMMAND']._serialized_end=897
-  _globals['_QUERYSTATUSCOMMAND']._serialized_start=899
-  _globals['_QUERYSTATUSCOMMAND']._serialized_end=919
-  _globals['_COMMANDREQUEST']._serialized_start=922
-  _globals['_COMMANDREQUEST']._serialized_end=1626
-  _globals['_COMMANDRESPONSE']._serialized_start=1629
-  _globals['_COMMANDRESPONSE']._serialized_end=1970
+  _globals['_SDRPARAMS']._serialized_end=526
+  _globals['_SDRCONNECTCOMMAND']._serialized_start=528
+  _globals['_SDRCONNECTCOMMAND']._serialized_end=547
+  _globals['_SDRSETPARAMSCOMMAND']._serialized_start=549
+  _globals['_SDRSETPARAMSCOMMAND']._serialized_end=616
+  _globals['_SDRRESETUSBCOMMAND']._serialized_start=618
+  _globals['_SDRRESETUSBCOMMAND']._serialized_end=638
+  _globals['_SDRPROBECOMMAND']._serialized_start=640
+  _globals['_SDRPROBECOMMAND']._serialized_end=657
+  _globals['_TAKEPHOTOCOMMAND']._serialized_start=659
+  _globals['_TAKEPHOTOCOMMAND']._serialized_end=677
+  _globals['_GNSSSELECTCOMMAND']._serialized_start=679
+  _globals['_GNSSSELECTCOMMAND']._serialized_end=755
+  _globals['_LINKSETLIMITCOMMAND']._serialized_start=757
+  _globals['_LINKSETLIMITCOMMAND']._serialized_end=807
+  _globals['_SYSTEMRESETCOMMAND']._serialized_start=809
+  _globals['_SYSTEMRESETCOMMAND']._serialized_end=829
+  _globals['_QUERYSTATUSCOMMAND']._serialized_start=831
+  _globals['_QUERYSTATUSCOMMAND']._serialized_end=851
+  _globals['_COMMANDREQUEST']._serialized_start=854
+  _globals['_COMMANDREQUEST']._serialized_end=1558
+  _globals['_COMMANDRESPONSE']._serialized_start=1561
+  _globals['_COMMANDRESPONSE']._serialized_end=1902
 # @@protoc_insertion_point(module_scope)

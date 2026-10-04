@@ -88,102 +88,128 @@ func (s *Service) paramsPath() string {
 	return filepath.Join(s.programDir, "parameters", "params.json")
 }
 
-// Params reads the current parameters.
-func (s *Service) Params(ctx context.Context) (domain.SdrParams, error) {
-	var out domain.SdrParams
+// loadParams reads params.json ONCE and returns both views of it.
+//
+// One read, and this matters. The first version read the file twice -- once
+// through Params() to get the values it validated, and again through a mustRead()
+// that discarded its error to get the map it wrote. Two reads of a file that
+// something else may be editing means the values validated are not necessarily
+// the values written.
+//
+// raw is the file as it stands, including every key this package does not model.
+// That map is what gets written back, which is why T_MIN_US, T_MAX_US,
+// START_OFFSET_S, TX_ANTENNA and RX_ANTENNA survive a partial update: encoding
+// the typed struct instead would drop all five, and load_config()'s j.at() would
+// throw on the next ./connect with no way back from the air.
+func (s *Service) loadParams() (domain.SdrParams, map[string]any, error) {
+	var typed domain.SdrParams
 
 	body, err := os.ReadFile(s.paramsPath())
 	if err != nil {
-		return out, fmt.Errorf("sdr: read params.json: %w", err)
+		return typed, nil, fmt.Errorf("sdr: read params.json: %w", err)
 	}
-	if err := json.Unmarshal(body, &out); err != nil {
-		return out, fmt.Errorf("sdr: parse params.json: %w", err)
+
+	raw := map[string]any{}
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return typed, nil, fmt.Errorf("sdr: parse params.json: %w", err)
 	}
-	return out, nil
+
+	// The typed view is decoded from the same bytes, not a second read. It is
+	// used for reporting and for validation; the map is what gets written.
+	if err := json.Unmarshal(body, &typed); err != nil {
+		return typed, nil, fmt.Errorf("sdr: parse params.json: %w", err)
+	}
+
+	if err := checkRequired(raw); err != nil {
+		return typed, nil, err
+	}
+
+	return typed, raw, nil
 }
+
+// Params reads the current parameters.
+func (s *Service) Params(ctx context.Context) (domain.SdrParams, error) {
+	typed, _, err := s.loadParams()
+	return typed, err
+}
+
+// checkRequired fails when a key load_config() will j.at() on is absent.
+func checkRequired(raw map[string]any) error {
+	var missing []string
+	for _, name := range RequiredNames() {
+		if _, ok := raw[name]; !ok {
+			missing = append(missing, name)
+		}
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+	return fmt.Errorf("%w: %s", ErrMissingKeys, strings.Join(missing, ", "))
+}
+
+// ErrMissingKeys is returned when params.json lacks a key the C++ requires.
+var ErrMissingKeys = errors.New("sdr: params.json is missing keys that connect.cpp requires")
 
 // SetParams applies a partial update and writes the file atomically.
 //
-// The validation is the point of this method. params.json is a frozen contract
-// with C++ we do not maintain; a value the program cannot use is a bricked SDR
-// discovered on the bench, and a partially written file is a bricked SDR with no
-// way back. So: validate first, write second, atomically.
+// Validation is against the table in params_contract.go, whose bounds come from
+// the Ettus datasheet and say so per entry. The write is atomic because a
+// half-written params.json is a bricked SDR.
 func (s *Service) SetParams(ctx context.Context, patch domain.SdrParamsPatch) error {
-	current, err := s.Params(ctx)
+	current, raw, err := s.loadParams()
 	if err != nil {
 		return err
 	}
 
-	apply := &current
-	if patch.PRFHz != nil {
-		if err := inRange("PRF", *patch.PRFHz, 1, 1e7); err != nil {
+	// Validate the INCOMING value before applying it, so the error names what
+	// was asked for rather than what it would have become.
+	for _, v := range []struct {
+		key    string
+		ptr    *float64
+		assign func(float64)
+	}{
+		{"PRF", patch.PRFHz, func(f float64) { current.PRFHz = f }},
+		{"FS", patch.SampleRateHz, func(f float64) { current.SampleRateHz = f }},
+		{"TX_FREQ", patch.TxFreqHz, func(f float64) { current.TxFreqHz = f }},
+		{"NORMALIZED_GAIN_TX", patch.NormalizedGainTx, func(f float64) { current.NormalizedGainTx = f }},
+		{"NORMALIZED_GAIN_RX", patch.NormalizedGainRx, func(f float64) { current.NormalizedGainRx = f }},
+		{"BW", patch.BandwidthHz, func(f float64) { current.BandwidthHz = f }},
+	} {
+		if v.ptr == nil {
+			continue
+		}
+		if err := ValidateValue(v.key, *v.ptr); err != nil {
 			return err
 		}
-		apply.PRFHz = *patch.PRFHz
-	}
-	if patch.SampleRateHz != nil {
-		if err := inRange("FS", *patch.SampleRateHz, 1e5, 1e9); err != nil {
-			return err
-		}
-		apply.SampleRateHz = *patch.SampleRateHz
-	}
-	if patch.TxFreqHz != nil {
-		if err := inRange("TX_FREQ", *patch.TxFreqHz, 1e6, 6e9); err != nil {
-			return err
-		}
-		apply.TxFreqHz = *patch.TxFreqHz
-	}
-	if patch.NormalizedGainTx != nil {
-		if err := inRange("NORMALIZED_GAIN_TX", *patch.NormalizedGainTx, 0, 1); err != nil {
-			return err
-		}
-		apply.NormalizedGainTx = *patch.NormalizedGainTx
-	}
-	if patch.NormalizedGainRx != nil {
-		if err := inRange("NORMALIZED_GAIN_RX", *patch.NormalizedGainRx, 0, 1); err != nil {
-			return err
-		}
-		apply.NormalizedGainRx = *patch.NormalizedGainRx
-	}
-	if patch.PulseDurationS != nil {
-		if err := inRange("PULSE_DURATION", *patch.PulseDurationS, 1e-9, 1e-3); err != nil {
-			return err
-		}
-		apply.PulseDurationS = *patch.PulseDurationS
-	}
-	if patch.BandwidthHz != nil {
-		if err := inRange("BW", *patch.BandwidthHz, 1e5, 1e9); err != nil {
-			return err
-		}
-		apply.BandwidthHz = *patch.BandwidthHz
+		v.assign(*v.ptr)
 	}
 	if patch.SessionDurationS != nil {
-		if *patch.SessionDurationS == 0 || *patch.SessionDurationS > 86400 {
-			return fmt.Errorf("%w: SESSION_DURATION must be 1..86400 seconds", ErrInvalidParams)
+		if err := ValidateValue("SESSION_DURATION", float64(*patch.SessionDurationS)); err != nil {
+			return err
 		}
-		apply.SessionDurationS = *patch.SessionDurationS
+		current.SessionDurationS = *patch.SessionDurationS
 	}
 
-	// Marshal through a generic map so the keys the vendored C++ expects survive
-	// even if this struct does not name them all. Encoding domain.SdrParams
-	// directly would silently DROP every key we have not modelled, and the
-	// program has no default for a missing one.
-	raw := map[string]any{}
-	if err := json.Unmarshal(mustRead(s.paramsPath()), &raw); err != nil {
-		return fmt.Errorf("sdr: parse params.json: %w", err)
-	}
-	raw["PRF"] = apply.PRFHz
-	raw["FS"] = apply.SampleRateHz
-	raw["TX_FREQ"] = apply.TxFreqHz
-	raw["NORMALIZED_GAIN_TX"] = apply.NormalizedGainTx
-	raw["NORMALIZED_GAIN_RX"] = apply.NormalizedGainRx
-	raw["PULSE_DURATION"] = apply.PulseDurationS
-	raw["BW"] = apply.BandwidthHz
-	raw["SESSION_DURATION"] = apply.SessionDurationS
+	// Overlay onto the file as it stands. Absent from the overlay means absent
+	// from the patch means "leave alone", and every key we do not name is
+	// carried through untouched.
+	raw["PRF"] = current.PRFHz
+	raw["FS"] = current.SampleRateHz
+	raw["TX_FREQ"] = current.TxFreqHz
+	raw["NORMALIZED_GAIN_TX"] = current.NormalizedGainTx
+	raw["NORMALIZED_GAIN_RX"] = current.NormalizedGainRx
+	raw["BW"] = current.BandwidthHz
+	raw["SESSION_DURATION"] = current.SessionDurationS
 
 	body, err := json.MarshalIndent(raw, "", "    ")
 	if err != nil {
 		return fmt.Errorf("sdr: encode params.json: %w", err)
+	}
+
+	// Re-check after the overlay: a patch cannot remove a key, but a file that
+	// was already broken should not be written back looking healthy.
+	if err := checkRequired(raw); err != nil {
+		return err
 	}
 
 	store := storage.New(filepath.Dir(s.paramsPath()))
@@ -191,20 +217,9 @@ func (s *Service) SetParams(ctx context.Context, patch domain.SdrParamsPatch) er
 		return fmt.Errorf("sdr: %w", err)
 	}
 
-	s.log.Info("SDR parameters updated", "prf", apply.PRFHz, "fs", apply.SampleRateHz, "tx", apply.TxFreqHz)
+	s.log.Info("SDR parameters updated",
+		"prf", current.PRFHz, "fs", current.SampleRateHz, "tx", current.TxFreqHz)
 	return nil
-}
-
-func inRange(name string, v, lo, hi float64) error {
-	if v < lo || v > hi {
-		return fmt.Errorf("%w: %s = %g is outside %g..%g", ErrInvalidParams, name, v, lo, hi)
-	}
-	return nil
-}
-
-func mustRead(path string) []byte {
-	b, _ := os.ReadFile(path)
-	return b
 }
 
 // Connect starts the acquisition program, detached.
