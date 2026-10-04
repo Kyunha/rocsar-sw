@@ -165,7 +165,12 @@ func Defaults() Config {
 	c.Camera.Device = "/dev/video0"
 	c.SDR.Program = "third_party/sdr-ettus-b200mini"
 	c.Telemetry.Interval = time.Second
-	c.QOS.BulkRateBps = 64 * 1024
+	// 8 KiB/s, about 64 kbit/s: a little over half the 115 kbit/s radio, so
+	// telemetry and commands have room without claiming precision the link lacks.
+	//
+	// The previous default was 64 KiB/s -- 512 kbit/s, more than four times the
+	// link. It read as a constraint and constrained nothing.
+	c.QOS.BulkRateBps = 8 * 1024
 	c.Mocked = map[string]bool{}
 
 	return c

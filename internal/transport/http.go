@@ -30,21 +30,36 @@ type HTTP struct {
 	store *storage.Store
 	srv   *http.Server
 	addr  string
+
+	// limiter bounds artefact downloads. Built once here rather than per request
+	// so that two concurrent downloads share one rate: the constraint is the link,
+	// not the request.
+	limiter *bulkLimiter
+	// bulkRate is kept so the handler can be rebuilt (tests, restarts) from the
+	// same configuration rather than from a rate already rounded through a bucket.
+	bulkRate int
 }
 
 // NewHTTP returns a file server rooted at the given data directory.
-func NewHTTP(addr string, store *storage.Store, log *slog.Logger) *HTTP {
+//
+// bytesPerSec bounds artefact downloads; zero or negative means unbounded.
+func NewHTTP(addr string, store *storage.Store, log *slog.Logger, bytesPerSec int) *HTTP {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &HTTP{log: log, store: store, addr: addr}
+	h := &HTTP{log: log, store: store, addr: addr, bulkRate: bytesPerSec}
+	if lim := newBulkLimiter(bytesPerSec); lim != nil {
+		h.limiter = lim
+		h.log.Info("artefact downloads bounded", "rate", lim.String())
+	}
+	return h
 }
 
 // Start binds the address and serves in the background.
 func (h *HTTP) Start(ctx context.Context) error {
 	h.srv = &http.Server{
 		Addr:    h.addr,
-		Handler: NewFileHandler(h.store, h.log),
+		Handler: NewFileHandler(h.store, h.log, h.bulkRate),
 		// A slow operator on a marginal link must not tie up a goroutine
 		// indefinitely, and an unbounded request body is an invitation.
 		ReadHeaderTimeout: 10 * time.Second,
@@ -91,14 +106,18 @@ func (h *HTTP) Stop() {
 // want, and because the traversal, Range and content-type behaviour is worth
 // testing directly. It is not exported *for* the tests -- the tests use it
 // because it is the same function the server runs.
-func NewFileHandler(store *storage.Store, log *slog.Logger) http.HandlerFunc {
+// bytesPerSec bounds artefact downloads. Zero or negative means unbounded, which
+// is what a caller that has not been told a rate gets -- a laptop on wifi, a test,
+// a developer who wants to see what the link really does.
+func NewFileHandler(store *storage.Store, log *slog.Logger, bytesPerSec int) http.HandlerFunc {
 	if log == nil {
 		log = slog.Default()
 	}
-	return func(w http.ResponseWriter, r *http.Request) { serve(w, r, store, log) }
+	lim := newBulkLimiter(bytesPerSec)
+	return func(w http.ResponseWriter, r *http.Request) { serve(w, r, store, log, lim) }
 }
 
-func serve(w http.ResponseWriter, r *http.Request, store *storage.Store, log *slog.Logger) {
+func serve(w http.ResponseWriter, r *http.Request, store *storage.Store, log *slog.Logger, lim *bulkLimiter) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		w.Header().Set("Allow", "GET, HEAD")
 		http.Error(w, "only GET and HEAD", http.StatusMethodNotAllowed)
@@ -131,7 +150,7 @@ func serve(w http.ResponseWriter, r *http.Request, store *storage.Store, log *sl
 		serveList(w, r, store, abs)
 		return
 	}
-	serveFile(w, r, store, log, abs, info)
+	serveFile(w, r, store, log, abs, info, lim)
 }
 
 // serveList returns a directory as JSON.
@@ -165,7 +184,7 @@ func serveList(w http.ResponseWriter, r *http.Request, store *storage.Store, abs
 
 // serveFile returns bytes, honouring Range.
 func serveFile(w http.ResponseWriter, r *http.Request, store *storage.Store, log *slog.Logger,
-	abs string, info os.FileInfo) {
+	abs string, info os.FileInfo, lim *bulkLimiter) {
 
 	f, err := os.Open(abs)
 	if err != nil {
@@ -186,7 +205,7 @@ func serveFile(w http.ResponseWriter, r *http.Request, store *storage.Store, log
 		if r.Method == http.MethodHead {
 			return
 		}
-		if _, err := copyStream(w, f); err != nil {
+		if _, err := copyStream(w, lim.reader(f)); err != nil {
 			// The client went away mid-transfer, which on a marginal link is
 			// routine and not an error worth a stack trace.
 			log.Debug("transfer interrupted", "file", info.Name(), "err", err)
@@ -224,7 +243,7 @@ func serveFile(w http.ResponseWriter, r *http.Request, store *storage.Store, log
 		return
 	}
 
-	if _, err := copyN(w, f, end-start+1); err != nil {
+	if _, err := copyN(w, lim.reader(f), end-start+1); err != nil {
 		log.Debug("range transfer interrupted", "file", info.Name(), "err", err)
 	}
 }

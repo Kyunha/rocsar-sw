@@ -324,7 +324,7 @@ func run() error {
 	}
 	defer zmq.Stop()
 
-	files := transport.NewHTTP(cfg.HTTP.Addr, store, log)
+	files := transport.NewHTTP(cfg.HTTP.Addr, store, log, cfg.QOS.BulkRateBps)
 	if err := files.Start(ctx); err != nil {
 		return err
 	}

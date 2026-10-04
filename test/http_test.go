@@ -22,7 +22,7 @@ func newTestFileServer(t *testing.T) (*httptest.Server, *storage.Store) {
 
 	root := t.TempDir()
 	store := storage.New(root)
-	srv := httptest.NewServer(transport.NewFileHandler(store, nil))
+	srv := httptest.NewServer(transport.NewFileHandler(store, nil, 0))
 	t.Cleanup(srv.Close)
 	return srv, store
 }

@@ -110,7 +110,19 @@ program = "third_party/sdr-ettus-b200mini"
 interval = "1s"
 
 [qos]
-# Userspace token-bucket ceiling for the bulk class, bytes per second. The
-# kernel shaper is the real limit; this stops a bulk transfer from monopolising
-# the socket's send path before the kernel ever sees the traffic.
-bulk_rate_bps = 65536
+# Ceiling on artefact downloads, bytes per second, enforced in-process by a token
+# bucket on the HTTP copy path.
+#
+# This comment described a limiter that did not exist. There was a tc hierarchy
+# and nothing else, and the hierarchy could not tell a download from telemetry --
+# see [link] above and ARCHITECTURE.md 6.6. So artefact bytes were unbounded and
+# a photo fetch consumed the whole link.
+#
+# 8 KiB/s is about 64 kbit/s, a little over half the 115 kbit/s radio. That
+# leaves room for telemetry and commands without claiming a precision the link
+# does not have.
+#
+# What this is NOT: link shaping. It bounds only what this process sends, it
+# back-pressures rather than prevents, and it cannot see the SDR or anything else
+# on the box. Set it to 0 for unbounded, which is what a laptop on wifi wants.
+bulk_rate_bps = 8192
