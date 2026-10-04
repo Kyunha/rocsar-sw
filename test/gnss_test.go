@@ -275,3 +275,90 @@ func TestFixValidRejectsImpossibleCoordinates(t *testing.T) {
 		}
 	}
 }
+
+// A u-blox receiver with no fix does not send nothing. It sends its documented
+// invalid-solution encoding, because the 142-byte UDP_message has no validity
+// field to say "no fix" in.
+//
+// Every value in it is inside its range and finite, so the bounds check passed it
+// and a receiver sitting on a bench with no sky view was published as a real
+// position: latitude 90, longitude 0, altitude -6,399,593.6 m. Observed on the
+// Pi with two receivers agreeing on Porto and the third reporting the north pole.
+//
+// Caught here rather than in the decoder, because Valid() is what the receiver
+// consults to compute FixOK -- one check, every consumer.
+func TestFixValidRejectsTheUbloxNoFixSentinel(t *testing.T) {
+	// Verbatim from the Pi: receiver 2, while receivers 1 and 3 had fixes.
+	sentinel := domain.Fix{
+		LatitudeDeg:  90.0,
+		LongitudeDeg: 0.0,
+		AltitudeM:    -6399593.6,
+	}
+	if sentinel.Valid() {
+		t.Error("the u-blox invalid solution was accepted as a position: " +
+			"lat 90, lon 0, alt -6399593.6 m is the north pole, 6,399 km below sea level")
+	}
+}
+
+// The test is the PAIR. Latitude 90 is a real coordinate and longitude 0 is a
+// real coordinate; rejecting either on its own would discard a legitimate fix.
+func TestFixValidKeepsRealCoordinatesThatResembleTheSentinel(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		fix  domain.Fix
+	}{
+		{"the north pole, longitude 0.0001 away",
+			domain.Fix{LatitudeDeg: 90.0, LongitudeDeg: 0.0001}},
+		{"the north pole, longitude 180",
+			domain.Fix{LatitudeDeg: 90.0, LongitudeDeg: 180}},
+		{"longitude 0 on the equator, a real place",
+			domain.Fix{LatitudeDeg: 0.0, LongitudeDeg: 0.0}},
+		{"just south of the sentinel",
+			domain.Fix{LatitudeDeg: 89.9999, LongitudeDeg: 0.0}},
+		{"just off it in longitude",
+			domain.Fix{LatitudeDeg: 90.0, LongitudeDeg: 0.0001}},
+	} {
+		if !tc.fix.Valid() {
+			t.Errorf("%s: %+v was rejected, but it is a real coordinate",
+				tc.name, tc.fix)
+		}
+	}
+}
+
+// The sentinel is a well-formed DATAGRAM carrying an invalid FIX. That
+// distinction is the whole point of catching it in Valid() rather than in
+// Decode: the receiver must still be recorded as answering, or "no fix" and
+// "receiver is silent" become indistinguishable to an operator.
+func TestSentinelDecodesButIsNotAFix(t *testing.T) {
+	body, err := gnss.Encode(gnss.RawFix{
+		Latitude:  90.0,
+		Longitude: 0.0,
+		Height:    -6399593.6,
+	})
+	if err != nil {
+		t.Fatalf("the encoder refused the sentinel: %v -- it must stay able to "+
+			"produce it, or nothing can reproduce the fault", err)
+	}
+
+	got, err := gnss.Decode(body, 2, time.Now())
+	if err != nil {
+		t.Fatalf("Decode rejected a well-formed datagram: %v", err)
+	}
+	if got.Latitude != 90.0 || got.Longitude != 0.0 || got.Height != -6399593.6 {
+		t.Fatalf("the sentinel did not survive the round trip, so this test is "+
+			"not exercising the real bytes: %+v", got)
+	}
+
+	// Built the way receiver.go:126 builds it, so this exercises the same
+	// conversion the running system does rather than a convenient one.
+	fix := domain.Fix{
+		ReceiverID:   2,
+		LatitudeDeg:  got.Latitude,
+		LongitudeDeg: got.Longitude,
+		AltitudeM:    got.Height,
+		ObservedAt:   time.Now(),
+	}
+	if fix.Valid() {
+		t.Error("the decoded sentinel is a valid fix")
+	}
+}

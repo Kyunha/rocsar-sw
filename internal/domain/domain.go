@@ -143,11 +143,45 @@ const (
 	MaxLongitudeDeg = 180
 )
 
+// u-blox's invalid solution, as it appears on the wire. See Fix.Valid.
+const (
+	ubloxInvalidLatitudeDeg  = 90.0
+	ubloxInvalidLongitudeDeg = 0.0
+)
+
 // An out-of-range coordinate is not a valid fix at any age. Publishing
 // lat=90, lon=1e300 is worse than publishing nothing, because the Ground
 // Station cannot tell it apart from a real reading and the operator would act
 // on it.
+//
+// The bounds check alone does NOT catch the case that actually happens. A u-blox
+// receiver with no fix does not send nothing and does not send a flag: the
+// 142-byte UDP_message has no validity field to send one in, so Read_uB fills the
+// message with u-blox's documented invalid-solution encoding instead --
+//
+//	latitude  90.0        (0x42600000)
+//	longitude 0.0
+//	height    -6399593.6  (~ -6.4e6 m)
+//
+// Every one of those values is inside its range and finite. A receiver sitting
+// on a bench with no sky view was therefore published as a real position at the
+// north pole, 6,399 km below sea level, and the Ground Station drew it.
+//
+// It is caught here, in Valid(), rather than in the decoder, for two reasons.
+// Valid() is what the receiver consults to compute FixOK, so one check fixes
+// every consumer -- telemetry, the GS, anything added later. And a datagram that
+// decodes cleanly is still worth keeping: "the receiver is answering and has no
+// fix" is a different fact from "the receiver is silent", and an operator needs
+// to tell those apart. Dropping the datagram would collapse them.
+//
+// The test is the PAIR, not latitude alone. Latitude 90 is a real coordinate --
+// the pole -- and rejecting it on its own would throw away a legitimate fix once
+// in a blue moon. Longitude exactly 0 at latitude exactly 90 is the encoding and
+// nothing else.
 func (f Fix) Valid() bool {
+	if f.LatitudeDeg == ubloxInvalidLatitudeDeg && f.LongitudeDeg == ubloxInvalidLongitudeDeg {
+		return false
+	}
 	return f.LatitudeDeg >= -MaxLatitudeDeg && f.LatitudeDeg <= MaxLatitudeDeg &&
 		f.LongitudeDeg >= -MaxLongitudeDeg && f.LongitudeDeg <= MaxLongitudeDeg
 }

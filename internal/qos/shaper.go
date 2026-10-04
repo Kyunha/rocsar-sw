@@ -156,8 +156,19 @@ func (s *Shaper) Apply(ctx context.Context, device string, rateKbps uint32) (boo
 	// to the default class and starve the priority one. There is no error
 	// anywhere -- the symptom is just that telemetry gets slower when a file
 	// moves. It is installed last and verified by reading the qdisc back.
-	filterOut, filterErr := s.exec(ctx, "tc", "filter", "add", "dev", device,
-		"parent", "1:", "protocol", "ip", "prio", "20", "flower", "dst_port", strconv.Itoa(config.BulkPort))
+	//
+	// `ip_proto tcp` is not optional. tc-flower's dst_port is a layer-4 match and
+	// has no meaning without knowing the transport protocol, so the parser
+	// rejects it outright:
+	//
+	//	$ tc filter add dev eth0 parent 1: protocol ip prio 20 flower dst_port 5557
+	//	Illegal "dst_port"
+	//
+	// Reproduced on the target, and the same command with `ip_proto tcp` in front
+	// is accepted and reads back correctly. Verified against tc-flower(8): "dst_port
+	// and src_port depend on ip_proto being set to tcp, udp or sctp". The bulk
+	// traffic is HTTP, so tcp.
+	filterOut, filterErr := s.exec(ctx, "tc", bulkFilterArgs(device, config.BulkPort)...)
 	if filterErr != nil {
 		// Not fatal on its own: shaping is still in force, the filter is not.
 		// But it is reported, loudly, because the consequence is invisible.
@@ -166,6 +177,25 @@ func (s *Shaper) Apply(ctx context.Context, device string, rateKbps uint32) (boo
 				oneLine(filterOut)))
 		s.log.Warn("bulk flower filter not installed; the link is shaped but unclassified",
 			"device", device, "port", config.BulkPort, "err", filterErr)
+		return true, s.reasonLocked()
+	}
+
+	// Read it back. `tc filter add` returning zero means the command was accepted,
+	// which is not the same as the filter being there: a parent that does not
+	// exist yet, or a handle the kernel quietly dropped, both exit 0 on some
+	// paths and leave bulk traffic unclassified with shaping reported as active.
+	// The comment above has claimed this verification since before it existed.
+	showOut, showErr := s.exec(ctx, "tc", "filter", "show", "dev", device)
+	if showErr != nil || !filterInstalled(showOut, config.BulkPort) {
+		why := oneLine(showOut)
+		if showErr != nil {
+			why = fmt.Sprintf("%v: %s", showErr, why)
+		}
+		s.set(device, rateKbps, prio, true,
+			fmt.Sprintf("bulk filter not confirmed on %s (%s): bulk traffic will join the priority class and may starve it",
+				device, why))
+		s.log.Warn("bulk flower filter did not read back; the link is shaped but unclassified",
+			"device", device, "port", config.BulkPort, "tc_filter_show", why)
 		return true, s.reasonLocked()
 	}
 
@@ -305,4 +335,67 @@ func (n *NullShaper) Status() domain.LinkStatus {
 		ShapingActive:  false,
 		InactiveReason: n.reason,
 	}
+}
+
+// bulkFilterArgs builds the `tc filter add` argument list that classifies bulk
+// traffic into the bulk class.
+//
+// ip_proto comes before dst_port and is not optional. tc's flower parser treats
+// dst_port as a layer-4 match and has nothing to match against without knowing
+// the transport protocol:
+//
+//	tc filter add dev eth0 parent 1: protocol ip prio 20 flower dst_port 5557
+//	Illegal "dst_port"
+//
+// Reproduced on the target; the same command with `ip_proto tcp` in front is
+// accepted and reads back correctly. tc-flower(8) says the same: "dst_port and
+// src_port depend on ip_proto being set to tcp, udp or sctp". The bulk traffic is
+// HTTP, so tcp.
+//
+// This is a function rather than an inline literal so a test can assert on the
+// argument list. Asserting on the source text instead would match the first
+// "dst_port" anywhere in the file, which is not this command.
+func bulkFilterArgs(device string, port int) []string {
+	return []string{"filter", "add",
+		"dev", device,
+		"parent", "1:",
+		"protocol", "ip",
+		"prio", "20",
+		"flower",
+		"ip_proto", "tcp",
+		"dst_port", strconv.Itoa(port),
+	}
+}
+
+// filterInstalled reports whether `tc filter show` printed a flower filter
+// matching the bulk port.
+//
+// Both halves have to be present. A flower filter without the port matches
+// nothing useful, and a port in the output without ip_proto would mean the
+// filter is classifying something other than what it was added for -- the exact
+// ambiguity the ip_proto fix removed on the way in.
+func filterInstalled(out string, port int) bool {
+	hasFlower, hasPort, hasProto := false, false, false
+	want := "dst_port"
+
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.Contains(line, "flower") {
+			hasFlower = true
+		}
+		if strings.Contains(line, "ip_proto tcp") {
+			hasProto = true
+		}
+		// Field-by-field, not a substring test: "dst_port 5557" is a prefix of
+		// "dst_port 55570", so a contains check would call a filter on the wrong
+		// port a success. That is the same class of silent misclassification this
+		// function exists to prevent.
+		fields := strings.Fields(line)
+		for i := 0; i+1 < len(fields); i++ {
+			if fields[i] == want && fields[i+1] == strconv.Itoa(port) {
+				hasPort = true
+			}
+		}
+	}
+	return hasFlower && hasPort && hasProto
 }
