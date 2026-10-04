@@ -42,7 +42,15 @@ telemetry_endpoint = "tcp://192.168.1.50:5556"
 
 [http]
 addr = ":5557"
-root = "/mnt/ssd/data"
+# The data root is /mnt/ssd itself, not /mnt/ssd/data.
+#
+# This was wrong and it was not a typo: the target Pi has photos/, raw/, logs/,
+# derived/ and gnss_logs/ sitting directly under /mnt/ssd, holding ~90 real
+# rx_data_*.bin captures from previous runs. Pointing root one level deeper
+# makes all of it invisible and, worse, makes startup fail -- storage.Check
+# refuses a root that does not exist rather than creating one, which is the
+# correct behaviour but turns a wrong path into a system that will not boot.
+root = "/mnt/ssd"
 # The port in `addr` is load-bearing. The kernel's flower filter classifies bulk
 # traffic on `dst_port 5557`, and it is a constant (config.BulkPort), not a key
 # here. If the two disagree the failure is silent: downloads join the priority
