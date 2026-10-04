@@ -403,8 +403,14 @@ func (c *Capture) readFrame(fd int) ([]byte, error) {
 
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
+		// Type and Memory are inputs on DQBUF: they say which queue to take
+		// from. Left at zero the kernel cannot tell what is being asked for and
+		// answers EINVAL. This is the third call in a row that needed the buffer
+		// type set, which is what you would expect from a struct that had no
+		// Type field at all.
 		var b v4l2Buffer
-		b.Memory = 1
+		b.Type = bufTypeVideoCapture
+		b.Memory = memoryMmap
 		if err := ioctl(fd, vidiocDQBUF, unsafe.Pointer(&b)); err != nil {
 			if err == syscall.EAGAIN {
 				time.Sleep(5 * time.Millisecond)
