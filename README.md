@@ -220,6 +220,7 @@ Raw:
 go build ./...
 go vet ./...
 go test ./...
+ruff check firmware/tests/
 python -m pytest firmware/tests/ -v
 ```
 
@@ -227,7 +228,7 @@ python -m pytest firmware/tests/ -v
 | :--- | :--- |
 | `test/` | Architecture boundaries, schema contracts, magic numbers, end-to-end command paths. The layering tests parse the import graph with `go/parser`, so a docstring mentioning `net` is not a violation and a function-local import is. |
 | `internal/*/` | Per-package units. |
-| `firmware/tests/` | Compiles `gondola_model.h` — the heading filter, tick maths, command handling and ST3215 framing — into a host binary and drives it, because that header includes no Arduino headers. Also checks the receive-buffer logic in `firmware.ino` by reading its source. |
+| `firmware/tests/` | Compiles `gondola_model.h` — the heading filter, tick maths, command handling and ST3215 framing — into a host binary and drives it, because that header includes no Arduino headers. Also checks the receive-buffer logic in `firmware.ino` by reading its source. The safety policies live here too: the boot interlock (`TestBootHold`, asserted from the transmit side), the heater dead-man timeline (`test_firmware_heater.py`, which also *reads* `internal/command/heater_keeper.go` and fails if two keep-alives no longer fit in the firmware's window), the IMU 50-miss counter (`TestMissThreshold`), and the non-finite-command guards. |
 | `internal/client/live_test.go` | Against a real OBC. Skipped unless `ROCSAR_LIVE_OBC=1`. Read-only: telemetry and listing, no commands, no writes. |
 
 The firmware tests skip rather than fail when no C/C++ compiler is present, so a
@@ -389,18 +390,47 @@ ARDUINO_PORT=/dev/ttyACM0 ./scripts/flash-firmware.sh
 Raw:
 
 ```sh
-arduino-cli compile --fqbn arduino:mbed_rp2040:pico firmware/firmware.ino
-arduino-cli upload  --fqbn arduino:mbed_rp2040:pico --port /dev/ttyACM0 firmware/firmware.ino
+arduino-cli compile --fqbn rp2040:rp2040:rpipicow --output-dir /tmp/pico-build firmware
+
+# Put the board in BOOTSEL (a 1200-baud open drops DTR and the core reboots
+# into the bootloader), then copy the UF2 to the boot volume:
+python3 -c "import serial,time; s=serial.Serial('/dev/ttyACM0',1200); time.sleep(0.5); s.close()"
+cp /tmp/pico-build/firmware.ino.uf2 /dev/sdX1   # the 128 MB RPI-RP2 volume — check lsblk first
 ```
 
 Port detection greps `arduino-cli board list` for the first `tty*`/`usbmodem*`
 node, which on a machine with several serial devices is the first one rather than
-the Pico — pass `ARDUINO_PORT` when in doubt.
+the Pico — pass `ARDUINO_PORT` when in doubt. Note that
+`scripts/flash-firmware.sh` currently names the `arduino:mbed_rp2040:pico`
+FQBN, which is not the core this tree builds with; the commands above are the
+ones verified on the Pi, UF2 route included.
 
 The sketch is split so the interesting half is testable: `gondola_model.h` holds
 the kinematics, the heading filter, command handling and the ST3215 wire protocol
 and includes no Arduino headers, so `firmware/tests/` compiles it on the host.
 `firmware.ino` keeps only what needs pins, timers and the UART.
+
+### What the firmware does without being asked
+
+- **It boots silent.** Power-up transmits nothing to the servo bus until a
+  `set_target` or `jog` arrives; `stop`, `zero`, `mount` and `dir` do not
+  release the interlock, because none of them asks a servo to go anywhere.
+  Before this, roughly four boots in five ran an axis to the rail within one
+  control tick of power-up — `target 0` with a 270° mount offset and a 5:1 gear
+  is reachable only for a 72° window of headings.
+- **Heaters have a 20 s dead-man.** Any heater whose last on-command is 20 s
+  old (`HEATER_AUTO_OFF_MS`) is cleared, whatever anyone intended. A running
+  OBC re-sends an acknowledged on every 10 s (`HeaterRefreshInterval`), so a
+  heater you asked for stays on, and killing the OBC, pulling the cable, or a
+  Ground Station that never started all cool within one window. `off` is
+  immediate and can never turn a heater on.
+- **The IMU is reported absent after ~1 s of silence.** Fifty consecutive
+  missed reads flip `imu_present` false (the bearing is held), and the 1 s
+  re-probe then picks the sensor up again if it came back. One dropped read
+  changes nothing.
+
+Each of these has a host test in `firmware/tests/` — see `TestBootHold`,
+`test_firmware_heater.py` and `TestMissThreshold`.
 
 Two buses both run at 115200 and are unrelated — the ST3215 servo UART and the
 USB CDC link to the Pi. They are separate named constants with a comment at each
@@ -528,6 +558,19 @@ documents disagree, the code is wrong.
   client side.
 - **The control loop is on the Pico at 50 Hz.** If the OBC dies the antennas keep
   pointing. The Pi is not allowed into that loop.
+- **A board that boots, boots silent.** Power-up transmits nothing to the servo
+  bus until `set_target` or `jog` says otherwise. The default heading (`0°`) is
+  reachable from only a 72° window of bearings, so the pre-change firmware ran
+  an axis to the rail within one tick of power-up in roughly four boots out of
+  five — with a pinned tick and no alarm as the only visible hint. Silence is
+  the only safe default when "do nothing" requires a command to express.
+- **The heater dead-man is two halves that only work as a pair.** The firmware
+  clears any heater not refreshed within 20 s; the OBC re-sends an acknowledged
+  on every 10 s. Every way the host half can fail — crash, cut cable, reboot —
+  leaves the firmware half to do the turning off. The intent is asymmetric on
+  purpose: an ON is kept alive only once the board acknowledged it, an OFF is
+  recorded even when the round trip fails, because dropping a keep-alive can
+  only cool. A Python test reads the Go constant so the two halves cannot drift.
 - **`feedback_state` and `imu_present` are not decoration.** A servo that stopped
   answering and one reporting a genuine zero load must be distinguishable, or a
   console says "0 A" for a motor that has not moved. Earlier firmware showed a

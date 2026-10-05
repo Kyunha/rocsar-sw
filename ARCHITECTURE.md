@@ -385,6 +385,71 @@ There is **no automatic reconnect loop inside `Link`.** Reconnection is a decisi
 the composition root makes, because a link that reconnects on its own turns a
 recoverable absence into an invisible retry storm that hides the fault.
 
+**The firmware's safety policy lives in `gondola_model.h`, not the sketch.** The
+sketch calls it at the right moments; the policy itself is host-testable, which
+is why every rule below has a test in `firmware/tests/` rather than a note in a
+commit (§12).
+
+**A board that boots, boots silent.** Power-up holds both axes in manual mode at
+centre with `awaitingCommand` set, and `shouldDriveServo()` — the interlock plus
+the deadband, one predicate so the sketch cannot apply one and forget the other —
+transmits nothing until `set_target` (releases both axes) or `jog` (releases that
+axis only). `stop`, `zero`, `mount` and `dir` deliberately do not release it:
+none of them asks a servo to go anywhere, so none of them may move an axis that
+has never been commanded. This replaced a boot that drove to the rail.
+`target_heading_deg` boots at 0, and with the 270° mount offset and 5:1 gear that
+target is reachable only for gondola headings in a 72° window — four boots in
+five ran an axis to the clamp within one control tick of power-up, with a tick
+pinned at 4095 and no alarm behind it as the only hint. The interlock does not
+swallow the first command: `lastSentTick` is still the `0xFFFF` never-sent
+sentinel when it clears, and every tick differs from `0xFFFF` by more than the
+deadband, so the first commanded position always reaches the bus even when it
+computes to centre. That sentinel is also never published as a position: while
+feedback is still `UNKNOWN`, the fallback reports the centre tick instead of
+65535, because `0xFFFF` as `current_tick` reads as ~5580° off centre with
+`feedback_state` as the only hint that it is fiction.
+
+**The heater dead-man is two halves, and only the pair works.**
+Firmware half: `HEATER_AUTO_OFF_MS` (20 s). `expireHeaters()` clears any heater
+whose last on-command is older than the window, every control tick, whatever
+anyone intended; `syncHeaterPins()` is the only writer of the heater pins, so
+the flags an operator reads and the pins can never disagree.
+Host half: `HeaterKeeper` (`internal/command/heater_keeper.go`) re-asserts every
+wanted heater on a `HeaterRefreshInterval` (10 s) ticker, run by
+`Dispatcher.Run(ctx)` from the composition root. Two refreshes fit inside one
+window, so a single lost keep-alive cannot flicker a heater that is on; a test
+reads both constants — one from each language — and fails if they drift apart.
+The intent recorded is deliberately asymmetric: an ON enters the keeper only
+after the board has acknowledged it, because an intent that never arrived must
+not be revived by the keep-alive later; an OFF is recorded even when the round
+trip fails, because dropping a keep-alive can only cool. Every failure mode of
+the host half — crash, cut cable, reboot, a Ground Station that never came up —
+therefore leaves the firmware half to do the turning off, which is the direction
+that is safe to fail in.
+
+**IMU silence ends at 50 consecutive misses.** `noteImuMiss()` counts
+`getEvent()` failures while the sensor is believed present; on the 50th (~1 s at
+the 50 Hz tick, `IMU_MISSED_SAMPLES_MAX`) the sketch declares absence through
+`applyImuHeading(..., false)` — the same call the no-sensor branch makes, so
+presence still has exactly one writer. That flips `imu_present` false instead of
+letting the wire claim a heading source it has not heard from in a second, and it
+lets the 1 s re-probe run, so a sensor re-seated mid-run is picked up without a
+reflash. A read that *answers* resets the counter even when its value was
+non-finite — the question is "did the sensor speak", not "was the number usable"
+— and the declaration resets it too, so a flapping sensor gets the full budget
+each time and two separate runs of dropped reads cannot add up into one
+declaration. Below the threshold nothing changes: one dropped read on a busy I2C
+bus must not disturb a bearing.
+
+**`sendMessage` writes only while a host is listening.** On arduino-pico,
+`if (!Serial)` is TinyUSB's DTR bit (`tud_cdc_connected()`), so frames are
+dropped — not queued — while nobody has the port open. A write to a CDC nobody
+reads fills the TX buffer and then blocks, which would stall the 20 ms control
+tick and freeze the antennas because nobody was there to read their telemetry. A
+frame with no reader is not a frame. The handshake that proves `Link.Open` is
+itself a `sendMessage`, so a link that comes up after a flash is this guard's
+bench test.
+
 ### 6.3 Camera
 
 Snapshot only. On `take_photo`, grab one full-resolution JPEG, write it to the
@@ -418,6 +483,10 @@ The shape `obc_rocsar/sdr_service.go` described, cleaned up:
   while one is running, and the refusal names the running PID.
 - `sdr_reset_usb` shells out to `uhubctl` for a power cycle.
 - `sdr_probe` returns `uhd_usrp_probe` output verbatim.
+- `sdr_get_params` reads `parameters/params.json` and returns it as JSON in
+  the reply message. The read side of `sdr_set_params`: the Ground Station
+  shows current values as placeholder hints while blank inputs keep meaning
+  "leave alone". Same verbatim-output rule as `sdr_probe`.
 
 `os/exec` is confined to this package (plus `camera`, which runs `fswebcam`).
 `qos` no longer shells out at all — see §6.6.
@@ -689,7 +758,11 @@ tells them everything.
 | :--- | :--- |
 | GS disconnects | OBC unaffected. Telemetry publishes to nobody. Commands queue nowhere. |
 | Pico unplugged | `SubsystemState.DISCONNECTED`. The Pico, if alive, holds its last bearing. The OBC does not retry silently — the state is reported. |
-| Pico stops answering | ACK timeout counted, `feedback_state` degrades to `HELD`, `imu_present` stays true (fitted, not answering). |
+| Pico stops answering | ACK timeout counted, `feedback_state` degrades to `HELD`, `imu_present` stays true in the last frame received (fitted, not answering). On-board IMU silence is a different failure, counted on the board — see below. |
+| Board powers up | Axes held, nothing transmitted until `set_target`/`jog`. No motion on boot, by design (§6.2). |
+| Host dies while a heater is on | The firmware expires it within `HEATER_AUTO_OFF_MS` (20 s) of the last acknowledged on. Every host failure fails toward cooling (§6.2). |
+| IMU fitted, then silent for 50 ticks | `imu_present` goes false after ~1 s, bearing held, the 1 s re-probe runs (§6.2). One dropped read changes nothing. |
+| Nobody has the CDC port open | Frames are dropped at the source rather than filling the TX buffer and stalling the control tick (§6.2). |
 | GNSS receiver silent | `fix_ok=false` after `gnss.stale_after`; the other receivers are unaffected; the selected one stays selected. |
 | GNSS receiver returns garbage | The datagram is rejected and counted in `reject_count`. Not published. |
 | Camera missing | `DISCONNECTED`. `take_photo` returns an error with a real reason. |
@@ -868,6 +941,19 @@ describing a wire format is a guess until something reads it:
 | `TestWriteFileAtomicLeavesNoPartialFile` | a half-written `params.json` or artefact |
 | `TestPartialUpdatePreservesUnmodelledKeys`, `TestMissingRequiredKeyIsRefused` | an SDR params write silently dropping keys |
 
+**The firmware host suite tests the other half of every pairing.**
+`firmware/tests/` compiles `gondola_model.h` into a probe binary and drives the
+real `applyCommand()`/`expireHeaters()` from pytest, plus source-read assertions
+on `firmware.ino` for what only exists in the sketch. Three of its tests exist
+specifically to stop two files from drifting apart:
+`test_the_host_refreshes_at_least_twice_per_firmware_window` reads
+`internal/command/heater_keeper.go` from Python and fails if two refreshes no
+longer fit inside `HEATER_AUTO_OFF_MS`;
+`test_power_up_holds_both_axes_and_transmits_nothing` asserts the boot interlock
+from the transmit side (DRIVE), not from what the model believes; and
+`test_the_fiftieth_miss_declares_the_sensor_absent` pins the IMU counter's
+threshold, its reset-on-declaration, and that a sample arriving resets it too.
+
 **Most of the names in earlier revisions of this table did not exist.** Listed
 were `TestGNSSDecodesDegrees`, `TestPicoFrameMatchesFirmware`,
 `TestTelemetryFrameUnderBudget`, `TestFlowerFilterPresent`,
@@ -895,7 +981,7 @@ scripts/generate.sh     # firmware → nanopb C, common + pico only (§4.4)
 go build ./...
 go test ./...
 go run ./tools/gs_cli   # the Ground Station console
-arduino-cli compile -u -p /dev/ttyACM0 --fqbn rp2040:rp2040:rpipico firmware/
+arduino-cli compile -u -p /dev/ttyACM0 --fqbn rp2040:rp2040:rpipicow firmware/
 ```
 
 Toolchain: Go 1.26, buf 1.72, `arduino-cli` with the `rp2040:rp2040` core, gcc
@@ -920,6 +1006,13 @@ Known limits, stated so nobody mistakes silence for coverage:
 - No hardware in the loop. The Pico, the servos, the SDR, the camera and the
   real GNSS receivers are untested by the suite. Tests use doubles and injected
   fakes; the integration is assumed correct until proven otherwise in flight.
+  What *has* been exercised by hand on real hardware (bench session, Oct 2026):
+  flash and link bring-up through the `if (!Serial)` guard, the boot interlock
+  (a fresh boot held at `target 0` for 20 s where the pre-change firmware had
+  both axes stalled at the rail), both interlock release paths, and the heater
+  pair (held past the firmware window by the keeper, then expired after the OBC
+  was killed, with no resurrection on restart). A bench session is not
+  automation; none of it runs unattended.
 - **Link shaping is verified by reading back the qdisc, not by measuring
   throughput under load.** `internal/qos/netlink_test.go` installs the hierarchy in
   a real network namespace and asserts the rates the kernel reports back, and
@@ -932,5 +1025,14 @@ Known limits, stated so nobody mistakes silence for coverage:
   binding used here cannot express a `pfifo` byte limit, so leaves get fair
   queueing with no explicit queue length. See §6.6.
 - The 420-byte `NavData` stream is not read (§6.1).
+- Servo status reads are **blocking**, bounded by `SERVO_STATUS_WAIT_MS` (5 ms,
+  ~4× a reply). A split-phase read was assessed and deferred: the worst observed
+  case is ~8–9 ms of the 20 ms tick, and splitting it would couple every servo
+  write to the read state machine. The cheap alternative, host-side overrun
+  detection from reply sequence gaps, has not been built either.
+- `SERVO_LOAD_PERCENT_SCALE` (10.0) is unverified. On the bench it reads
+  104–105% both stalled against the rail and at mid-travel, and 0% at the
+  opposite end — the number has never been calibrated against amperes, and a
+  load percentage that saturates is not yet an operator signal.
 - There is no artefact catalogue, so no integrity checking on stored files
   (§6.7).
