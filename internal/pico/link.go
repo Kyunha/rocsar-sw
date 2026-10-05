@@ -215,6 +215,38 @@ func (l *Link) Open(ctx context.Context) error {
 	}
 }
 
+// Listen starts the receive goroutine and sends nothing.
+//
+// The passive counterpart to Open. Open proves the link with a status_request,
+// which is a command on the wire, and a sniffer whose contract is "report
+// frames, send nothing" cannot use it. Here the frames themselves are the
+// proof: the flight controller emits telemetry every control tick whether or
+// not it is asked, so writing nothing still answers "is it transmitting?" --
+// and unlike a probe it cannot answer "does it obey?" while pretending not to.
+//
+// Close tears down exactly as it does after Open.
+func (l *Link) Listen(ctx context.Context) {
+	l.mu.Lock()
+	if l.connected {
+		l.mu.Unlock()
+		return
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	l.cancel = cancel
+	// The framing accumulator is per-connection, as in Open: a half-received
+	// frame from an earlier port must not complete the next one's first frame.
+	l.reader.reset()
+	// connected is what Close() keys on. Without it a sniffed link would leave
+	// its receive goroutine running on the way out -- the exact leak Open's
+	// comment calls "the shape of bug where the system reports telemetry it can
+	// no longer command".
+	l.connected = true
+	l.mu.Unlock()
+
+	l.wg.Add(1)
+	go l.readLoop(ctx)
+}
+
 // abortOpen unwinds a failed handshake, leaving nothing running.
 func (l *Link) abortOpen(cancel context.CancelFunc) {
 	l.mu.Lock()

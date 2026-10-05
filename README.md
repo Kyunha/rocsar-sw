@@ -373,7 +373,14 @@ ssh pi@192.168.1.50 'sudo mv /tmp/obc /usr/local/bin/obc && sudo systemctl resta
 **CGO is the catch.** `go-zeromq/zmq4` links against `libzmq`, so a
 `CGO_ENABLED=0` build produces a binary that compiles and then fails at startup.
 Cross-compiling for the Pi needs a matching cross-toolchain and `libzmq` for
-`arm64`; if you would rather not maintain one, build natively on the Pi.
+`arm64`; if you would rather not maintain one, build natively on the Pi:
+
+```sh
+./scripts/build-on-obc.sh 192.168.1.50 root    # sync, build all seven binaries on
+                                               # the OBC, flash the flight
+                                               # controller from its USB, verify
+                                               # with one real telemetry frame
+```
 
 Configuration is deployed separately — `rocsar.toml` is committed, and
 `rocsar.local.toml` is the gitignored per-machine overlay.
@@ -398,12 +405,14 @@ python3 -c "import serial,time; s=serial.Serial('/dev/ttyACM0',1200); time.sleep
 cp /tmp/pico-build/firmware.ino.uf2 /dev/sdX1   # the 128 MB RPI-RP2 volume — check lsblk first
 ```
 
-Port detection greps `arduino-cli board list` for the first `tty*`/`usbmodem*`
-node, which on a machine with several serial devices is the first one rather than
-the Pico — pass `ARDUINO_PORT` when in doubt. Note that
-`scripts/flash-firmware.sh` currently names the `arduino:mbed_rp2040:pico`
-FQBN, which is not the core this tree builds with; the commands above are the
-ones verified on the Pi, UF2 route included.
+Port detection finds the Pico by its `2e8a` USB vendor id rather than by
+taking the first serial node — on the OBC the first `tty*` is a GNSS adapter —
+and `ARDUINO_PORT` overrides it when in doubt.
+`scripts/flash-firmware.sh` drives the same route as the commands above:
+`rp2040:rp2040:rpipicow` compile, a 1200-baud open to drop into BOOTSEL, then
+`picotool load` of the UF2 (falling back to copying it onto the RPI-RP2
+volume). The stale `arduino:mbed_rp2040:pico` FQBN it used to name is gone;
+that core is not the one this tree builds with.
 
 The sketch is split so the interesting half is testable: `gondola_model.h` holds
 the kinematics, the heading filter, command handling and the ST3215 wire protocol

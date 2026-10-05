@@ -95,6 +95,10 @@ func run() error {
 	defer stop()
 
 	if *raw {
+		// Passive means passive: Open() would put a status_request on the wire.
+		// Listen() only starts the reader -- the firmware streams telemetry
+		// every control tick on its own, so sending nothing still sees frames.
+		link.Listen(ctx)
 		return sniff(ctx, link, *seconds)
 	}
 

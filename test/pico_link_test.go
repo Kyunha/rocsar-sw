@@ -313,6 +313,46 @@ func TestLinkOpenSucceedsWhenDeviceAnswers(t *testing.T) {
 	t.Fatal("no telemetry arrived after Open, though the handshake succeeded")
 }
 
+// Listen must start the receive goroutine WITHOUT a status_request. The passive
+// sniffer (pico_bench -raw) exists to answer "is it transmitting?" without
+// putting anything on the wire; it was blind because sniff never started the
+// reader, and opening the link would have violated the contract it prints.
+func TestListenReceivesTelemetryAndSendsNothing(t *testing.T) {
+	lb := newLoopback()
+	l := newTestLink(t, lb)
+
+	l.Listen(context.Background())
+	if !l.Connected() {
+		t.Fatal("Listen left the link unconnected, so Close would leak the receive goroutine")
+	}
+
+	lb.emitTelemetry(sampleTelemetry())
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if tel, ok := l.Telemetry(); ok && tel.GondolaHeadingDeg == 271.5 {
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	if tel, ok := l.Telemetry(); !ok || tel.GondolaHeadingDeg != 271.5 {
+		t.Fatal("no telemetry arrived after Listen; the reader is not running")
+	}
+
+	if got := lb.framesWritten(); len(got) != 0 {
+		t.Errorf("Listen wrote %d frame(s) to the device; it must send nothing", len(got))
+	}
+
+	// Close must tear a listened link down exactly as it does an opened one.
+	done := make(chan struct{})
+	go func() { _ = l.Close(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("Close hung on a listened link")
+	}
+}
+
 // A command to a device that has never answered must be reported as "not
 // connected", not as a timeout. The link was never established, so claiming a
 // timeout would send an operator looking at the ACK path when the cable is the

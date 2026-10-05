@@ -142,7 +142,7 @@ void readImuHeading(unsigned long now) {
   // above holds the last temperature rather than zeroing it, the same posture
   // as the bearing and the servo readings. The BNO055 reports whole degrees;
   // a tenth of a degree is far finer than anyone acts on.
-  gondola.imuTemperatureC = (float)bno.getTemperature();
+  gondola.imuTemperatureC = (float)bno.getTemp();
 }
 
 void sendTelemetryMessage() {
