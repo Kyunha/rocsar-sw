@@ -25,7 +25,6 @@ import (
 	"io"
 	"log/slog"
 	"os"
-	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -43,7 +42,7 @@ func main() {
 
 func run() error {
 	program := flag.String("program", "third_party/sdr-ettus-b200mini",
-		"the vendored acquisition program directory")
+		"directory holding parameters/ and Data/ -- NOT the connect binary, which is found on PATH")
 	dataDir := flag.String("data", "/mnt/rocsar/data",
 		"data directory, where SDR logs are written")
 	flag.Parse()
@@ -100,7 +99,7 @@ func printUsage() {
   show          print the current parameters
   set K=V ...   apply a partial update, validated and written atomically
   probe         run uhd_usrp_probe
-  connect       start ./connect detached, output to a timestamped log
+  connect       start connect detached, output to a timestamped log
   reset-usb     power-cycle the SDR's USB port
 
 set accepts: PRF FS TX_FREQ BW NORMALIZED_GAIN_TX NORMALIZED_GAIN_RX SESSION_DURATION
@@ -109,7 +108,12 @@ set accepts: PRF FS TX_FREQ BW NORMALIZED_GAIN_TX NORMALIZED_GAIN_RX SESSION_DUR
   sdr_bench set TX_FREQ=5.7e9 BW=40e6
 
 Anything not named is left alone. PULSE_DURATION is not accepted: config.hpp
-does not read it, so setting it would do nothing and appear to work.`)
+does not read it, so setting it would do nothing and appear to work.
+
+-program names the directory holding parameters/ and Data/, not the binary.
+The connect program is found on PATH. That directory must be called
+sdr-ettus-b200mini, because connect.cpp resolves its own config path relative
+to its working directory; validate says so if it is not.`)
 }
 
 // validate prints the contract.
@@ -117,7 +121,11 @@ does not read it, so setting it would do nothing and appear to work.`)
 // This is the command that answers "what does connect.cpp actually need?", which
 // otherwise means reading C++ on the aircraft.
 func validate(svc *sdr.Service, program string) error {
-	path := filepath.Join(program, "parameters", "params.json")
+	// The path comes from the Service, not from a second derivation here. The
+	// file the server edits and the file this reports on have to be the same
+	// one, and the C++ has a third opinion about it that only CheckProgramConfig
+	// can settle.
+	path := svc.ParamsPath()
 	body, err := os.ReadFile(path)
 	if err != nil {
 		return fmt.Errorf("read %s: %w", path, err)
@@ -190,6 +198,20 @@ func validate(svc *sdr.Service, program string) error {
 		return fmt.Errorf("%d problem(s) in %s", bad, path)
 	}
 	fmt.Printf("OK: %s satisfies the contract\n", path)
+
+	// A contract that validates is not the same as a file the program will read.
+	// This is the one check that catches sdr.program pointing somewhere the C++'s
+	// own hardcoded path does not reach, which would otherwise make every edit
+	// above report success and change nothing.
+	if err := svc.CheckProgramConfig(); err != nil {
+		return err
+	}
+	if bin, err := sdr.LookProgram(program); err != nil {
+		fmt.Printf("  connect: NOT on PATH, and Connect would fall back to the program directory\n")
+	} else {
+		fmt.Printf("  connect: %s\n", bin)
+	}
+	fmt.Printf("  the program and this tool read the same file\n")
 	return nil
 }
 

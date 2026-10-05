@@ -104,6 +104,16 @@ stale_after = "2s"
 device = "/dev/video0"
 
 [sdr]
+# The directory holding parameters/params.json and Data/ -- NOT the connect
+# binary, which is found on PATH (see README, "The SDR program on the Pi").
+# It is also the working directory the program is started in, because the C++
+# resolves its own config and capture paths against CWD.
+#
+# The name is load-bearing, not cosmetic: connect.cpp hardcodes
+# "./../sdr-ettus-b200mini/parameters/params.json", so this only reaches the file
+# above if the directory is called sdr-ettus-b200mini. The OBC refuses to start
+# an acquisition when it does not, rather than writing parameters the program
+# would never read. On the Pi, override with ROCSAR_SDR_PROGRAM instead.
 program = "third_party/sdr-ettus-b200mini"
 
 [telemetry]

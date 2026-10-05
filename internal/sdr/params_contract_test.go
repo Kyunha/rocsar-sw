@@ -249,20 +249,35 @@ func TestUnknownKeyIsNotValidated(t *testing.T) {
 //
 //	const Config cfg = load_config("./../sdr-ettus-b200mini/parameters/params.json");
 //
-// That is the reason the child's CWD is set explicitly. If that line changes,
-// this test does not fire -- but the comment here and in service.go both point
-// at it, and the failure mode (the program cannot find its own configuration)
-// is immediate and obvious on the bench.
+// That is the reason the child's CWD is set explicitly, and it is the reason
+// programConfigRelPath had to be copied into Go: the C++ decides which file a
+// capture reads, and the OBC has to check its own derivation against it.
+//
+// So this test pins BOTH sides. If the C++ line changes, the constant is stale
+// and the check in programParamsPath would be validating against a path the
+// program no longer uses -- silently, because the comparison would still pass.
+// This is the test that makes the duplicated constant safe to keep.
 func TestConfigPathIsHardcodedRelativeToCWD(t *testing.T) {
 	src, err := os.ReadFile(filepath.Join("..", "..", "third_party",
 		"sdr-ettus-b200mini", "connect.cpp"))
 	if err != nil {
 		t.Skipf("vendored connect.cpp not present: %v", err)
 	}
-	if !strings.Contains(string(src), "./../sdr-ettus-b200mini/parameters/params.json") {
-		t.Error("connect.cpp no longer hardcodes ./../sdr-ettus-b200mini/parameters/params.json.\n" +
-			"  The child's working directory is set to the program directory precisely to\n" +
-			"  satisfy that path. If it changed, re-check how Service.Connect sets cmd.Dir.")
+	const cppPath = "./../sdr-ettus-b200mini/parameters/params.json"
+	if !strings.Contains(string(src), cppPath) {
+		t.Errorf("connect.cpp no longer hardcodes %s.\n"+
+			"  The child's working directory is set to the program directory precisely to\n"+
+			"  satisfy that path. If it changed, re-check how Service.Connect sets cmd.Dir,\n"+
+			"  and update programConfigRelPath to match.", cppPath)
+	}
+
+	// The Go copy, compared after stripping the C++'s leading "./", which
+	// filepath.Join would discard anyway.
+	if got, want := programConfigRelPath, strings.TrimPrefix(cppPath, "./"); got != want {
+		t.Errorf("programConfigRelPath = %q but connect.cpp uses %q.\n"+
+			"  These are two homes for one fact. Update the constant, or the\n"+
+			"  programParamsPath check will validate a path the program never reads.",
+			got, want)
 	}
 }
 

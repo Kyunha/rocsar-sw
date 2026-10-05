@@ -32,7 +32,7 @@ non-obvious constraints are.
    └────────────────┘ ◀───────────── └────────────────┘
                                           │  │  │
                           UDP :2001-2003  │  │  └── fswebcam ─▶ /dev/video0
-                          GNSS ×3         │  └───── ./connect ─▶ B200mini (USB)
+                          GNSS ×3         │  └───── connect ──▶ B200mini (USB)
 ```
 
 ### Hard constraints
@@ -464,7 +464,7 @@ explicit flag  >  ROCSAR_* environment  >  rocsar.toml  >  code default
 | `gnss.selected` | `1` | Trusted receiver, by 1-based position in `ports`. |
 | `gnss.stale_after` | `2s` | Fix age past which `fix_ok` goes false. |
 | `camera.device` | `/dev/video0` | The node `fswebcam` reads. |
-| `sdr.program` | `third_party/sdr-ettus-b200mini` | Acquisition program. |
+| `sdr.program` | `third_party/sdr-ettus-b200mini` | Directory holding `parameters/` and `Data/` — **not** the `connect` binary, which is found on `PATH`. Must be named `sdr-ettus-b200mini`; see below. |
 | `telemetry.interval` | `1s` | Frame rate. |
 | `qos.bulk_rate_bps` | `8192` | Artefact download ceiling. `0` = unbounded. |
 | `require_hardware` | `false` | Missing hardware is fatal instead of degraded. |
@@ -489,6 +489,33 @@ Three rules that are load-bearing:
 - **`rocsar.local.toml` is merged over `rocsar.toml` and is gitignored.** Use it
   for a different Pi address or data directory so the override does not become a
   commit that fights the next person.
+
+### The SDR program on the Pi
+
+The acquisition program is **installed on `PATH`**, not shipped beside the OBC
+binary. That is what lets a compiled `obc` be `scp`'d onto the Pi and drive a
+program that was built and installed separately:
+
+```sh
+ln -s /root/rocsar-rpi/sdr-ettus-b200mini/connect /usr/local/bin/connect
+export ROCSAR_SDR_PROGRAM=/root/rocsar-rpi/sdr-ettus-b200mini
+```
+
+Two things about that value, both of which look like pedantry and are not:
+
+- **It is a directory, not a program.** It names where `parameters/params.json`
+  and `Data/` live, and it is the working directory the program is started in.
+  `connect` itself is found on `PATH`, with a fallback to `<that dir>/connect`
+  so a fresh checkout still works with nothing installed.
+- **It must be called `sdr-ettus-b200mini`.** `connect.cpp` hardcodes
+  `load_config("./../sdr-ettus-b200mini/parameters/params.json")`, which resolves
+  against the working directory and therefore only lands on
+  `<that dir>/parameters/params.json` when the directory has that name. Point it
+  anywhere else and the OBC writes parameters to a file the program never reads:
+  the Ground Station reports the edit as saved and the capture keeps using the
+  old values. The OBC refuses to start an acquisition in that case rather than
+  flying a silent mismatch, and `sdr_bench validate` says the same thing on the
+  bench.
 
 ---
 

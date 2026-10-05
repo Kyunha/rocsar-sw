@@ -69,7 +69,7 @@ Four computers and one radio link are involved:
 |    |  gnss  |     |  pico  |     | camera |     |   sdr   | |   qos   |     |
 |    +--------+     +--------+     +--------+     +---------+ +--------+     |
 |         |              |              |              |                     |
-|   UDP :2001-3     USB serial     fswebcam       USB + ./connect            |
+|   UDP :2001-3     USB serial     fswebcam       USB + connect (on PATH)    |
 +---------------------------------------------------------------------------+
                                    |
                      USB CDC, COBS-framed protobuf, 115200
@@ -115,7 +115,7 @@ rocsar/
 │   ├── gnss/                ← UDP receiver bank
 │   ├── pico/                ← COBS + protobuf + serial link to the flight controller
 │   ├── camera/              ← fswebcam snapshot
-│   ├── sdr/                 ← params.json, ./connect lifecycle, probe, USB reset
+│   ├── sdr/                 ← params.json, connect lifecycle, probe, USB reset
 │   ├── storage/             ← data directory, atomic placement
 │   ├── telemetry/           ← 1 Hz aggregate assembly. no I/O.
 │   ├── qos/                 ← HTB link shaping over rtnetlink. no userspace queue.
@@ -478,9 +478,27 @@ The shape `obc_rocsar/sdr_service.go` described, cleaned up:
 - `sdr_set_params` reads, validates and writes `parameters/params.json`
   (PRF, sample rate, TX frequency, gains, bandwidth). Write is atomic:
   temp file, then rename. A half-written `params.json` is a bricked SDR.
-- `sdr_connect` starts `./connect` detached, with stdout and stderr to a
+- `sdr_connect` starts `connect` detached, with stdout and stderr to a
   timestamped log under the data directory. It refuses to start a second one
   while one is running, and the refusal names the running PID.
+
+  The binary is found **on `PATH`**, falling back to `<sdr.program>/connect`
+  when it is not installed. The deployed system installs it (`ln -s
+  /root/rocsar-rpi/sdr-ettus-b200mini/connect /usr/local/bin/`) rather than
+  shipping it beside the OBC, so a binary `scp`'d onto the Pi drives a program
+  that was built and installed separately.
+
+  `sdr.program` is therefore **not** the executable. It is the directory
+  holding `parameters/` and `Data/`, and it is still the working directory the
+  child is started in, because the C++ resolves both its configuration and its
+  capture paths against `CWD`. That directory must be named
+  `sdr-ettus-b200mini`: `connect.cpp` hardcodes
+  `load_config("./../sdr-ettus-b200mini/parameters/params.json")`, which only
+  reaches `<sdr.program>/parameters/params.json` for a directory with that
+  name. The OBC checks the two derivations against each other on every start
+  and refuses a mismatch, because otherwise `sdr_set_params` would report a
+  successful write to a file the program never reads — an operator's gain and
+  PRF changes appearing to save and doing nothing.
 - `sdr_reset_usb` shells out to `uhubctl` for a power cycle.
 - `sdr_probe` returns `uhd_usrp_probe` output verbatim.
 - `sdr_get_params` reads `parameters/params.json` and returns it as JSON in
@@ -887,6 +905,11 @@ becomes a second home for a fact, and two homes drift.
 this table in earlier revisions although all three are parsed. `[link] shaping`
 defaulted to `true` here; the code default is `false` (§6.6 — an unshaped link is
 the safe default, and `rocsar.toml` ships `false` with the reasoning inline).
+
+`[sdr] program` is the one key whose value is **not** the thing its name
+suggests. It is a directory, not a program, and it is not where `connect` is
+found — that is on `PATH`. It must be named `sdr-ettus-b200mini`, for the
+C++'s hardcoded config path to resolve to the file the OBC edits; see §6.4.
 
 There is no `[gui]` section and no `gui.*` key. `GUI_ARCHITECTURE.md` describes the
 Ground Station console's own settings; none of them are read by the OBC, and

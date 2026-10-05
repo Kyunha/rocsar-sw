@@ -100,7 +100,7 @@ var layerRules = []forbiddenRule{
 // decision that is still in force.
 var subsystemOwners = map[string][]string{
 	"os/exec": {
-		// Runs ./connect and reads USB device nodes for the SDR.
+		// Runs connect (found on PATH) and reads USB device nodes for the SDR.
 		"internal/sdr",
 		// Runs fswebcam to photograph the camera.
 		"internal/camera",

@@ -1,8 +1,16 @@
-// Package sdr drives the vendored Ettus B200mini acquisition program.
+// Package sdr drives the Ettus B200mini acquisition program.
 //
 // The shape is obc_rocsar's sdr_service.go, cleaned up: parameters/params.json is
-// read and written, ./connect is started detached with its output to a log, and
+// read and written, connect is started detached with its output to a log, and
 // uhd_usrp_probe and uhubctl are shelled out to for diagnosis.
+//
+// The program itself is found on PATH, because the deployed system installs it
+// there rather than shipping it beside the OBC binary. sdr.program names the
+// directory holding parameters/ and Data/ -- not the executable -- and that
+// directory is also the working directory the child is started in, because the
+// C++ resolves both its configuration and its capture paths against CWD. The
+// two path derivations are checked against each other on every start; see
+// programParamsPath for why that is not optional.
 //
 // os/exec appears here and in internal/qos, and nowhere else -- enforced by
 // test/layering_test.go. Every other part of the OBC reaches hardware through an
@@ -80,12 +88,120 @@ func NewService(programDir, logDir string, log *slog.Logger) *Service {
 	}
 }
 
-// programPath is the acquisition binary.
-func (s *Service) programPath() string { return filepath.Join(s.programDir, "connect") }
+// programName is the acquisition binary's own name, and the string looked up on
+// PATH. The deployed system installs it there (a symlink into
+// /usr/local/bin), so the OBC no longer has to ship next to it.
+const programName = "connect"
+
+// programConfigRelPath is where the program looks for its own configuration,
+// relative to its working directory.
+//
+// Taken verbatim from connect.cpp:
+//
+//	const Config cfg = load_config("./../sdr-ettus-b200mini/parameters/params.json");
+//
+// That line is a hardcoded relative path in C++ this repository does not
+// maintain, so it -- not paramsPath() below -- decides which file a capture
+// actually uses. TestConfigPathIsHardcodedRelativeToCWD pins both copies to
+// connect.cpp: if that line changes, that test fails rather than this constant
+// quietly going stale.
+const programConfigRelPath = "../sdr-ettus-b200mini/parameters/params.json"
+
+// programPath is the acquisition binary, looked up on PATH.
+//
+// PATH first, then next to the parameters. The program is installed on PATH
+// (a symlink into /usr/local/bin) so a binary scp'd onto the OBC can drive a
+// program built and installed separately, and the fallback keeps a checkout
+// with the vendored tree still working without installing anything.
+func (s *Service) programPath() (string, error) {
+	if path, err := exec.LookPath(programName); err == nil {
+		return path, nil
+	}
+	local := filepath.Join(s.programDir, programName)
+	if _, err := os.Stat(local); err != nil {
+		return "", fmt.Errorf("%w: %s is not on PATH and there is no %s",
+			ErrNoProgram, programName, local)
+	}
+	return local, nil
+}
+
+// LookProgram reports where the acquisition binary would be run from, without
+// starting it. Exported for sdr_bench, so an operator can confirm the OBC will
+// find the program they think it will before they are on the aircraft.
+func LookProgram(programDir string) (string, error) {
+	return (&Service{programDir: programDir}).programPath()
+}
 
 // paramsPath is the parameter file the program reads.
 func (s *Service) paramsPath() string {
 	return filepath.Join(s.programDir, "parameters", "params.json")
+}
+
+// ParamsPath is where this Service reads and writes parameters/params.json.
+//
+// Exported so a tool reports on the same file the server edits. sdr_bench used
+// to build the path itself, which is a second home for a fact that has to match
+// the server's exactly -- and the C++ has a third opinion, see programParamsPath.
+func (s *Service) ParamsPath() string { return s.paramsPath() }
+
+// CheckProgramConfig reports whether the program and this Service would agree on
+// which params.json is authoritative, without starting anything.
+//
+// The check belongs here rather than only inside Connect so an operator can run
+// it on the bench, where a disagreement is cheap to fix, rather than
+// discovering it in the air.
+func (s *Service) CheckProgramConfig() error {
+	_, err := s.programParamsPath()
+	return err
+}
+
+// programParamsPath returns the params.json the program will itself open, and
+// refuses if that is not the file this Service reads and writes.
+//
+// Both sides derive a path from s.programDir, and they must derive the SAME
+// one. Go builds <programDir>/parameters/params.json; the C++ resolves
+// programConfigRelPath against the working directory, which reaches
+// <programDir> again only because the directory is named sdr-ettus-b200mini.
+// Put programDir anywhere else and the two disagree: SetParams would report a
+// successful write to one file while the program kept using another, so an
+// operator's gain and PRF changes would appear to save and do nothing.
+//
+// The only honest fix is upstream -- the C++ taking a path argument. Until
+// then this is checked on every start rather than discovered on the bench.
+func (s *Service) programParamsPath() (string, error) {
+	cwd, err := filepath.Abs(s.programDir)
+	if err != nil {
+		return "", fmt.Errorf("sdr: resolve %s: %w", s.programDir, err)
+	}
+	program := filepath.Clean(filepath.Join(cwd, programConfigRelPath))
+	ours, err := filepath.Abs(s.paramsPath())
+	if err != nil {
+		return "", fmt.Errorf("sdr: resolve %s: %w", s.paramsPath(), err)
+	}
+	if program == ours || sameFile(program, ours) {
+		return program, nil
+	}
+	return "", fmt.Errorf("sdr: the program would read %s but this OBC reads and "+
+		"writes %s.\n  connect.cpp hardcodes %q relative to its working directory, so "+
+		"sdr.program must name a directory called sdr-ettus-b200mini; %s does not "+
+		"resolve to one.\n  Parameter edits would report success and have no effect on "+
+		"a capture.",
+		program, ours, programConfigRelPath, s.programDir)
+}
+
+// sameFile reports whether two paths are the same existing file, following
+// symlinks. False if either is missing or unreadable, which is the safe answer:
+// the caller then insists on the paths matching as strings.
+func sameFile(a, b string) bool {
+	fa, err := os.Stat(a)
+	if err != nil {
+		return false
+	}
+	fb, err := os.Stat(b)
+	if err != nil {
+		return false
+	}
+	return os.SameFile(fa, fb)
 }
 
 // loadParams reads params.json ONCE and returns both views of it.
@@ -250,9 +366,12 @@ func (s *Service) Connect(ctx context.Context) error {
 	}
 	s.mu.Unlock()
 
-	program := s.programPath()
-	if _, err := os.Stat(program); err != nil {
-		return fmt.Errorf("%w: %s", ErrNoProgram, program)
+	program, err := s.programPath()
+	if err != nil {
+		return err
+	}
+	if _, err := s.programParamsPath(); err != nil {
+		return err
 	}
 
 	logDir, err := storage.New(s.logDir).Sub("sdr")
@@ -269,9 +388,11 @@ func (s *Service) Connect(ctx context.Context) error {
 	}
 
 	// The child is started with the program's own directory as its working
-	// directory. The vendored C++ writes its output relative to CWD
-	// (./Data/rx_data_<time>.bin), so inheriting the OBC's directory puts every
-	// capture somewhere the HTTP listing does not serve.
+	// directory. The vendored C++ resolves its configuration against CWD
+	// (programConfigRelPath) and writes its capture relative to it
+	// (Data/rx_data_<time>.bin), so the directory is load-bearing even though
+	// the binary itself now comes from PATH. Inheriting the OBC's own directory
+	// would put every capture somewhere the HTTP listing does not serve.
 	pid, err := s.start(ctx, s.programDir, program, nil, f)
 	if err != nil {
 		_ = f.Close()
@@ -289,7 +410,12 @@ func (s *Service) Connect(ctx context.Context) error {
 	s.state = domain.SubsystemBusy
 	s.mu.Unlock()
 
-	s.log.Info("SDR acquisition started", "pid", pid, "log", logPath, "cwd", s.programDir)
+	// program and cwd are both logged, and they are different facts. The binary
+	// may have come from /usr/local/bin while its configuration came from a
+	// directory under /root, and an operator reading only one of them would
+	// guess wrong about which params.json a capture used.
+	s.log.Info("SDR acquisition started",
+		"pid", pid, "program", program, "cwd", s.programDir, "log", logPath)
 	return nil
 }
 
