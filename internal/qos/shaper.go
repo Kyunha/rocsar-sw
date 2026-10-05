@@ -1,15 +1,21 @@
 // Package qos shapes the air link.
 //
-// Two layers, because they solve different problems and confusing them is how
-// you end up with neither working:
+// This package is the kernel layer, and only the kernel layer: an HTB hierarchy
+// on the link device, so the cap is enforced on traffic this process does not
+// own. Anything on the Pi can saturate the radio link; a queue in our own process
+// cannot help with that.
 //
-//   - Userspace (Limiter): a priority queue and a token bucket in front of the
-//     telemetry socket. It stops a bulk transfer from monopolising the socket's
-//     send path before the kernel ever sees the traffic.
+// The userspace layer lives in internal/transport, not here. It bounds the
+// artefact download path with golang.org/x/time/rate. The two were briefly one
+// package, and keeping them apart is what stopped each from pretending to be the
+// other: nothing here is a queue, and nothing there shapes the link.
 //
-//   - Kernel (Shaper): an HTB hierarchy on the link device, so the limit is
-//     enforced on traffic this process does not own. Anything on the Pi can
-//     saturate the radio link; a queue in our own process cannot help with that.
+// There is no classifier. The hierarchy is installed with a default class and no
+// filter, so everything shares the priority class. That is a measured result, not
+// an omission; see ARCHITECTURE.md 6.6 for the three faults that retired the
+// flower filter.
+//
+// The kernel is reached over rtnetlink, not by running tc. See KernelOps below.
 //
 // ARCHITECTURE.md 6.6.
 package qos
@@ -289,14 +295,15 @@ func (s *Shaper) Status() domain.LinkStatus {
 		ShapingActive: s.active,
 	}
 	if !s.active {
-		// Three different operator actions live behind this one field: tc is
-		// missing, sudo is not permitted, or shaping is off in configuration.
-		// A single bool sends someone to debug the wrong one.
+		// Three different operator actions live behind this one field: the device
+		// does not exist, the unit is missing CAP_NET_ADMIN, or shaping is off in
+		// configuration. A single bool sends someone to debug the wrong one.
 		st.State = domain.SubsystemError
 		st.InactiveReason = s.reason
 	} else if s.reason != "" {
-		// Shaping is in force but something is degraded -- the bulk filter, so
-		// far. That is not the same as inactive and must not read as such.
+		// Shaping is in force but something is degraded -- the traffic is not
+		// classified, so a download shares the priority class with telemetry. That
+		// is not the same as inactive and must not read as such.
 		st.State = domain.SubsystemBusy
 		st.InactiveReason = s.reason
 	}

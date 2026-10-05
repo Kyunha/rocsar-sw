@@ -180,6 +180,27 @@ func (f *fakeOBC) emit(t *testing.T, count int, interval time.Duration) {
 	}
 }
 
+// backgroundEmit runs a fixed burst in the background and returns a join
+// function. The join must be deferred before Close: an emitter still running
+// when the PUB closes fails its Send and calls t.Fatal from a goroutine whose
+// test has already completed, which panics the whole binary -- taking every
+// other test's results with it.
+func backgroundEmit(t *testing.T, f *fakeOBC, n int, interval time.Duration) (join func()) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		f.emit(t, n, interval)
+	}()
+	return func() {
+		select {
+		case <-done:
+		case <-time.After(30 * time.Second):
+			t.Error("background emitter did not finish; the burst was lost")
+		}
+	}
+}
+
 // emitUntil publishes one frame every interval until stop is closed. The stop
 // is checked before every emit, so at most one frame is ever in flight after
 // it closes -- which is what makes drainFrames deterministic.

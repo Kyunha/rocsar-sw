@@ -84,14 +84,16 @@ var layerRules = []forbiddenRule{
 // point: it is easy to add an entry and hard to notice you have.
 //
 // Adding one here is a decision, not a convenience, so the reason travels with it.
+// Removing one is a decision too: internal/qos was on this list because it shelled
+// out to tc, and it no longer does, because the shaper talks to rtnetlink. An
+// allowance nothing uses is worse than no list at all, because it reads as a
+// decision that is still in force.
 var subsystemOwners = map[string][]string{
 	"os/exec": {
 		// Runs ./connect and reads USB device nodes for the SDR.
 		"internal/sdr",
-		// Runs tc to shape the link.
-		"internal/qos",
-	// Runs fswebcam to photograph the camera.
-	"internal/camera",
+		// Runs fswebcam to photograph the camera.
+		"internal/camera",
 	},
 }
 

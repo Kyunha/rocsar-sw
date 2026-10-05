@@ -1,6 +1,7 @@
 package qos
 
 import (
+	"context"
 	"os"
 	"strings"
 	"testing"
@@ -70,18 +71,10 @@ func TestNetlinkClassRatesReachTheKernelUnchanged(t *testing.T) {
 	const dev = "shapetest0"
 	newDummyDevice(t, dev)
 
-	ops := NetlinkOps{}
-	if err := ops.ClearRoot(dev); err != nil {
-		t.Fatalf("ClearRoot on a fresh device: %v", err)
-	}
-	if err := ops.AddRootHTB(dev); err != nil {
-		t.Fatalf("AddRootHTB: %v", err)
-	}
-	if err := ops.AddClass(dev, PriorityClass, RootHandle, 41, 115); err != nil {
-		t.Fatalf("AddClass priority: %v", err)
-	}
-	if err := ops.AddClass(dev, BulkClass, RootHandle, 74, 74); err != nil {
-		t.Fatalf("AddClass bulk: %v", err)
+	// Installed through Shaper, not by hand, so what is read back is what the
+	// shipped code path produces.
+	if ok, reason := NewShaper(nil, nil).Apply(context.Background(), dev, 115); !ok {
+		t.Fatalf("Apply: %s", reason)
 	}
 
 	link, err := netlink.LinkByName(dev)
@@ -119,36 +112,41 @@ func TestNetlinkInstallsTheHierarchyAndReadsItBack(t *testing.T) {
 	newDummyDevice(t, dev)
 
 	ops := NetlinkOps{}
-	if err := ops.ClearRoot(dev); err != nil {
-		t.Fatalf("ClearRoot: %v", err)
-	}
-	if err := ops.AddRootHTB(dev); err != nil {
-		t.Fatalf("AddRootHTB: %v", err)
-	}
-	if err := ops.AddClass(dev, PriorityClass, RootHandle, 41, 115); err != nil {
-		t.Fatalf("AddClass priority: %v", err)
-	}
-	if err := ops.AddClass(dev, BulkClass, RootHandle, 74, 74); err != nil {
-		t.Fatalf("AddClass bulk: %v", err)
-	}
-	if err := ops.AddLeaf(dev, PriorityClass, PriorityLeaf); err != nil {
-		t.Fatalf("AddLeaf priority: %v", err)
-	}
-	if err := ops.AddLeaf(dev, BulkClass, BulkLeaf); err != nil {
-		t.Fatalf("AddLeaf bulk: %v", err)
+	if ok, reason := NewShaper(nil, nil).Apply(context.Background(), dev, 115); !ok {
+		t.Fatalf("Apply: %s", reason)
 	}
 
 	present, err := ops.Present(dev)
-	if err != nil {
-		t.Fatalf("Present: %v", err)
-	}
 	if !present {
 		t.Error("Present reports no shaping qdisc on a device we just installed one on")
 	}
 
-	// Reinstalling over an existing hierarchy must work, which is what makes this
-	// idempotent across restarts. ClearRoot is called first by Apply, so this also
-	// exercises the delete path against a real qdisc.
+	// And that the leaves are attached where they belong: one per class, parented
+	// to it. An HTB class with no leaf cannot be scheduled, so a missing leaf is a
+	// hierarchy that looks installed and does not shape.
+	link, err := netlink.LinkByName(dev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	qdiscs, err := netlink.QdiscList(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leaves := map[uint32]uint32{} // parent -> leaf handle
+	for _, q := range qdiscs {
+		if _, ok := q.(*netlink.FqCodel); ok {
+			leaves[q.Attrs().Parent] = q.Attrs().Handle
+		}
+	}
+	if leaves[PriorityClass] != PriorityLeaf {
+		t.Errorf("priority leaf = %s, want %s", HandleString(leaves[PriorityClass]), HandleString(PriorityLeaf))
+	}
+	if leaves[BulkClass] != BulkLeaf {
+		t.Errorf("bulk leaf = %s, want %s", HandleString(leaves[BulkClass]), HandleString(BulkLeaf))
+	}
+
+	// Removing the hierarchy must actually remove it, which is the read-back that
+	// detects "the call returned nil and the effect is not there".
 	if err := ops.ClearRoot(dev); err != nil {
 		t.Fatalf("ClearRoot over an existing hierarchy: %v", err)
 	}
@@ -161,22 +159,40 @@ func TestNetlinkInstallsTheHierarchyAndReadsItBack(t *testing.T) {
 	}
 }
 
-// Clearing a device that never had one is success, not an error.
+// End to end, through Shaper, on a device that has never been shaped.
 //
-// With tc this was a substring match on three known messages, one of which was
-// documented as dangerous to match loosely. It is now ENOENT.
-func TestNetlinkClearRootOnAnUnshapedDeviceIsSuccess(t *testing.T) {
+// This is the case that used to be a substring match on tc's stderr. The first
+// Apply clears a hierarchy that does not exist, and every fresh interface carries
+// a handle-zero `noqueue` qdisc that the kernel answers EINVAL to -- so a fresh
+// device is the exact case most likely to be mishandled, and it is the case that
+// decides whether shaping works on first boot or only after a manual tc run.
+func TestShaperAppliesToAFreshDeviceAndIsIdempotent(t *testing.T) {
 	netnsAvailable(t)
 	const dev = "shapetest2"
 	newDummyDevice(t, dev)
 
-	if err := (NetlinkOps{}).ClearRoot(dev); err != nil {
-		t.Errorf("ClearRoot on a device with no hierarchy returned %v, want nil", err)
+	s := NewShaper(nil, nil)
+
+	ok, reason := s.Apply(context.Background(), dev, 115)
+	if !ok {
+		t.Fatalf("first Apply on a fresh device failed: %s", reason)
 	}
-	// And twice, to be sure it is genuinely idempotent rather than accidentally
-	// matching the first call.
-	if err := (NetlinkOps{}).ClearRoot(dev); err != nil {
-		t.Errorf("second ClearRoot returned %v, want nil", err)
+	present, err := (NetlinkOps{}).Present(dev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !present {
+		t.Error("Present reports no shaping qdisc after a successful Apply")
+	}
+
+	// Applying again must work over the hierarchy the first call installed, or a
+	// restart silently degrades shaping.
+	ok, reason = s.Apply(context.Background(), dev, 115)
+	if !ok {
+		t.Fatalf("second Apply over an existing hierarchy failed: %s", reason)
+	}
+	if !s.Active() {
+		t.Error("Active() is false after two successful Apply calls")
 	}
 }
 

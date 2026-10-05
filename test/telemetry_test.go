@@ -247,7 +247,7 @@ func TestSelectedFixRequiresASelectedReceiver(t *testing.T) {
 func TestLinkInactiveReasonReachesTheWire(t *testing.T) {
 	s := worstCaseSnapshot()
 	s.Link.ShapingActive = false
-	s.Link.InactiveReason = "sudo: a password is required"
+	s.Link.InactiveReason = "could not install the root HTB qdisc on wlan0: permission denied. Link shaping needs CAP_NET_ADMIN"
 
 	f := transport.EncodeTelemetry(s)
 	if got := f.GetLink().GetInactiveReason(); got != s.Link.InactiveReason {

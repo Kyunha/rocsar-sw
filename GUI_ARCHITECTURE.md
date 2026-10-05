@@ -276,10 +276,14 @@ reason.** A GUI makes this easy to get wrong, because a slider or a row of
 buttons can each fire an event. Refusing is deliberate — silently queueing
 operator clicks turns "I pressed jog" into "jog happened at some point".
 
-A command queued while the link is down is **dropped, not queued**. It fails
-with `NOT_CONNECTED`. A jog issued when the link dies must not be executed when
-the link returns, an indeterminate time later, at a bearing the operator has
-since forgotten.
+A command queued while the link is down is **dropped, not queued**. It fails with
+`client.ErrNotConnected` -- a Go sentinel, not a synthesised `CommandResponse`
+carrying `NOT_CONNECTED`. That code is a wire error the OBC puts in a reply, and
+manufacturing one locally for a reply the OBC never sent would be a lie about
+where the refusal came from. The operator-visible sentence is the same either
+way; the provenance is honest this way. A jog issued when the link dies must not
+be executed when the link returns, an indeterminate time later, at a bearing the
+operator has since forgotten.
 
 ### 6.5 Reconnect
 

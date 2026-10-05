@@ -58,9 +58,15 @@ type Queue struct {
 	// sem bounds the depth: one in flight plus one queued. Acquired
 	// non-blockingly; a full semaphore is the refusal, not a wait.
 	sem chan struct{}
-	mu  sync.Mutex
-	// sock is nil when down. Guarded by mu; every send, receive, dial and
-	// close happens under it.
+	// mu serialises submissions. Held for the whole exchange.
+	mu sync.Mutex
+	// sockMu guards only the socket pointer, and only briefly. Close takes
+	// sockMu and never mu, so closing while a Submit is inside never blocks
+	// behind it: the socket is closed under the blocked Recv, which fails at
+	// once instead of running to its timeout. Lock order, where both are
+	// held, is always mu then sockMu, never the reverse.
+	sockMu sync.Mutex
+	// sock is nil when down.
 	sock zmq4.Socket
 
 	// bo spaces re-attempts after a failure: 1 s, 2 s, 4 s, capped at 8 s.
@@ -139,23 +145,16 @@ func (q *Queue) Submit(ctx context.Context, req *rocsarv1.CommandRequest) (*rocs
 		return nil, fmt.Errorf("%w (last failure: %s)", ErrNotConnected, q.lastErr)
 	}
 
-	if q.sock == nil {
-		sock := zmq4.NewDealer(context.Background(), zmq4.WithTimeout(q.cmdTimeout))
-		if err := sock.Dial(q.cfg.Control); err != nil {
-			_ = sock.Close()
-			q.failLocked(fmt.Sprintf("dial %s: %s", q.cfg.Control, err))
-			return nil, fmt.Errorf("%w: %s", ErrNotConnected, err)
-		}
-		q.sock = sock
+	if !q.ensureDialedLocked() {
+		return nil, fmt.Errorf("%w: %s", ErrNotConnected, q.lastErr)
 	}
 
-	resp, err := roundTrip(q.sock, req, q.cmdTimeout)
+	resp, err := roundTrip(q.socket(), req, q.cmdTimeout)
 	if err != nil {
 		// The socket is suspect now: a failed exchange may have left a partial
 		// envelope on either side, and the next command must not read this
 		// one's reply. Drop it; the next Submit redials.
-		_ = q.sock.Close()
-		q.sock = nil
+		q.dropSocket()
 		q.failLocked(err.Error())
 		return nil, err
 	}
@@ -164,13 +163,53 @@ func (q *Queue) Submit(ctx context.Context, req *rocsarv1.CommandRequest) (*rocs
 	return resp, nil
 }
 
+// ensureDialedLocked dials when down. False means the dial itself failed, in
+// which case lastErr names it and a fail-fast window is already open. Call
+// with mu held.
+func (q *Queue) ensureDialedLocked() bool {
+	q.sockMu.Lock()
+	defer q.sockMu.Unlock()
+	if q.sock != nil {
+		return true
+	}
+	sock := zmq4.NewDealer(context.Background(), zmq4.WithTimeout(q.cmdTimeout))
+	if err := dialBounded(sock, q.cfg.Control, q.cmdTimeout); err != nil {
+		// Close the abandoned handle: a handshake that completes late must
+		// land on a closed socket, never join this one as a second connection.
+		_ = sock.Close()
+		q.failLocked(err.Error())
+		return false
+	}
+	q.sock = sock
+	return true
+}
+
+// socket returns the live socket, or nil. Brief lock; the caller must not hold
+// it across the exchange.
+func (q *Queue) socket() zmq4.Socket {
+	q.sockMu.Lock()
+	defer q.sockMu.Unlock()
+	return q.sock
+}
+
+// dropSocket closes and forgets the live socket, if any.
+func (q *Queue) dropSocket() {
+	q.sockMu.Lock()
+	defer q.sockMu.Unlock()
+	if q.sock != nil {
+		_ = q.sock.Close()
+		q.sock = nil
+	}
+}
+
 // failLocked opens a fail-fast window. Call with mu held.
 //
-// TCP dial is asynchronous, so "the link is down" almost never fails at Dial:
-// the dial succeeds and the exchange times out instead. Without the window,
-// every click during an outage would burn a full exchange timeout and pile up
-// behind the semaphore. With it, the first failure costs one timeout and the
-// rest fail at once, until the window expires and the next click probes again.
+// A refused dial fails fast on its own -- go-zeromq attempts the connect
+// synchronously -- but a blackholed address does not: the dial succeeds and
+// the exchange burns a full timeout instead. Without the window, every click
+// during such an outage would cost a full exchange timeout and pile up behind
+// the semaphore. With it, the first failure costs one timeout and the rest fail
+// at once, until the window expires and the next click probes again.
 func (q *Queue) failLocked(reason string) {
 	q.downUntil = time.Now().Add(q.bo.next())
 	q.lastErr = reason
@@ -189,16 +228,13 @@ func (q *Queue) State() LinkState {
 	}
 }
 
-// Close releases the socket. A Submit already in flight runs to its own
-// timeout; Close does not interrupt it, for the same reason ctx cannot --
-// there is no cancellable receive to interrupt it with.
+// Close releases the socket. It never blocks behind a Submit: the socket is
+// closed under any exchange in progress, whose Recv fails at once instead of
+// running to its timeout. A test that fails mid-submit must still tear down,
+// and a Close that hangs behind the command it is trying to abandon is a
+// deadlock wearing a method signature.
 func (q *Queue) Close() {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	if q.sock != nil {
-		_ = q.sock.Close()
-		q.sock = nil
-	}
+	q.dropSocket()
 }
 
 func (q *Queue) setInFlight(n int) {

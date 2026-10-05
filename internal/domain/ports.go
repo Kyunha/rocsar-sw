@@ -123,13 +123,15 @@ type SdrParamsPatch struct {
 
 // LinkShaper is the kernel traffic control interface.
 //
-// Set never returns an error that stops the caller. tc fails for dozens of
-// reasons unrelated to our logic -- sudo without a password, tc not installed,
-// wrong interface, kernel without HTB -- and none of them justify taking down a
-// telemetry server. Every method returns (ok, message) so the reason reaches the
-// operator and the rest of the system keeps running.
+// Set never returns an error that stops the caller. Traffic control fails for
+// dozens of reasons unrelated to our logic -- no CAP_NET_ADMIN, wrong interface,
+// a kernel without HTB -- and none of them justify taking down a telemetry server.
+// Every method returns (ok, message) so the reason reaches the operator and the
+// rest of the system keeps running.
 type LinkShaper interface {
-	// Apply installs the HTB hierarchy and the flower filter.
+	// Apply installs the HTB rate cap. It does not install a classification
+	// filter: the one that used to be here classified nothing (see qos.Apply and
+	// ARCHITECTURE.md 6.6), and the port has no method that could add one back.
 	Apply(ctx context.Context, device string, rateKbps uint32) (bool, string)
 	// Active reports whether shaping is currently in force.
 	Active() bool
@@ -137,7 +139,7 @@ type LinkShaper interface {
 	Status() LinkStatus
 	// QdiscPresent reads the device back from the kernel. The absence of this
 	// read-back is why an unnoticed classification failure can persist: the
-	// commands succeed and the traffic still lands in the wrong class.
+	// calls succeed and the traffic still lands in the wrong class.
 	QdiscPresent(ctx context.Context, device string) (bool, error)
 }
 

@@ -31,10 +31,10 @@ type Capture struct {
 
 	quality int
 
-	mu     sync.Mutex
-	state  domain.SubsystemState
-	shots  uint64
-	last   string
+	mu    sync.Mutex
+	state domain.SubsystemState
+	shots uint64
+	last  string
 }
 
 var _ domain.Camera = (*Capture)(nil)

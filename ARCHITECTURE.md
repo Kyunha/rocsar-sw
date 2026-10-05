@@ -6,9 +6,18 @@ this document in the same commit that changes the behaviour.
 
 ## 0. Precedence
 
-This document outranks every other file in the repository. In particular it
-outranks `NOTES.md`, which is a description of *frozen binary contracts* and is
-updated only when a wire format changes.
+This document outranks every other file in the repository, with one exception:
+`GUI_ARCHITECTURE.md` **amends** this document for the Ground Station console. The
+console is specified there in detail — its link library, its settings, its
+interaction model — and this document defers to it on those points rather than
+duplicating and contradicting it. Every subsystem, link and constraint owned by the
+OBC is governed here and is not negotiable from there.
+
+`NOTES.md`, named in earlier revisions as the authority on *frozen binary
+contracts*, does not exist (§2). The contracts it would have held are in
+`firmware/` (§4.4) and are pinned by tests that decode real bytes, which is the
+stronger guarantee: the file could describe the struct, the test can prove the
+consumer reads it correctly.
 
 The previous `NOTES.md` in `obc_rocsar/` was wrong in a way that shipped a broken
 product: it documented GNSS latitude and longitude as arriving in radians when
@@ -33,17 +42,17 @@ Four computers and one radio link are involved:
 | :--- | :--- | :--- |
 | **OBC** | Raspberry Pi 4B | Process of record. Owns the SSD, the SDR, the camera, and the link to the operator. |
 | **Flight controller** | RP2040 Pico | Real-time control loop at 50 Hz. Owns the IMU, the servo bus and the heaters. |
-| **GS** | Operator laptop | PySide6 console. Telemetry display and command surface. |
+| **GS** | Operator laptop | Go console (`tools/gs_cli`, over `internal/client`). Telemetry display and command surface. |
 | **SDR** | Ettus B200mini | SAR acquisition, USB to the OBC. |
 | **GNSS ×3** | u-blox receivers | Redundant positioning, `Read_uB` on the Pi. |
 
 ```
 +---------------------------------------------------------------------------+
-|  GROUND STATION  (PySide6, operator laptop)                              |
+|  GROUND STATION  (Go console on the operator laptop)                      |
 |    ZMQ DEALER -> :5555        ZMQ SUB <- :5556        HTTP <- :5557       |
 +---------------------------------------------------------------------------+
                                    |
-                    Ethernet, shaped by tc to 115 kbit/s
+                    Ethernet, shaped by HTB (rtnetlink) to 115 kbit/s
                                    |
 +---------------------------------------------------------------------------+
 |  OBC  (Raspberry Pi 4B, Go)                                              |
@@ -57,10 +66,10 @@ Four computers and one radio link are involved:
 |    +----+---------------+---------------+---------------+----+            |
 |         |               |               |               |                 |
 |    +--------+     +--------+     +--------+     +---------+ +--------+     |
-|    |  gnss  |     |  pico  |     | camera |     |   sdr   | | tc/qos |     |
+|    |  gnss  |     |  pico  |     | camera |     |   sdr   | |   qos   |     |
 |    +--------+     +--------+     +--------+     +---------+ +--------+     |
 |         |              |              |              |                     |
-|   UDP :2001-3     USB serial     V4L2 /dev/*     USB + ./connect            |
+|   UDP :2001-3     USB serial     fswebcam       USB + ./connect            |
 +---------------------------------------------------------------------------+
                                    |
                      USB CDC, COBS-framed protobuf, 115200
@@ -93,8 +102,7 @@ are wrong.
 ```
 rocsar/
 ├── ARCHITECTURE.md          ← this document
-├── NOTES.md                 ← frozen binary contracts (GNSS struct, COBS framing)
-├── README.md                ← how to build, run and flash
+├── GUI_ARCHITECTURE.md      ← the Ground Station console, in detail. §14 notes where it amends this document.
 ├── go.mod                   ← module github.com/rocsar/obc
 ├── rocsar.toml              ← configuration, read by the OBC and the GS
 ├── buf.yaml                 ← buf workspace
@@ -102,29 +110,35 @@ rocsar/
 ├── api/
 │   ├── buf.yaml             ← module `rocsar`, root here
 │   └── rocsar/v1/*.proto    ← THE schema. one source of truth.
-├── cmd/obc/main.go          ← composition root: the only place adapters are chosen
 ├── internal/
 │   ├── domain/              ← types and Port interfaces. imports nothing external.
 │   ├── gnss/                ← UDP receiver bank
 │   ├── pico/                ← COBS + protobuf + serial link to the flight controller
-│   ├── camera/              ← V4L2 snapshot
+│   ├── camera/              ← fswebcam snapshot
 │   ├── sdr/                 ← params.json, ./connect lifecycle, probe, USB reset
 │   ├── storage/             ← data directory, atomic placement
 │   ├── telemetry/           ← 1 Hz aggregate assembly. no I/O.
-│   ├── qos/                 ← userspace priority queue + token bucket
-│   └── transport/           ← ZMQ + HTTP. the only packages that import the wire.
+│   ├── qos/                 ← HTB link shaping over rtnetlink. no userspace queue.
+│   ├── transport/           ← ZMQ + HTTP, and the artefact download limiter (§6.6)
+│   └── client/              ← the GS link library: subscribe, command, artefacts
 ├── firmware/                ← the .ino, gondola_model.h, pico_wire.h, generated C
 ├── third_party/
 │   ├── Read_uB/             ← vendored, unmodified. §10.
 │   └── sdr-ettus-b200mini/  ← vendored, unmodified. §10.
-├── gs/                      ← Python: generated stubs, client, view model, Qt app
-├── tools/                   ← bench tools that need no server
+├── gs/                      ← Python: generated protobuf stubs only (§14)
+├── tools/                   ← gs_cli (the GS console), camera_bench, gs_probe
 └── test/                    ← architecture boundary tests
 ```
 
-Generated code is committed for the Python side (`gs/rocsar_pb2/`) because the
-Ground Station must be installable on an operator laptop without a toolchain.
-Go code is generated at build time and gitignored.
+Generated Python code is committed (`gs/rocsar/v1/*_pb2.py`) so that a Python
+subscriber can be installed on an operator laptop without a toolchain. The Ground
+Station itself is Go and needs no generated code at runtime.
+
+`NOTES.md` and `README.md` are listed in earlier revisions of this document and do
+not exist. The binary contracts they were meant to hold are in `firmware/` (§4.4)
+and are pinned by tests in `test/` (§12), which is the stronger guarantee; build and
+run instructions live in the repository's commit history and in `scripts/` until the
+two files are written.
 
 ---
 
@@ -138,12 +152,16 @@ One direction. Never the reverse. Concretely:
 
 - `internal/transport` may call `domain.CommandHandler`. It may not open a serial
   port, spawn a process, or touch a camera.
+- `internal/client` is the Ground Station's mirror of `internal/transport`: it owns
+  the wire for the GS side, and it may not reach into any subsystem adapter.
 - `internal/domain` and `internal/telemetry` import **nothing** from outside the
   standard library and nothing from `api/rocsar/v1`. They do not know that
   protobuf exists.
 - Hardware and wire formats are declared as interfaces **in the package that
   consumes them**, so the dependency points from user to implementation.
-- `os/exec` appears in exactly two packages: `internal/sdr` and `internal/qos`.
+- `os/exec` appears in exactly two packages: `internal/sdr` and `internal/camera`.
+  This section previously named `internal/qos`, which no longer shells out at all
+  (§6.6).
 
 This is enforced mechanically, not by discipline. See §12.
 
@@ -157,7 +175,11 @@ real implementation and a mock; a test asserts both exist.
 | `Pico` | `pico.Link` | `pico.Mock` |
 | `Camera` | `camera.Capture` | `camera.Mock` |
 | `Sdr` | `sdr.Service` | `sdr.Mock` |
-| `LinkShaper` | `qos.TcShaper` | `qos.NullShaper` |
+| `LinkShaper` | `qos.Shaper` | `qos.NullShaper` |
+
+`qos.TcShaper` was the type name while the adapter ran `tc`. There is no `tc` in
+`qos` now (§6.6), so the adapter is `qos.Shaper` and the netlink calls behind it
+are `qos.NetlinkOps`.
 | `Shutdown` | `pico.Link` | *(none — see below)* |
 
 There is no `GnssReceiver` port. It was declared, nothing consumed it — the bank
@@ -188,7 +210,7 @@ into the RP2040 binary even though they share a package.
 | `common.proto` | `ErrorCode`, `FeedbackState`, `SubsystemState`, `AntennaAxis` |
 | `command.proto` | Every command the GS can send, as one `Command` with a `oneof` |
 | `telemetry.proto` | `TelemetryFrame` — the 1 Hz aggregate |
-| `protocol.proto` | `PicoMessage` (the COBS payload), `CommandRequest`, `CommandResponse` |
+| `pico.proto` | `PicoMessage` (the COBS payload), `PicoCommand`, `PicoTelemetry`, `PicoAck` |
 
 ### 4.2 The Pico envelope
 
@@ -202,8 +224,10 @@ already uses, deliberately: `sequence` + `timestamp_us` + a `oneof` of
 ```
 buf generate
   ├── go       → api/rocsar/v1/*.pb.go            (OBC)
-  ├── python   → gs/rocsar_pb2/                   (GS, committed)
-  └── nanopb   → firmware/rocsar.pb.{c,h}         (RP2040)
+  └── python   → gs/rocsar/v1/*_pb2.py            (Python subscribers, committed)
+
+scripts/generate.sh, firmware target only (RP2040):
+  └── nanopb   → firmware/common.pb.{c,h}, firmware/pico.pb.{c,h}
 ```
 
 The nanopb plugin is the **vendored binary** at
@@ -213,9 +237,10 @@ and nanopb is pinned to the exact version the firmware was validated against.
 
 Two options files:
 
-- `rocsar.options` — nanopb. `TelemetryMessage.antennas max_count:2`. Without it
-  the generated C struct grows without bound and the RP2040 runs out of RAM.
-- *(no GS options file needed — the GS uses generated Python, not nanopb.)*
+- `pico.options` — nanopb, referenced by path from the generation script. It caps
+  repeated fields (`PicoTelemetry.antennas max_count:2`); without it the generated
+  C struct grows without bound and the RP2040 runs out of RAM.
+- *(no GS options file needed — the GS is Go; the Python side uses generated stubs.)*
 
 The nanopb generation runs a **separate buf invocation** over a restricted file
 set (§4.4), so `command.proto`'s ground-station messages cannot reach the
@@ -231,9 +256,10 @@ rocsar/v1/pico.proto        (PicoMessage, PicoCommand, PicoTelemetry, PicoAck)
 ```
 
 `rocsar/v1/command.proto` and `rocsar/v1/telemetry.proto` are **excluded** from
-firmware generation. This is enforced by the generation script listing files
-explicitly, and asserted by a test that greps `firmware/rocsar.pb.c` for the
-ground-station type names.
+firmware generation. The generation script lists the firmware protos explicitly and
+fails if an unexpected `.c` file appears in `firmware/`. An earlier revision of this
+document also claimed a Go test grepped the generated C for ground-station type
+names; no such test exists, and the script-level check is what is actually enforced.
 
 ---
 
@@ -261,9 +287,22 @@ sequence` (§5.2), because the Pico is a different machine with its own counter.
 
 **Topic frame on PUB.** Telemetry is `[topic, frame]`. ZeroMQ `SUBSCRIBE` filters
 on frame prefix, so putting the topic in its own leading frame makes the filter
-exact. The topic is one of `telemetry.system`, `telemetry.gnss`,
-`telemetry.pico`, `telemetry.sdr`, `telemetry.camera` — the aggregate frame
-carries all of them, and the topic lets a GS subscribe to a subset.
+exact.
+
+**Exactly one topic is published: `telemetry`.** An earlier revision of this
+document described five topics (`telemetry.system`, `telemetry.gnss`,
+`telemetry.pico`, `telemetry.sdr`, `telemetry.camera`) and said the topic let a GS
+subscribe to a subset. That is not what the code does and it is not what the
+aggregate frame is for: `TelemetryFrame` is one message carrying the whole 1 Hz
+picture, so there is nothing to subscribe to selectively. `qos.AllTopics()` returns
+`["telemetry"]` and `cmd/obc` publishes only that.
+
+`qos` declares a second constant, `TopicControl` = `control.response`, which no
+publisher or subscriber references anywhere in the tree. It is left in place rather
+than deleted because it names a topic the command path is *intended* to need, and
+deciding whether commands belong on the PUB socket is a design question, not a
+cleanup. Until something publishes or subscribes to it, it is inert: it is not on
+the wire and nothing depends on it.
 
 **Slow joiner.** A SUB that connects mid-stream receives the queued backlog. A GS
 measuring rate must discard its first `SLOW_JOINER_FRAMES` frames or it will
@@ -307,7 +346,8 @@ separate constants in separate packages and a comment at each site says so.
 ### 6.1 GNSS
 
 Three `Read_uB` instances send a 142-byte `UDP_message` to `127.0.0.1` on ports
-`2001`, `2002`, `2003`. The layout is frozen and documented in `NOTES.md`.
+`2001`, `2002`, `2003`. The layout is frozen and pinned by `test/gnss_test.go`,
+which decodes the real 142 bytes (§0).
 
 **Units.** Latitude, longitude and heading arrive in **degrees**. The producer
 converts before sending. The decoder must not convert again. This is stated here
@@ -326,7 +366,9 @@ is trusted. The selected receiver's fix goes into telemetry; the others do not.
 
 **Staleness.** A fix older than `gnss_stale_after` is reported with
 `fix_ok=false` even though the last decoded value was valid. An old fix is worse
-than no fix.
+than no fix. The threshold is the `gnss.stale_after` config key (default `2s`);
+this section previously called it `gnss_stale_after`, which is not a key that
+exists.
 
 **A second datagram exists and is out of scope.** `Read_uB.cpp:357` also sends a
 420-byte `#pragma pack(1) NavData` on a separate socket, carrying `flags`,
@@ -351,9 +393,18 @@ The GS then fetches the bytes over HTTP. There is no live stream: it consumed
 bandwidth that constraint H1 does not have, in exchange for a picture nobody
 needed continuously.
 
-The V4L2 binding is hand-written `syscall`/`unsafe` struct definitions. That is
-unavoidable — there is no maintained Go V4L2 package — and it is the reason the
-struct layout has its own test.
+Capture shells out to `fswebcam`. The hand-written V4L2 binding — `syscall`/`unsafe`
+struct definitions against `/dev/video0`, which was the camera adapter before — is
+**deleted**, along with its layout test. It was hand-written because there is no
+maintained Go V4L2 package, and that is exactly the argument for not doing it: the
+struct layout was an untestable liability maintained for the sake of a JPEG that
+`fswebcam` produces in one line.
+
+This is a reduction in capability, recorded as such: nothing can now set format,
+resolution or exposure through the OBC. If a capture needs tuning that
+`fswebcam` cannot express, the honest fix is a maintained capture package, not a
+resurrected struct definition. `camera.device` still defaults to `/dev/video0`
+because that is the device `fswebcam` reads.
 
 ### 6.4 SDR
 
@@ -368,7 +419,8 @@ The shape `obc_rocsar/sdr_service.go` described, cleaned up:
 - `sdr_reset_usb` shells out to `uhubctl` for a power cycle.
 - `sdr_probe` returns `uhd_usrp_probe` output verbatim.
 
-`os/exec` is confined to this package (plus `qos` for `tc`).
+`os/exec` is confined to this package (plus `camera`, which runs `fswebcam`).
+`qos` no longer shells out at all — see §6.6.
 
 ### 6.5 Telemetry
 
@@ -401,9 +453,11 @@ root htb
 └── 1:20  bulk       rate <link_rate - 41.4>bit        ← artefacts, HTTP
 ```
 
-Unclassified traffic defaults to **1:10**, so a device with no classifier still
-gives telemetry a floor rather than dumping everything into the class named
-"bulk".
+The root's default class is **1:10**, so a device with no classifier still gives
+telemetry a floor rather than dumping everything into the class named "bulk".
+Handles are fixed (`1:`, `1:10`, `1:20`, `110:`, `120:`) so that telemetry can name
+them the way an operator reads them out of `tc qdisc show`; `HandleString` formats
+them the same way rather than as decimal.
 
 #### No classifier ships
 
@@ -434,31 +488,74 @@ traffic is NOT classified"* so that `shaping_active` is never mistaken for a
 priority class that does something.
 
 **What replaced it for the minimal system:** artefact downloads are bounded
-**in-process**, by a token bucket on the HTTP copy path driven by
-`qos.bulk_rate_bps`. That is the traffic that was actually starving telemetry. It
-is not link shaping — it cannot constrain the SDR, a system service, or anything
-else on the box, and it back-pressures rather than prevents.
+**in-process**, by a `golang.org/x/time/rate` limiter on the HTTP copy path
+(`internal/transport/limiter.go`, driven by `qos.bulk_rate_bps`). That is the
+traffic which was actually starving telemetry. It is not link shaping — it cannot
+constrain the SDR, a system service, or anything else on the box, and it
+back-pressures rather than prevents.
+
+This limiter is a hand-rolled token bucket no longer: it delegates to
+`x/time/rate`, a maintained library, rather than reimplementing arithmetic that is
+easy to get subtly wrong. It keeps two behaviours the library does not give for
+free: reads are granted in `quantum`-sized chunks so the HTTP path is not woken
+once per buffer, and a grant is capped at `min(len(p), quantum, burst)`.
+
+That cap is a bug fix, not an optimisation. The old bucket computed its wait from
+`burst` and `rate` and then handed the reader `burst` bytes regardless of how many
+were asked for. Below 512 B/s the quantum exceeded the burst, so the bucket
+granted more than it had and the reader blocked forever. The low-rate case is now
+covered by a test that exercises a rate the old code could not survive.
 
 **Deferred to its own module.** Per-class link constraint needs a classifier that
 demonstrably matches on this interface. Candidates, none yet proven here: `u32`
 on the TCP port, `net_cls` on the artefact server's cgroup, or nftables. Choosing
 between them by guesswork is how the flower filter came to be written.
 
-`tc` fails for dozens of reasons unrelated to our logic — no passwordless sudo,
-`tc` absent, wrong interface, kernel without HTB. **None of them justify taking
-down a telemetry server.** `TcShaper.Set` always returns `(ok, message)` and never
-raises. Every `tc` invocation has a 5-second timeout, because `sudo` waiting for
-a password on a Pi with no TTY blocks forever, and a blocked telemetry server is
-worse than an unshaped one.
+#### Installed over rtnetlink, not `tc`
 
-`tc qdisc del` on a device with no qdisc returns an error, and for us that
-error is *success*. Detection is anchored on the exact text
-(`RTNETLINK answers: No such file or directory`, `Cannot delete qdisc`) because
-"executable not found" contains a similar substring and would otherwise be read
-as "there was no rule", reporting success when `tc` does not exist at all.
+Every `tc` subprocess is **deleted**. Shaping is applied through
+`github.com/vishvananda/netlink`, which speaks the kernel's own netlink socket
+directly, and it sits behind the `qos.KernelOps` interface so the two implementations
+can be swapped in one file.
 
-The shaper requires `CAP_NET_ADMIN`. The systemd unit carries it. Without it the
-OBC runs unshaped and says so in telemetry rather than refusing to start.
+The subprocess version was the fragile part, not the shaping:
+
+- `sudo` on a Pi with no TTY blocks forever waiting for a password. A 5-second
+  timeout per invocation was the mitigation, and it was a mitigation for a
+  failure the design did not need to have.
+- **`tc` fails for dozens of reasons unrelated to our logic** — absent binary,
+  wrong interface, kernel without HTB, a non-interactive sudo — and detection was
+  anchored on matching English error text. `"executable not found"` and
+  `"Cannot delete qdisc"` are substrings of each other's failure modes, so the
+  shaper could report a healthy device that it had never actually touched.
+- `tc qdisc del` on a device with no qdisc *errors*, and for us that error is
+  success. Distinguishing "nothing to clear" from "the tool is missing" by string
+  matching is the exact fragility being removed.
+
+Netlink removes all of it: there is no subprocess, no PATH lookup, no password
+prompt, no timeout, and no text parsing. Errors are `syscall.Errno`, so
+"not there" is `ENOENT`/`EINVAL` and is not confused with "tool missing".
+
+The shaper requires `CAP_NET_ADMIN`, and says so in telemetry when it lacks it —
+the OBC runs unshaped rather than refusing to start.
+
+Three behaviours the implementation had to get right, all pinned by tests in
+`internal/qos`:
+
+1. **Root qdisc add/delete needs `netlink.HANDLE_ROOT`.** Passing a zero `Parent`
+   returns `ENOENT`, because `0` names no qdisc.
+2. **A fresh interface reports deleting its handle-zero `noqueue` qdisc as
+   `EINVAL`.** "No hierarchy here" is `ENOENT`/`EINVAL`; both are treated as
+   *absent*, never as failure.
+3. **Netlink rates are bits per second.** `NewHtbClass` divides by 8 internally, so
+   passing kbit/s as a bits/s value silently sets the rate 8× too high. The layer
+   converts once, at the edge.
+
+Leaves are `fq_codel`, not `pfifo limit N`. The netlink binding cannot express a
+`pfifo` byte limit, so the leaves get CoDel's fair queueing with no explicit queue
+length. This is a real, if small, deviation from the intended design: the classes
+are what enforce the rates, but the queues no longer bound latency the way a
+sized `pfifo` would. It is recorded here rather than described as intended.
 
 **There is no userspace priority queue, and this section previously claimed
 there was.** A two-class limiter (`PriorityHigh` bypass, `PriorityBulk`
@@ -474,9 +571,17 @@ limiter with one class is a token bucket around everything. The kernel hierarchy
 is the only thing doing useful work, and it is the only thing that can: it shapes
 traffic this process does not own.
 
-If a bulk publisher ever appears on the ZeroMQ socket, the userspace queue comes
-back — the seam is `qos.Limiter` and the reason it was removed is recorded here
+A previous revision named `qos.Limiter` as the seam where a userspace priority
+queue would return if a bulk publisher ever appears on the ZeroMQ socket. No such
+type exists; the deleted queue was in `internal/qos` and the limiter that remains
+lives in `internal/transport` (§6.6). The reason it was removed is recorded here
 rather than left as an absence nobody can explain.
+
+The classifier question is still open, and netlink did not close it. Installing
+HTB over netlink is easier than `tc` was; *choosing which class a packet belongs
+to* is a separate problem that netlink makes no easier. `net_cls` remains the
+strongest candidate, because it needs a cgroup and the artefact server can be run
+as its own process — but it is untested on this interface and stays deferred.
 
 The published topic vocabulary (`qos.TopicTelemetry`, `qos.TopicControl`) stays:
 it is the wire contract in §5.1, not part of the limiter.
@@ -502,7 +607,7 @@ absent or complete — which is the property that actually matters.
 | `gnss-rx-1..3` | one UDP socket each | mutate anything |
 | `pico-rx` | serial read side | write to the port |
 | `pico-tx` | serial write side, the sequence counter | read from the port |
-| `camera` | the V4L2 device | touch the network |
+| `camera` | the `fswebcam` child process | touch the network |
 | `sdr` | the child process, `params.json` | block the command path |
 | `telemetry` | the 1 Hz ticker | perform I/O in assembly |
 | `zmq-control` | the ROUTER socket | touch the PUB socket |
@@ -585,7 +690,7 @@ tells them everything.
 | GS disconnects | OBC unaffected. Telemetry publishes to nobody. Commands queue nowhere. |
 | Pico unplugged | `SubsystemState.DISCONNECTED`. The Pico, if alive, holds its last bearing. The OBC does not retry silently — the state is reported. |
 | Pico stops answering | ACK timeout counted, `feedback_state` degrades to `HELD`, `imu_present` stays true (fitted, not answering). |
-| GNSS receiver silent | `fix_ok=false` after `gnss_stale_after`; the other receivers are unaffected; the selected one stays selected. |
+| GNSS receiver silent | `fix_ok=false` after `gnss.stale_after`; the other receivers are unaffected; the selected one stays selected. |
 | GNSS receiver returns garbage | The datagram is rejected and counted in `reject_count`. Not published. |
 | Camera missing | `DISCONNECTED`. `take_photo` returns an error with a real reason. |
 | SDR missing | `DISCONNECTED`. `sdr_connect` returns an error. Everything else runs. |
@@ -650,8 +755,10 @@ project and an aircraft.
 
 Consequences we accept:
 
-- The 142-byte `UDP_message` is a **frozen contract**. We do not change it, we
-  read it correctly, and `NOTES.md` documents it field by field with the units.
+- The 142-byte `UDP_message` is a **frozen contract**. We do not change it and we
+  read it correctly; `test/gnss_test.go` decodes the real bytes and
+  `TestGNSSDecodesDegreesNotRadians` is the test that exists because getting this
+  wrong shipped a broken product.
 - `Read_uB` also sends a 420-byte `NavData` we do not read (§6.1).
 - The SDR program writes its output relative to its own working directory, so the
   OBC sets the child's CWD explicitly rather than inheriting one.
@@ -691,14 +798,26 @@ becomes a second home for a fact, and two homes drift.
 | `[http]` | `root` | `/mnt/rocsar/data` |
 | `[link]` | `device` | `eth0` |
 | `[link]` | `rate_kbps` | `115` |
-| `[link]` | `shaping` | `true` |
+| `[link]` | `shaping` | `false` |
 | `[pico]` | `port` | `/dev/ttyACM0` |
 | `[pico]` | `baudrate` | `115200` |
 | `[gnss]` | `ports` | `[2001, 2002, 2003]` |
 | `[gnss]` | `selected` | `1` |
+| `[gnss]` | `stale_after` | `2s` |
 | `[camera]` | `device` | `/dev/video0` |
 | `[sdr]` | `program` | `third_party/sdr-ettus-b200mini` |
 | `[telemetry]` | `interval` | `1s` |
+| `[qos]` | `bulk_rate_bps` | `8192` |
+| *(top level)* | `require_hardware` | `false` |
+
+`gnss.stale_after`, `qos.bulk_rate_bps` and `require_hardware` were missing from
+this table in earlier revisions although all three are parsed. `[link] shaping`
+defaulted to `true` here; the code default is `false` (§6.6 — an unshaped link is
+the safe default, and `rocsar.toml` ships `false` with the reasoning inline).
+
+There is no `[gui]` section and no `gui.*` key. `GUI_ARCHITECTURE.md` describes the
+Ground Station console's own settings; none of them are read by the OBC, and
+`[client]` here holds only the two endpoints the GS dials.
 
 `http.addr` used to be load-bearing: the `tc` flower filter classified on
 `dst_port 5557`, so changing the port meant the filter silently stopped matching
@@ -715,7 +834,7 @@ number.
 
 ## 12. How the architecture is kept true
 
-Discipline decays. Three mechanical checks:
+Discipline decays. Five mechanical checks:
 
 1. **Import-graph boundary test.** `test/layering_test.go` parses every `.go`
    file with `go/parser` and fails if `internal/domain` or `internal/telemetry`
@@ -728,35 +847,64 @@ Discipline decays. Three mechanical checks:
 3. **Config completeness test.** Every flag the command registers must appear in
    the configuration table, and every configuration key must be reachable from a
    flag or an environment variable. Adding one without the other fails the build.
+4. **`os/exec` confinement test.** The only packages permitted to spawn a process
+   are `internal/sdr` and `internal/camera`. `internal/qos` was removed from this
+   list when it stopped shelling out (§6.6).
+5. **Generated-protobuf confinement test.** Generated stubs may be imported only
+   by the codec packages. This is what makes "regenerate and the build still
+   works" a property rather than a hope.
 
 Plus a set of **contract tests that decode real bytes**, because a document
 describing a wire format is a guess until something reads it:
 
 | Test | Guards against |
 | :--- | :--- |
-| `TestGNSSDecodesDegrees` | the double-conversion bug that shipped |
-| `TestCOBSRoundTrip` and boundaries | framing corruption at the 254-byte edge |
-| `TestPicoFrameMatchesFirmware` | the Go encoder and the C encoder disagreeing |
-| `TestTelemetryFrameUnderBudget` | the frame outgrowing the priority class |
-| `TestFlowerFilterPresent` | the silent `tc` classification failure |
-| `TestFirmwareExcludesGroundStationTypes` | a ground-station message reaching the RP2040 |
+| `TestGNSSDecodesDegreesNotRadians` | the double-conversion bug that shipped |
+| `TestCobsRoundTrip`, `TestCobsSizeFormula`, `TestCobsDecodeRejectsMalformed` | framing corruption at the 254-byte edge |
+| `TestCobsEncodeMatchesFirmwareC`, `…Randomised` | the Go encoder and the C encoder disagreeing |
+| `TestEveryCommandEmitsOneDelimitedFrame`, `TestMaxFrameMatchesTheFormula` | the Pico envelope drifting from `firmware/pico_wire.h` |
+| `TestTelemetryFrameFitsThePriorityClassBudget` | the frame outgrowing the priority class |
 | `TestNoClassificationFilterIsInstalled` | §6.6 ships no filter, and says so |
-| `TestSDRParamsAtomicWrite` | a half-written `params.json` |
+| `TestWriteFileAtomicLeavesNoPartialFile` | a half-written `params.json` or artefact |
+| `TestPartialUpdatePreservesUnmodelledKeys`, `TestMissingRequiredKeyIsRefused` | an SDR params write silently dropping keys |
+
+**Most of the names in earlier revisions of this table did not exist.** Listed
+were `TestGNSSDecodesDegrees`, `TestPicoFrameMatchesFirmware`,
+`TestTelemetryFrameUnderBudget`, `TestFlowerFilterPresent`,
+`TestFirmwareExcludesGroundStationTypes` and `TestSDRParamsAtomicWrite`; not one
+was a test that exists. The behaviours mostly *are* covered, under different names
+and in different packages — three were near-misses of a renamed test, and three
+describe capabilities that have since been deleted. Two consequences:
+
+- A test name in this document is a claim about the tree, and it was wrong six
+  times out of eight. Names here are to be read as "the coverage exists here",
+  verified against the source, not as documentation of intent.
+- `TestFlowerFilterPresent` is gone because there is no filter (§6.6);
+  `TestFirmwareExcludesGroundStationTypes` never existed — the firmware exclusion
+  is enforced by `scripts/generate.sh` (§4.4), not by a Go test;
+  `TestSDRParamsAtomicWrite` was misfiled, since atomic write is a `storage`
+  concern, and SDR params have their own contract tests.
 
 ---
 
 ## 13. Build
 
 ```
-buf generate          # api/rocsar/v1 → Go, Python, nanopb C
+buf generate            # api/rocsar/v1 → Go, Python
+scripts/generate.sh     # firmware → nanopb C, common + pico only (§4.4)
 go build ./...
 go test ./...
-python -m pytest gs/  # GS, needs Python 3.11+
+go run ./tools/gs_cli   # the Ground Station console
 arduino-cli compile -u -p /dev/ttyACM0 --fqbn rp2040:rp2040:rpipico firmware/
 ```
 
-Toolchain: Go 1.26, buf 1.72, Python 3.11+, `arduino-cli` with the
-`rp2040:rp2040` core, gcc for the firmware host tests.
+Toolchain: Go 1.26, buf 1.72, `arduino-cli` with the `rp2040:rp2040` core, gcc
+for the firmware host tests.
+
+An earlier revision listed `python -m pytest gs/`. There is no Python application
+under `gs/` — only generated protobuf stubs (§2) — so there is nothing there to
+test. Python 3.11 is still needed to *generate* the stubs, and `tools/gs_probe.py`
+runs on it, but the Ground Station is Go.
 
 There is **no CI.** This is stated plainly because it is a real gap: every check
 above currently depends on a human remembering to run it. Adding CI is the
@@ -772,8 +920,17 @@ Known limits, stated so nobody mistakes silence for coverage:
 - No hardware in the loop. The Pico, the servos, the SDR, the camera and the
   real GNSS receivers are untested by the suite. Tests use doubles and injected
   fakes; the integration is assumed correct until proven otherwise in flight.
-- `tc` shaping is verified by asserting the commands and reading back the qdisc,
-  not by measuring throughput under load.
+- **Link shaping is verified by reading back the qdisc, not by measuring
+  throughput under load.** `internal/qos/netlink_test.go` installs the hierarchy in
+  a real network namespace and asserts the rates the kernel reports back, and
+  `test/qos_test.go` asserts the intended hierarchy against a fake `KernelOps`. The
+  41/74/115 kbit/s figures in §6.6 come from `tc qdisc show` output on a
+  development interface. What is **not** established is achieved throughput on the
+  real radio link with a real receiver attached. Both the measurement and the
+  classifier remain open.
+- `internal/qos` leaves are `fq_codel`, not plain `pfifo limit`. The netlink
+  binding used here cannot express a `pfifo` byte limit, so leaves get fair
+  queueing with no explicit queue length. See §6.6.
 - The 420-byte `NavData` stream is not read (§6.1).
 - There is no artefact catalogue, so no integrity checking on stored files
   (§6.7).

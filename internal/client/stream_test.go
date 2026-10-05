@@ -26,7 +26,8 @@ func TestStreamDiscardsTheSlowJoinerBacklog(t *testing.T) {
 	s := newStream(context.Background(), f.testConfig(), 500*time.Millisecond)
 	defer s.Close()
 
-	go f.emit(t, 12, 20*time.Millisecond)
+	join := backgroundEmit(t, f, 12, 20*time.Millisecond)
+	defer join()
 
 	first := nextFrame(t, s, 10*time.Second)
 	second := nextFrame(t, s, 10*time.Second)
@@ -59,7 +60,8 @@ func TestStreamReportsMeasuringUntilTheBacklogIsGone(t *testing.T) {
 	if !s.Measuring() {
 		t.Fatal("a fresh stream does not report Measuring")
 	}
-	go f.emit(t, SlowJoinerFrames+2, 20*time.Millisecond)
+	join := backgroundEmit(t, f, SlowJoinerFrames+2, 20*time.Millisecond)
+	defer join()
 	nextFrame(t, s, 10*time.Second)
 
 	eventually(t, 10*time.Second, func() bool { return !s.Measuring() },
@@ -68,6 +70,12 @@ func TestStreamReportsMeasuringUntilTheBacklogIsGone(t *testing.T) {
 
 // Skipped sequence numbers accumulate in State.SequenceGaps and ride along on
 // the frame that follows them.
+//
+// Deterministic by construction: delivery is established first (so the discard
+// is over and history exists), the background publisher is stopped and the
+// socket drained (so nothing is in flight), and only then is a gap
+// manufactured. Every number below is derived from what was actually delivered,
+// never assumed.
 func TestStreamCountsSequenceGaps(t *testing.T) {
 	f := newFakeOBC(t)
 	defer f.close()
@@ -75,21 +83,31 @@ func TestStreamCountsSequenceGaps(t *testing.T) {
 	s := newStream(context.Background(), f.testConfig(), 500*time.Millisecond)
 	defer s.Close()
 
-	go func() {
-		f.emit(t, SlowJoinerFrames, 10*time.Millisecond) // discarded
-		f.emit(t, 2, 10*time.Millisecond)                // delivered: 6, 7
-		f.skip(2)                                        // 8, 9 never sent
-		f.emit(t, 1, 0)                                  // delivered: 10, gaps 2
-	}()
+	stop := make(chan struct{})
+	go f.emitUntil(t, 5*time.Millisecond, stop)
 
-	nextFrame(t, s, 10*time.Second) // 6
-	nextFrame(t, s, 10*time.Second) // 7
-	third := nextFrame(t, s, 10*time.Second)
-	if got := third.Telemetry.GetSequence(); got != 10 {
-		t.Fatalf("third frame is sequence %d, want 10", got)
+	first := nextFrame(t, s, 10*time.Second)
+	second := nextFrame(t, s, 10*time.Second)
+	if second.Telemetry.GetSequence() != first.Telemetry.GetSequence()+1 {
+		t.Fatalf("nominal delivery is not consecutive: %d then %d",
+			first.Telemetry.GetSequence(), second.Telemetry.GetSequence())
 	}
-	if third.Gaps != 2 {
-		t.Errorf("frame carries %d gaps, want 2", third.Gaps)
+
+	close(stop)
+	base := second.Telemetry.GetSequence()
+	if d := drainFrames(t, s, 300*time.Millisecond); d > base {
+		base = d
+	}
+
+	f.skip(2)
+	f.emitOne(t)
+
+	gapped := nextFrame(t, s, 10*time.Second)
+	if got := gapped.Telemetry.GetSequence(); got != base+3 {
+		t.Fatalf("post-gap frame is sequence %d, want %d", got, base+3)
+	}
+	if gapped.Gaps != 2 {
+		t.Errorf("frame carries %d gaps, want 2", gapped.Gaps)
 	}
 	eventually(t, 10*time.Second, func() bool { return s.State().SequenceGaps == 2 },
 		"gap counter to reach 2")
@@ -97,6 +115,9 @@ func TestStreamCountsSequenceGaps(t *testing.T) {
 
 // A backwards sequence means the OBC rebooted: the flag is raised, the gap
 // counter resets (the far side reset too), and delivery continues.
+//
+// Same determinism as the gap test: establish, stop, drain, then manufacture
+// the gap and the restart from known numbers.
 func TestStreamFlagsAnOBCRestart(t *testing.T) {
 	f := newFakeOBC(t)
 	defer f.close()
@@ -104,23 +125,31 @@ func TestStreamFlagsAnOBCRestart(t *testing.T) {
 	s := newStream(context.Background(), f.testConfig(), 500*time.Millisecond)
 	defer s.Close()
 
-	go func() {
-		f.emit(t, SlowJoinerFrames+2, 10*time.Millisecond)
-		f.skip(3) // bank some gaps first, so the reset is observable
-		f.emit(t, 1, 0)
-		f.rewind()
-		f.emit(t, 2, 10*time.Millisecond)
-	}()
-
+	stop := make(chan struct{})
+	go f.emitUntil(t, 5*time.Millisecond, stop)
 	nextFrame(t, s, 10*time.Second)
-	nextFrame(t, s, 10*time.Second)
-	pre := nextFrame(t, s, 10*time.Second) // post-gap frame
-	if pre.Gaps != 3 {
-		t.Fatalf("pre-restart frame carries %d gaps, want 3", pre.Gaps)
+	second := nextFrame(t, s, 10*time.Second)
+	close(stop)
+	base := second.Telemetry.GetSequence()
+	if d := drainFrames(t, s, 300*time.Millisecond); d > base {
+		base = d
 	}
+
+	// Bank some gaps first, so the reset is observable rather than assumed.
+	f.skip(3)
+	f.emitOne(t)
+	pre := nextFrame(t, s, 10*time.Second)
+	if pre.Gaps != 3 || pre.Telemetry.GetSequence() != base+4 {
+		t.Fatalf("pre-restart frame is seq %d with %d gaps, want seq %d with 3",
+			pre.Telemetry.GetSequence(), pre.Gaps, base+4)
+	}
+
+	f.rewind()
+	f.emitOne(t)
+	f.emitOne(t)
 	restarted := nextFrame(t, s, 10*time.Second)
-	if !restarted.Restart {
-		t.Errorf("post-restart frame does not carry the Restart flag: %+v", restarted)
+	if !restarted.Restart || restarted.Telemetry.GetSequence() != 1 {
+		t.Errorf("post-restart frame is not flagged as sequence 1: %+v", restarted)
 	}
 	eventually(t, 10*time.Second, func() bool { return s.State().SequenceGaps == 0 },
 		"gap counter to reset on restart")
@@ -134,6 +163,11 @@ func TestStreamFlagsAnOBCRestart(t *testing.T) {
 // and reopening it must resume delivery with a fresh slow-joiner discard. The
 // SUB and the DEALER reconnect independently, so this test owns no queue and
 // asserts nothing about commands.
+//
+// The publisher runs until told to stop, never a fixed burst: after the
+// resubscription, frames emitted before it arrived are lost to the backlog, so
+// a fixed burst could be consumed entirely by the discard and the test would
+// wait on silence.
 func TestStreamReconnectsWhenTelemetryReturns(t *testing.T) {
 	f := newFakeOBC(t)
 	defer f.close()
@@ -141,11 +175,17 @@ func TestStreamReconnectsWhenTelemetryReturns(t *testing.T) {
 	s := newStream(context.Background(), f.testConfig(), 300*time.Millisecond)
 	defer s.Close()
 
-	go f.emit(t, SlowJoinerFrames+3, 20*time.Millisecond)
+	stop := make(chan struct{})
+	go f.emitUntil(t, 20*time.Millisecond, stop)
 	nextFrame(t, s, 10*time.Second)
 	eventually(t, 10*time.Second, func() bool { return s.State().TelemetryConnected },
 		"stream to report connected")
 
+	close(stop)
+	// The emitter checks stop between frames, so by the time the publisher
+	// drops there is at most one frame still in flight -- and it lands in the
+	// discard or not at all, never in the assertions below.
+	time.Sleep(100 * time.Millisecond)
 	f.dropPub()
 	eventually(t, 10*time.Second, func() bool {
 		st := s.State()
@@ -154,7 +194,9 @@ func TestStreamReconnectsWhenTelemetryReturns(t *testing.T) {
 
 	discardedBefore := s.State().FramesDiscarded
 	f.reopenPub(t)
-	go f.emit(t, SlowJoinerFrames+2, 20*time.Millisecond)
+	stop2 := make(chan struct{})
+	defer close(stop2)
+	go f.emitUntil(t, 20*time.Millisecond, stop2)
 
 	got := nextFrame(t, s, 15*time.Second)
 	if got.Telemetry == nil {

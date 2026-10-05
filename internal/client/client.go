@@ -131,17 +131,50 @@ func dialSub(endpoint, topic string, timeout time.Duration) (*Subscription, erro
 
 	// The timeout is a construction option: this library has no per-call receive
 	// timeout, which is why Recv blocks until a message arrives or the socket is
-	// closed.
+	// closed. It also bounds the dial, which would otherwise hang in the ZMTP
+	// handshake against a silent endpoint.
 	sock := zmq4.NewSub(ctx, zmq4.WithTimeout(timeout))
 	if err := sock.SetOption(zmq4.OptionSubscribe, topic); err != nil {
 		_ = sock.Close()
 		return nil, fmt.Errorf("client: subscribe to %q: %w", topic, err)
 	}
-	if err := sock.Dial(endpoint); err != nil {
+	if err := dialBounded(sock, endpoint, timeout); err != nil {
 		_ = sock.Close()
-		return nil, fmt.Errorf("client: dial %s: %w", endpoint, err)
+		return nil, err
 	}
 	return &Subscription{sock: sock}, nil
+}
+
+// dialBounded dials with a timeout.
+//
+// go-zeromq's Dial blocks in the ZMTP handshake -- the greeting read -- with no
+// deadline. WithTimeout covers Send and Recv only. Against an endpoint that
+// accepts TCP and never speaks ZMTP (a firewall, a half-open route on a marginal
+// radio link), a bare Dial hangs forever: no backoff, no state update, no
+// timeout. This is the same class of library limitation as the missing receive
+// timeout, and it gets the same treatment: bound it here, once, for every
+// caller.
+//
+// A timed-out attempt is abandoned, not cancelled: nothing unblocks a handshake
+// read from outside, so the attempt leaks one goroutine and one half-open TCP
+// connection. The caller MUST close the socket on this error, so that if the
+// abandoned handshake ever completes it lands on a closed socket nobody reads
+// instead of joining a live one as a second, silent connection. Attempt rate is
+// bounded by the callers -- the backoff ladder in Stream, the fail-fast window
+// in Queue -- so the leak is bounded too, and it is recorded here rather than
+// discovered as a slow goroutine climb during an outage.
+func dialBounded(sock zmq4.Socket, endpoint string, timeout time.Duration) error {
+	done := make(chan error, 1)
+	go func() { done <- sock.Dial(endpoint) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			return fmt.Errorf("client: dial %s: %w", endpoint, err)
+		}
+		return nil
+	case <-time.After(timeout):
+		return fmt.Errorf("client: dial %s: no ZMTP handshake within %s", endpoint, timeout)
+	}
 }
 
 // subTimeout bounds one receive. Ten seconds is long enough that a 1 Hz frame is
@@ -217,8 +250,8 @@ const qosTopicTelemetry = "telemetry"
 func (c *Client) Send(ctx context.Context, req *rocsarv1.CommandRequest) (*rocsarv1.CommandResponse, error) {
 	zc := zmq4.NewDealer(ctx, zmq4.WithTimeout(CommandTimeout))
 	defer zc.Close()
-	if err := zc.Dial(c.cfg.Control); err != nil {
-		return nil, fmt.Errorf("client: dial %s: %w", c.cfg.Control, err)
+	if err := dialBounded(zc, c.cfg.Control, CommandTimeout); err != nil {
+		return nil, err
 	}
 	return roundTrip(zc, req, CommandTimeout)
 }
