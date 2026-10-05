@@ -52,6 +52,7 @@ func worstCaseSnapshot() telemetry.Snapshot {
 		Pico: domain.PicoTelemetry{
 			GondolaHeadingDeg: 359.9999, TargetHeadingDeg: 180.0001,
 			Heater1State: true, Heater2State: true, IMUPresent: true,
+			ImuTemperatureC: 85.5,
 			Axes: axes, ObservedAt: now,
 		},
 		PicoAck: &domain.Ack{CommandSequence: 4294967295, Success: false, Error: domain.ErrHardwareFault},
@@ -213,6 +214,9 @@ func TestSnapshotRoundTrip(t *testing.T) {
 	}
 	if back.Pico.Axes[0].FeedbackState != s.Pico.Axes[0].FeedbackState {
 		t.Errorf("feedback state changed: %v -> %v", s.Pico.Axes[0].FeedbackState, back.Pico.Axes[0].FeedbackState)
+	}
+	if back.Pico.ImuTemperatureC != s.Pico.ImuTemperatureC {
+		t.Errorf("imu temperature changed: %v -> %v", s.Pico.ImuTemperatureC, back.Pico.ImuTemperatureC)
 	}
 	if !back.PhotosTakenKnown || back.PhotosTaken != s.PhotosTaken {
 		t.Errorf("photo count known=%v count=%d, want known=true count=%d",

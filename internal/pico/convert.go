@@ -31,6 +31,7 @@ func telemetryToDomain(m *rocsarv1.PicoTelemetry, now time.Time) domain.PicoTele
 		Heater1State:      m.GetHeater1State(),
 		Heater2State:      m.GetHeater2State(),
 		IMUPresent:        m.GetImuPresent(),
+		ImuTemperatureC:   float64(m.GetImuTemperatureC()),
 		ObservedAt:        now,
 	}
 

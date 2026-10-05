@@ -158,6 +158,26 @@ func TestIMUAbsentRendersHeld(t *testing.T) {
 	}
 }
 
+func TestIMUPresentRendersTemperature(t *testing.T) {
+	s := baseSnapshot()
+	s.Pico.ImuTemperatureC = 27.5
+
+	got := Build(s).Pico.ImuTemperatureC
+	if got == nil || *got != 27.5 {
+		t.Errorf("imu temperature rendered %v for a present IMU; want 27.5, distinct from held", got)
+	}
+}
+
+func TestIMUAbsentHidesTemperature(t *testing.T) {
+	s := baseSnapshot()
+	s.Pico.IMUPresent = false
+	s.Pico.ImuTemperatureC = 27.5
+
+	if got := Build(s).Pico.ImuTemperatureC; got != nil {
+		t.Errorf("imu temperature rendered %v with imu_present=false; a held value is the last reading, not a measurement", *got)
+	}
+}
+
 // --- feedback (§7.2): the int32 that must never print as a number ---
 
 func TestHeldServoHidesLoadAndTemp(t *testing.T) {

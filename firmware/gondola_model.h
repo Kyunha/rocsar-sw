@@ -659,6 +659,12 @@ struct GondolaState {
   // IMU_MISSED_SAMPLES_MAX declaration in noteImuMiss(); reset by any answered
   // read (clearImuMisses) and by reaching the threshold itself.
   uint16_t imuMissCount;
+
+  // BNO055 die temperature in degrees Celsius, read alongside the heading.
+  // Held from the last reading when the sensor misses (init 0.0): zeroing it
+  // on a miss would be the same lie as zeroing a servo reading, and the wire
+  // carries it next to imu_present so the operator reads the two together.
+  float imuTemperatureC;
 };
 
 // Projects the model onto the wire message. The whole mapping lives here so the
@@ -679,8 +685,11 @@ inline void fillTelemetryMessage(const GondolaState& state,
   // Report the measurement, not the value: gondola_heading_deg is a *held*
   // bearing whenever imu_present is false, and the Pi and the GUI both need to
   // say so rather than present a frozen heading as a live one. This is the same
-  // reason a blank frame must not be read as real zeros.
+  // reason a blank frame must not be read as real zeros. imu_temperature_c
+  // rides beside the same bit for the same reason: held when the sensor is
+  // quiet, measured when it answers.
   out.imu_present = state.imuPresent;
+  out.imu_temperature_c = state.imuTemperatureC;
 
   out.antennas_count = NUM_ANTENNAS;
   for (int i = 0; i < NUM_ANTENNAS; i++) {
@@ -731,6 +740,7 @@ inline void initGondolaState(GondolaState& state) {
   state.heater2LastOnMs = 0;
   state.imuPresent = false;
   state.imuMissCount = 0;
+  state.imuTemperatureC = 0.0f;
 }
 
 // Folds one heading sample into the model and reports what it did.

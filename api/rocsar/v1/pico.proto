@@ -145,6 +145,14 @@ message PicoTelemetry {
   // frame defaults to false, so a frame from a firmware predating this field
   // reads as "no measurement", which is the honest reading of one.
   bool imu_present = 6;
+
+  // BNO055 die temperature in degrees Celsius, read alongside the heading.
+  // Only meaningful when imu_present is true: otherwise it is held from the
+  // last reading (zero at boot), and a blank proto3 frame defaults to zero,
+  // so it must be read as "no measurement" via imu_present -- the same
+  // absence discipline as gondola_heading_deg. A field number is the wire;
+  // do not renumber these fields.
+  float imu_temperature_c = 7;
 }
 
 // ---------------------------------------------------------------------------

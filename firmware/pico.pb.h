@@ -85,6 +85,13 @@ typedef struct _rocsar_v1_PicoTelemetry {
  frame defaults to false, so a frame from a firmware predating this field
  reads as "no measurement", which is the honest reading of one. */
     bool imu_present;
+    /* BNO055 die temperature in degrees Celsius, read alongside the heading.
+ Only meaningful when imu_present is true: otherwise it is held from the
+ last reading (zero at boot), and a blank proto3 frame defaults to zero,
+ so it must be read as "no measurement" via imu_present -- the same
+ absence discipline as gondola_heading_deg. A field number is the wire;
+ do not renumber these fields. */
+    float imu_temperature_c;
 } rocsar_v1_PicoTelemetry;
 
 typedef struct _rocsar_v1_PicoMessage {
@@ -113,7 +120,7 @@ extern "C" {
 #define rocsar_v1_StatusRequestCommand_init_default {0}
 #define rocsar_v1_PicoCommand_init_default       {0, 0, {rocsar_v1_SetTargetCommand_init_default}}
 #define rocsar_v1_PicoAck_init_default           {0, 0, _rocsar_v1_ErrorCode_MIN}
-#define rocsar_v1_PicoTelemetry_init_default     {0, 0, 0, 0, 0, {rocsar_v1_AntennaTelemetry_init_default, rocsar_v1_AntennaTelemetry_init_default}, 0}
+#define rocsar_v1_PicoTelemetry_init_default     {0, 0, 0, 0, 0, {rocsar_v1_AntennaTelemetry_init_default, rocsar_v1_AntennaTelemetry_init_default}, 0, 0}
 #define rocsar_v1_PicoMessage_init_default       {0, 0, 0, {rocsar_v1_PicoAck_init_default}}
 #define rocsar_v1_SetTargetCommand_init_zero     {0}
 #define rocsar_v1_JogCommand_init_zero           {0, 0}
@@ -125,7 +132,7 @@ extern "C" {
 #define rocsar_v1_StatusRequestCommand_init_zero {0}
 #define rocsar_v1_PicoCommand_init_zero          {0, 0, {rocsar_v1_SetTargetCommand_init_zero}}
 #define rocsar_v1_PicoAck_init_zero              {0, 0, _rocsar_v1_ErrorCode_MIN}
-#define rocsar_v1_PicoTelemetry_init_zero        {0, 0, 0, 0, 0, {rocsar_v1_AntennaTelemetry_init_zero, rocsar_v1_AntennaTelemetry_init_zero}, 0}
+#define rocsar_v1_PicoTelemetry_init_zero        {0, 0, 0, 0, 0, {rocsar_v1_AntennaTelemetry_init_zero, rocsar_v1_AntennaTelemetry_init_zero}, 0, 0}
 #define rocsar_v1_PicoMessage_init_zero          {0, 0, 0, {rocsar_v1_PicoAck_init_zero}}
 
 /* Field tags (for use in manual encoding/decoding) */
@@ -158,6 +165,7 @@ extern "C" {
 #define rocsar_v1_PicoTelemetry_heater2_state_tag 4
 #define rocsar_v1_PicoTelemetry_antennas_tag     5
 #define rocsar_v1_PicoTelemetry_imu_present_tag  6
+#define rocsar_v1_PicoTelemetry_imu_temperature_c_tag 7
 #define rocsar_v1_PicoMessage_sequence_tag       1
 #define rocsar_v1_PicoMessage_timestamp_us_tag   2
 #define rocsar_v1_PicoMessage_ack_tag            3
@@ -242,7 +250,8 @@ X(a, STATIC,   SINGULAR, FLOAT,    target_heading_deg,   2) \
 X(a, STATIC,   SINGULAR, BOOL,     heater1_state,     3) \
 X(a, STATIC,   SINGULAR, BOOL,     heater2_state,     4) \
 X(a, STATIC,   REPEATED, MESSAGE,  antennas,          5) \
-X(a, STATIC,   SINGULAR, BOOL,     imu_present,       6)
+X(a, STATIC,   SINGULAR, BOOL,     imu_present,       6) \
+X(a, STATIC,   SINGULAR, FLOAT,    imu_temperature_c,   7)
 #define rocsar_v1_PicoTelemetry_CALLBACK NULL
 #define rocsar_v1_PicoTelemetry_DEFAULT NULL
 #define rocsar_v1_PicoTelemetry_antennas_MSGTYPE rocsar_v1_AntennaTelemetry
@@ -292,8 +301,8 @@ extern const pb_msgdesc_t rocsar_v1_PicoMessage_msg;
 #define rocsar_v1_MountCommand_size              11
 #define rocsar_v1_PicoAck_size                   10
 #define rocsar_v1_PicoCommand_size               20
-#define rocsar_v1_PicoMessage_size               198
-#define rocsar_v1_PicoTelemetry_size             178
+#define rocsar_v1_PicoMessage_size               203
+#define rocsar_v1_PicoTelemetry_size             183
 #define rocsar_v1_SetTargetCommand_size          5
 #define rocsar_v1_StatusRequestCommand_size      0
 #define rocsar_v1_StopCommand_size               6

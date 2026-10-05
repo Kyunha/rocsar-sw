@@ -132,6 +132,7 @@ func picoTelemetry(p domain.PicoTelemetry) *rocsarv1.PicoTelemetry {
 		Heater1State:      p.Heater1State,
 		Heater2State:      p.Heater2State,
 		ImuPresent:        p.IMUPresent,
+		ImuTemperatureC:   float32(p.ImuTemperatureC),
 	}
 	for _, a := range p.Axes {
 		t.Antennas = append(t.Antennas, &rocsarv1.AntennaTelemetry{
@@ -267,6 +268,7 @@ func DecodeTelemetry(f *rocsarv1.TelemetryFrame) telemetry.Snapshot {
 			Heater1State:      p.GetHeater1State(),
 			Heater2State:      p.GetHeater2State(),
 			IMUPresent:        p.GetImuPresent(),
+			ImuTemperatureC:   float64(p.GetImuTemperatureC()),
 		}
 		for _, a := range p.GetAntennas() {
 			s.Pico.Axes = append(s.Pico.Axes, domain.Axis{

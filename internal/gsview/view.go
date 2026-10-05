@@ -117,7 +117,12 @@ type PicoView struct {
 	Heater1On         bool       `json:"heater1_on"`
 	Heater2On         bool       `json:"heater2_on"`
 	IMU               string     `json:"imu"`
-	Antennas          []AxisView `json:"antennas"`
+	// ImuTemperatureC is the BNO055 die temperature in degrees Celsius. Nil
+	// unless the IMU is present (measured): a held value is the last reading,
+	// and showing it as a measurement repeats the held-bearing trap this
+	// column exists to prevent.
+	ImuTemperatureC *float64   `json:"imu_temperature_c"`
+	Antennas        []AxisView `json:"antennas"`
 }
 
 // AxisView is one antenna axis. Load and TemperatureC are nil unless the servo
@@ -255,6 +260,10 @@ func buildPico(p domain.PicoTelemetry) *PicoView {
 		Heater2On:         p.Heater2State,
 		IMU:               measuredOrHeld(p.IMUPresent),
 		Antennas:          make([]AxisView, 0, len(p.Axes)),
+	}
+	if p.IMUPresent {
+		temp := p.ImuTemperatureC
+		out.ImuTemperatureC = &temp
 	}
 	for _, a := range p.Axes {
 		axis := AxisView{

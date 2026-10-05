@@ -62,9 +62,16 @@ func printTelemetry(f *rocsarv1.TelemetryFrame) {
 		if f.GetPicoConnected() {
 			conn = "connected"
 		}
-		fmt.Printf("         pico   %s  heading %.2f (target %.2f)  imu %s  heaters %s/%s\n",
+		fmt.Printf("         pico   %s  heading %.2f (target %.2f)  imu %s",
 			conn, p.GetGondolaHeadingDeg(), p.GetTargetHeadingDeg(),
-			measuredOrHeld(p.GetImuPresent()), onOff(p.GetHeater1State()), onOff(p.GetHeater2State()))
+			measuredOrHeld(p.GetImuPresent()))
+		if p.GetImuPresent() {
+			// Only meaningful as a measurement: otherwise it is held from the
+			// last reading, and printing it beside HELD invites reading it as one.
+			fmt.Printf("  imu temp %.1fC", p.GetImuTemperatureC())
+		}
+		fmt.Printf("  heaters %s/%s\n",
+			onOff(p.GetHeater1State()), onOff(p.GetHeater2State()))
 		for _, a := range p.GetAntennas() {
 			load := "load ?"
 			if a.GetFeedbackState() == 1 {

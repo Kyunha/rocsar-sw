@@ -233,6 +233,13 @@ type PicoTelemetry struct {
 	// BNO055 is fitted, in which case the heading is the last bearing held and
 	// the two are indistinguishable without this bit.
 	IMUPresent bool
+
+	// ImuTemperatureC is the BNO055 die temperature in degrees Celsius, read
+	// alongside the heading. Only meaningful when IMUPresent is true:
+	// otherwise it is held from the last reading (zero at boot), and a zero
+	// must be read as "no measurement" via IMUPresent -- the same absence
+	// discipline as GondolaHeadingDeg.
+	ImuTemperatureC float64
 	ObservedAt time.Time
 }
 

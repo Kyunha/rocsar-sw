@@ -138,6 +138,11 @@ void readImuHeading(unsigned long now) {
 
   clearImuMisses(gondola);
   applyImuHeading(gondola, event.orientation.x, true);
+  // Read alongside the heading so the two agree about the sensor: a miss
+  // above holds the last temperature rather than zeroing it, the same posture
+  // as the bearing and the servo readings. The BNO055 reports whole degrees;
+  // a tenth of a degree is far finer than anyone acts on.
+  gondola.imuTemperatureC = (float)bno.getTemperature();
 }
 
 void sendTelemetryMessage() {
