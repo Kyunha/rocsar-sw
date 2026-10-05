@@ -119,6 +119,11 @@ func (e *Engine) Build() Snapshot {
 	}
 	if e.providers.CameraLast != nil {
 		s.LastPhoto, s.PhotosTaken = e.providers.CameraLast()
+		// Known exactly when the encoder would emit the count: a provider
+		// supplied it and the subsystem is not unspecified. Mirroring the
+		// encoder's condition here rather than duplicating it there keeps the
+		// two from disagreeing about what "known" means.
+		s.PhotosTakenKnown = s.Camera != domain.SubsystemUnspecified
 	}
 	if e.providers.Link != nil {
 		s.Link = e.providers.Link()
@@ -150,6 +155,12 @@ type Snapshot struct {
 	CameraDevice string
 	LastPhoto    string
 	PhotosTaken  uint64
+	// PhotosTakenKnown reports whether the count above means anything. A zero
+	// with Known=false is "the camera subsystem never reported", rendered as
+	// "—"; a zero with Known=true is "no photographs yet". The wire carries
+	// the distinction (photos_taken is optional); this field carries it back
+	// out of the decoder, so a consumer never has to guess from the number.
+	PhotosTakenKnown bool
 
 	Link domain.LinkStatus
 }

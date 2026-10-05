@@ -93,6 +93,7 @@ def _request(probe: Path, servo_id: int) -> str:
         [str(probe), "--servo-status-request", str(servo_id)],
         capture_output=True,
         text=True,
+        check=False,
     )
     assert result.returncode == 0, result.stderr
     return result.stdout.strip()
@@ -103,6 +104,7 @@ def _scan(probe: Path, wire: str, servo_id: int) -> dict[str, object]:
         [str(probe), "--servo-status-scan", wire, str(servo_id)],
         capture_output=True,
         text=True,
+        check=False,
     )
     assert result.returncode == 0, result.stderr
     fields: dict[str, object] = {}
@@ -280,29 +282,51 @@ class TestTheParserRefuses:
 # ---------------------------------------------------------------------------
 
 
+def _states(stdout: str) -> list[dict]:
+    """Every STATE line, parsed as {axis_index: {field: value}}.
+
+    Shared by the --apply-feedback and --boot-state entry points: they print
+    the same line, and a second parser for it would be a second opinion about
+    a format that only exists so these tests can read it.
+    """
+    states = []
+    for line in stdout.splitlines():
+        if not line.startswith("STATE "):
+            continue
+        body = line[len("STATE ") :]
+        axes = dict(re.findall(r"a(\d) ([^\|]+)", body))
+        states.append(
+            {
+                index: {
+                    k: (float(v) if "." in v else int(v))
+                    for k, v in re.findall(r"(\w+)=([-\d.]+)", blob)
+                }
+                for index, blob in axes.items()
+            }
+        )
+    return states
+
+
 def _feedback_steps(probe: Path, steps: list[tuple[str, int]]) -> list[dict]:
     args: list[str] = []
     for wire, servo_id in steps:
         args += [wire, str(servo_id)]
     result = subprocess.run(
-        [str(probe), "--apply-feedback", *args], capture_output=True, text=True
+        [str(probe), "--apply-feedback", *args], capture_output=True, text=True, check=False
     )
     assert result.returncode == 0, result.stderr
-    states = []
-    for line in result.stdout.splitlines():
-        if line.startswith("STATE "):
-            body = line[len("STATE ") :]
-            axes = dict(re.findall(r"a(\d) ([^\|]+)", body))
-            states.append(
-                {
-                    index: {
-                        k: (float(v) if "." in v else int(v))
-                        for k, v in re.findall(r"(\w+)=([-\d.]+)", blob)
-                    }
-                    for index, blob in axes.items()
-                }
-            )
-    return states
+    return _states(result.stdout)
+
+
+def _boot_axes(probe: Path) -> dict[str, dict]:
+    """The power-up axes, after one hardware-less control tick."""
+    result = subprocess.run(
+        [str(probe), "--boot-state"], capture_output=True, text=True, check=False
+    )
+    assert result.returncode == 0, result.stderr
+    states = _states(result.stdout)
+    assert len(states) == 1, "the boot state is one tick, not a sequence"
+    return states[0]
 
 
 class TestFoldingFeedbackIntoTheAxis:
@@ -320,6 +344,27 @@ class TestFoldingFeedbackIntoTheAxis:
         assert first["fb_state"] == 0
         assert first["tick"] == 1000, "the fallback reports the commanded tick"
         assert first["load"] == 0
+
+    def test_before_any_command_the_fallback_reports_the_centre(
+        self, probe: Path
+    ) -> None:
+        """The never-sent sentinel must not reach the wire as a position.
+
+        lastSentTick is 0xFFFF until something is transmitted, and 0xFFFF is
+        65535 -- about 5580 degrees off centre, more than fourteen full turns
+        of a servo that stops at 4095. With feedback_state=UNKNOWN beside it a
+        careful reader might notice; nothing else on the wire says so, and the
+        GUI reads these numbers as numbers. The axis that has never been
+        commanded holds at centre, so centre is what the fallback reports.
+        """
+        axes = _boot_axes(probe)
+        for index in ("0", "1"):
+            assert axes[index]["tick"] == 2048, (
+                "the sentinel must be reported as the centre it stands for"
+            )
+            assert axes[index]["fb_state"] == 0, (
+                "and still as UNKNOWN: nothing has been measured yet"
+            )
 
     def test_a_measured_tick_replaces_the_command_echo(
         self, probe: Path

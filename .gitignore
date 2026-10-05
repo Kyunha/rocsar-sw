@@ -8,12 +8,23 @@ third_party/
 
 # Build output
 /obc
+/gs_cli
+/bin/
 *.test
 __pycache__/
 *.pyc
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
+
+# Wails generates these at build time (wails build / wails dev), like the Go
+# protobuf bindings above. A bare `npm run build` does not regenerate them, so
+# the frontend builds only through wails -- which is the only supported path.
+cmd/gs/build/bin/
+cmd/gs/frontend/dist/*
+!cmd/gs/frontend/dist/.gitkeep
+cmd/gs/frontend/node_modules/
+cmd/gs/frontend/wailsjs/
 
 # Per-machine config overrides rocsar.toml
 rocsar.local.toml

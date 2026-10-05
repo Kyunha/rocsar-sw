@@ -434,29 +434,30 @@ to it is cheap, renaming is not.
 
 Grouped by what the operator is doing, not by struct.
 
-**Connection** — `Connect()`, `Disconnect()`, `LinkState()`
+**Connection** — `Connect(cfg)`, `Disconnect()`, `LinkState()`, `Endpoints()`
 
 **Telemetry** — pushed, not polled. `Snapshot()` exists once, for first paint
 before the first event.
 
 **Antenna / flight controller** — `SetHeading(deg)`, `Jog(servo, tick)`,
-`Zero(servo)`, `Mount(servo, deg)`, `SetDirection(servo, mult)`,
-`SetHeater(id, on)`, `Stop(servo)`, `PicoStatus()`
+`ZeroServo(servo)`, `ZeroAll()`, `MountOffset(servo, deg)`,
+`SetDirection(servo, mult)`, `SetHeater(id, on)`, `StopServo(servo)`,
+`StopAll()`, `PicoStatusRequest()`
 
 **GNSS** — `SelectReceiver(id)`, `RotateReceiver()`
 
 **Camera** — `TakePhoto()`
 
-**SDR** — `Probe()`, `ConnectSDR()`, `ResetUSB()`, `SetParams(patch)`
+**SDR** — `SdrProbe()`, `SdrConnect()`, `SdrResetUSB()`, `SetSdrParams(patch)`
 
 **Link** — `SetLinkLimit(kbit)`
 
-**Artefacts** — `ListArtefacts(path)`, `DownloadArtefact(name, resume)`,
-`CancelDownload()`, `RevealArtefact(path)`
+**Artefacts** — `ListArtefacts(path)`, `DownloadArtefact(name)`,
+`CancelDownload()`, `PreviewArtefact(name)`
 
 **System** — `QueryStatus()`
 
-Two absences, both deliberate:
+Three absences, all deliberate:
 
 - **`SystemReset` is not bound.** The dispatcher answers it `ERROR_UNSUPPORTED`
   (`internal/command/dispatcher.go:116`). A GUI button for a command that is
@@ -466,15 +467,22 @@ Two absences, both deliberate:
   that validates its arguments host-side, exactly as `buildRequests` does in
   `tools/gs_cli/client.go:229`. A generic escape hatch would put a protobuf
   oneof in the browser, where a renumbering is a silent runtime failure.
+- **No `RevealArtefact`.** Showing a file in the OS file manager needs either
+  a platform API (Wails v2 has none on Linux) or `os/exec` (forbidden to
+  everything but `internal/sdr` and `internal/qos` by the layering test). The
+  browser row copies the path to the clipboard instead, through the runtime's
+  own clipboard -- no new bound method needed, because the frontend already
+  speaks to that runtime directly.
 
 ### 8.1 Events
 
 | Event | Rate | Payload |
 | :--- | :--- | :--- |
-| `telemetry:frame` | 1 Hz | the §7 view struct |
+| `telemetry:frame` | 1 Hz | `{view, gaps, restart, link}` — the §7 view plus what the stream noticed and link health at that instant |
 | `command:result` | per command | request id, success, error code, message, artefact metadata |
-| `link:state` | on change | §6.7 |
-| `download:progress` | ≤10 Hz | name, bytes, total, rate, ETA |
+| `link:state` | on frame, after each command, on connect/disconnect | §6.7 with age in seconds (never nanoseconds) |
+| `download:progress` | ≤10 Hz | name, bytes, total (-1 when unknown), measured rate |
+| `download:done` | per transfer | name, bytes, elapsed, rate, or the error |
 | `log` | as logged | one line |
 
 ---
@@ -765,9 +773,10 @@ window to get right.
 
 Stated so nobody mistakes silence for coverage.
 
-- **Nothing here has been run against an OBC.** The toolchain is verified
-  (§12); the client logic is not. `tools/gs_cli` exists and is trusted, but
-  `cmd/gs` has never been pointed at a live system.
+- **Nothing here has been run against the live system.** The toolchain is
+  verified (§12); `cmd/gs` has been pointed at a local mock OBC repeatedly,
+  never at the aircraft. `tools/gs_cli` exists and is trusted, but a window
+  has never commanded a servo that moves.
 - **No hardware in the loop.** As `ARCHITECTURE.md` §14 says, for the OBC. It
   applies to the console, which has never seen a servo move.
 - **The v2→v3 migration is unpriced.** If Wails v3 is wanted later, the work is
@@ -784,3 +793,8 @@ Stated so nobody mistakes silence for coverage.
 - **`decoded` does not mean `trusted`.** `internal/gsview` renders what the OBC
   sent. It cannot tell a correct reading from a plausible one, and nothing here
   claims otherwise.
+- **A map panel is being developed in parallel and is not covered here.** The
+  `telemetry:frame` event shape (`{view, gaps, restart}` with `view` per §7)
+  is the contract it builds against and will not move under it. Open questions
+  on that track -- tile sourcing for offline field use, projection of degrees,
+  marker assets -- belong to it, not to this document.

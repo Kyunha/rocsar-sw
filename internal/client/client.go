@@ -52,11 +52,11 @@ import (
 // four-level precedence the OBC uses. Nothing here reads a file.
 type Config struct {
 	// Control is the OBC's ROUTER: tcp://host:5555.
-	Control string
+	Control string `json:"control_endpoint"`
 	// Telemetry is the OBC's PUB: tcp://host:5556.
-	Telemetry string
+	Telemetry string `json:"telemetry_endpoint"`
 	// HTTP is the OBC's artefact server: http://host:5557.
-	HTTP string
+	HTTP string `json:"http_endpoint"`
 	// Topic is the telemetry topic to subscribe to. It is "telemetry" and
 	// nothing else.
 	//
@@ -69,7 +69,7 @@ type Config struct {
 	// A client built from the document subscribes to five topics, matches none,
 	// and reports a dead OBC -- because a ZeroMQ filter mismatch and a dead OBC
 	// are indistinguishable from this side of the socket.
-	Topic string
+	Topic string `json:"topic"`
 }
 
 // Client holds the three endpoints.

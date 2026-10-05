@@ -64,6 +64,14 @@ uint32_t txSequence = 0;
 // encodePicoFrame() lives in pico_wire.h so the sketch and anything else that
 // encodes a frame go through the same one.
 bool sendMessage(const rocsar_v1_PicoMessage& message) {
+  // No host listening. Serial (USB CDC) reports false until the far end has
+  // opened the port, and writing to a CDC that nobody reads fills the TX
+  // buffer and then blocks -- which would stall the 20 ms control tick and
+  // freeze the antennas because nobody was there to read their telemetry.
+  // A frame with no reader is not a frame, so drop it and keep looping.
+  if (!Serial) {
+    return false;
+  }
   uint8_t frame[PICO_TX_FRAME_MAX];
   size_t frameLen = encodePicoFrame(message, frame, sizeof(frame));
   if (frameLen == 0) {
@@ -110,17 +118,25 @@ void readImuHeading(unsigned long now) {
 
   sensors_event_t event;
   if (!bno.getEvent(&event, Adafruit_BNO055::VECTOR_EULER)) {
-    // A fitted sensor that delivered nothing this tick. Hold.
+    // A fitted sensor that delivered nothing this tick. Hold, and count it.
     //
     // Note this deliberately does NOT call applyImuHeading(gondola, 0.0f, true):
     // a 0.0f sample is finite, so that call would pass the guard and integrate
     // a reading of zero, dragging the bearing toward north. "No sample" and
     // "a sample of 0 degrees" are different facts and only one of them is a
-    // measurement. `imuPresent` is already correct and stays as it is -- the
-    // sensor is fitted, it just did not answer.
+    // measurement. `imuPresent` stays as it is for as long as the sensor keeps
+    // answering at all -- but not forever: after IMU_MISSED_SAMPLES_MAX
+    // consecutive silence the sensor is declared absent through the same
+    // applyImuHeading(..., false) path a missing sensor takes, so the re-probe
+    // above gets a chance to run and the wire stops claiming a heading source
+    // it has not heard from in a second.
+    if (noteImuMiss(gondola)) {
+      applyImuHeading(gondola, 0.0f, false);
+    }
     return;
   }
 
+  clearImuMisses(gondola);
   applyImuHeading(gondola, event.orientation.x, true);
 }
 
@@ -138,15 +154,27 @@ void sendTelemetryMessage() {
   sendMessage(message);
 }
 
+// The model owns heater state and the dead-man clock behind it; the pins are
+// hardware, so this is the one place that translates one into the other. It is
+// idempotent and called from both places the flags can change -- after a
+// command, for an immediate response, and after expireHeaters() in the loop,
+// for the silent case where the keep-alive simply stopped arriving.
+void syncHeaterPins() {
+  digitalWrite(HEATER_1_PIN, gondola.heater1 ? HIGH : LOW);
+  digitalWrite(HEATER_2_PIN, gondola.heater2 ? HIGH : LOW);
+}
+
 // ============================================================================
 // COMMAND PARSER & EXECUTION
 // ============================================================================
 void handleCommand(const rocsar_v1_PicoCommand &cmd) {
-  rocsar_v1_ErrorCode error = applyCommand(gondola, cmd);
+  // millis() is passed because an "on" starts the heater dead-man clock; see
+  // applyCommand() for why the clock is command data rather than a sketch
+  // concern.
+  rocsar_v1_ErrorCode error = applyCommand(gondola, cmd, millis());
 
   // The model tracks heater state; the pins have to follow.
-  digitalWrite(HEATER_1_PIN, gondola.heater1 ? HIGH : LOW);
-  digitalWrite(HEATER_2_PIN, gondola.heater2 ? HIGH : LOW);
+  syncHeaterPins();
 
   // Always close the loop!
   sendCommandResponse(cmd.sequence, error);
@@ -249,8 +277,6 @@ void setup() {
 
   pinMode(HEATER_1_PIN, OUTPUT);
   pinMode(HEATER_2_PIN, OUTPUT);
-  digitalWrite(HEATER_1_PIN, LOW);
-  digitalWrite(HEATER_2_PIN, LOW);
 
   // ST3215 Serial Bus
   Serial1.setTX(0);
@@ -263,6 +289,11 @@ void setup() {
   Wire.begin();
 
   initGondolaState(gondola);
+
+  // Both heaters off, written through the one function that ever touches their
+  // pins -- so "the pins mirror the model" is true from the first line of setup
+  // and there is no second writer to drift from it.
+  syncHeaterPins();
 
   if (bno.begin()) {
     bno.setExtCrystalUse(true);
@@ -315,13 +346,23 @@ void loop() {
     // Smooth IMU Reading
     readImuHeading(now);
 
+    // Dead-man first, so the telemetry frame this tick already reports the
+    // truth: a heater whose keep-alive stopped arriving goes off here, and the
+    // pins follow. expireHeaters() only ever turns things off, so this can
+    // never start heating on its own.
+    expireHeaters(gondola, now);
+    syncHeaterPins();
+
     // Update Kinematics & Actuate Servos
     for (int i = 0; i < NUM_ANTENNAS; i++) {
       AntennaAxis& antenna = gondola.antennas[i];
       uint16_t targetTick =
           antenna.calculateTargetTick(gondola.gondolaHeading, gondola.targetHeading);
 
-      if (shouldSendServoTick(antenna.lastSentTick, targetTick)) {
+      // shouldDriveServo() is the boot interlock plus the deadband, in that
+      // order: an axis nobody has commanded transmits nothing, so powering up
+      // moves nothing until set_target or jog says otherwise.
+      if (shouldDriveServo(antenna, targetTick)) {
         sendServoPosition(antenna.id, targetTick);
         antenna.lastSentTick = targetTick;
       }

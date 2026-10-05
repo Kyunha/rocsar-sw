@@ -302,7 +302,7 @@ func TestPartialUpdatePreservesUnmodelledKeys(t *testing.T) {
 
 	s := NewService(prog, dir, discardLogger())
 	prf := 3000.0
-	if err := s.SetParams(contextTODO(), domain.SdrParamsPatch{PRFHz: &prf}); err != nil {
+	if err := s.SetParams(context.Background(), domain.SdrParamsPatch{PRFHz: &prf}); err != nil {
 		t.Fatalf("SetParams: %v", err)
 	}
 
@@ -365,7 +365,7 @@ func TestMissingRequiredKeyIsRefused(t *testing.T) {
 
 	s := NewService(prog, dir, discardLogger())
 	prf := 3000.0
-	err := s.SetParams(contextTODO(), domain.SdrParamsPatch{PRFHz: &prf})
+	err := s.SetParams(context.Background(), domain.SdrParamsPatch{PRFHz: &prf})
 	if err == nil {
 		t.Fatal("SetParams accepted a params.json missing keys config.hpp requires")
 	}
@@ -375,8 +375,6 @@ func TestMissingRequiredKeyIsRefused(t *testing.T) {
 }
 
 // Helpers kept here so the contract tests read as tests and not as setup.
-
-func contextTODO() context.Context { return context.Background() }
 
 func discardLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))

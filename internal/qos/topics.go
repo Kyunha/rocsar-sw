@@ -12,7 +12,6 @@ package qos
 // traffic and a second priority class has no producer. See ARCHITECTURE.md 6.6.
 const (
 	TopicTelemetry = "telemetry"
-	TopicControl   = "control.response"
 )
 
 // AllTopics lists every published topic, for the subscription filter and for the

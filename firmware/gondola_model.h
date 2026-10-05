@@ -54,6 +54,34 @@ static_assert(NUM_ANTENNAS <=
 // and re-probing means fitting one later is picked up without a reflash.
 #define IMU_REPROBE_MS 1000
 
+// Consecutive getEvent() failures tolerated before a sensor that was answering
+// is declared absent. 50 at the shipped 50 Hz control tick is about a second --
+// long enough that one dropped read on a busy I2C bus changes nothing, short
+// enough that a sensor unplugged mid-run stops claiming to be a source of
+// heading within a second instead of holding its last bearing forever while the
+// wire still says imu_present.
+//
+// Named, because it used to be the kind of number that would be written inline
+// and then re-derived by whoever read the code. The re-probe (IMU_REPROBE_MS)
+// runs once this is reached, so fitting or re-seating a sensor is picked up
+// without a reflash.
+#define IMU_MISSED_SAMPLES_MAX 50
+
+// How long a heater stays on without a fresh command.
+//
+// This is the firmware half of a dead-man. The host (internal/command/
+// heater_keeper.go) re-sends an acknowledged heater-on every
+// HeaterRefreshInterval (10 s), which restarts this clock; anything else --
+// a dead host, a cut cable, a reboot -- stops the refreshes and the heater
+// goes off within one window of itself. It is here rather than in the sketch
+// because it is command-handling policy, and policy in the .ino can only be
+// checked by flashing a board.
+//
+// The two constants are a pair: 10 s refreshes fit twice into 20 s, so one
+// lost refresh does not flicker the heater. TestFirmwareHeater asserts that
+// relationship so neither side can be halved alone.
+#define HEATER_AUTO_OFF_MS 20000UL
+
 // The servo ids each antenna axis speaks to on the ST3215 bus. Overridable at
 // build time (arduino-cli --build-property compiler.cpp.extra_flags=-DANTENNA_0_SERVO_ID=3)
 // so a bench rig with different servo ids needs no source change; the defaults
@@ -201,16 +229,21 @@ inline bool shouldSendServoTick(uint16_t lastSent, uint16_t target) {
 //
 // Sized from the wire, not guessed: a 14-byte reply is about 1.2 ms at
 // SERVO_BAUD, so 5 ms is roughly four times the answer and is reached only by a
-// servo that has stopped answering. The buffer holds two replies plus a partial,
-// because the first poll's echo and the second poll's reply can both still be in
-// flight when the next read begins -- which is the case the old fixed-width read
-// could not represent at all.
+// servo that has stopped answering.
+//
+// The buffer is sized for a burst, not for one poll. One poll arrives as an
+// 8-byte echo of the request plus a 14-byte reply (22 bytes), and the previous
+// poll's pair can still be in the RX FIFO when the next request goes out --
+// two polls in flight is 44 bytes, which is more than the 40 this used to be.
+// A full buffer stops being read (`filled < sizeof(buffer)`), so the bytes pile
+// up in the UART's FIFO and the next poll reads a window that starts mid-frame.
+// 64 is two full bursts with room for a third.
 //
 // These live here rather than in the sketch because they are part of the framing
 // contract, and a #define inside the .ino can only be read, not checked against
 // the code that uses it.
 #define SERVO_STATUS_WAIT_MS 5
-#define SERVO_STATUS_BUFFER_LEN 40
+#define SERVO_STATUS_BUFFER_LEN 64
 
 // The longest frame this bus produces, in bytes, used to tell a slow arrival from
 // a corrupt length byte. The ST3215 instruction set tops out well below this: the
@@ -440,6 +473,20 @@ struct AntennaAxis {
   uint16_t manualTick;
   uint16_t lastSentTick;
 
+  // The boot interlock: set at power-up and cleared by the first command that
+  // expresses an intent for *this* axis -- set_target (both axes) or jog. While
+  // it is set, shouldDriveServo() transmits nothing, so a board that boots
+  // holds its mechanical position instead of driving to whatever the default
+  // geometry computes.
+  //
+  // That default is not a neutral one. target_heading_deg boots at 0, the
+  // mount offset is 270 degrees and the gear ratio is 5:1, so for four bearings
+  // out of five the first thing the firmware does on power-up is run an axis to
+  // the clamp at the rail. stop/zero/mount/dir deliberately do NOT clear this:
+  // none of them asks the servo to go anywhere, so none of them should be able
+  // to move an axis that has never been commanded.
+  bool awaitingCommand;
+
   // Telemetry Feedback Fields
   uint16_t currentTick;
   float currentAngleDeg;
@@ -463,9 +510,13 @@ struct AntennaAxis {
     centerTick = center;
     mountOffsetDeg = mountOffset;
     dirMultiplier = dir;
-    manualMode = false;
+    // Conservative boot: held in manual mode at centre, interlocked, and never
+    // sent -- so the first loop tick computes a target, declines to transmit
+    // it, and reports the posture rather than a position. See awaitingCommand.
+    manualMode = true;
     manualTick = center;
     lastSentTick = 0xFFFF;
+    awaitingCommand = true;
     currentTick = center;
     currentAngleDeg = 0.0f;
     temperatureC = 0.0f;
@@ -474,7 +525,7 @@ struct AntennaAxis {
     feedbackError = 0;
   }
 
-  uint16_t calculateTargetTick(float gondolaHeading, float targetHeading) {
+  uint16_t calculateTargetTick(float gondolaHeading, float targetHeading) const {
     if (manualMode) return manualTick;
 
     // Seam guard. applyImuHeading() below refuses to integrate a non-finite
@@ -496,6 +547,25 @@ struct AntennaAxis {
     return clampTick((int32_t)centerTick + tickOffset);
   }
 };
+
+// Whether an axis may put a position on the bus this control tick.
+//
+// Two conditions in one predicate, so the sketch cannot apply one and forget
+// the other. The boot interlock first: an axis that has never been commanded
+// transmits nothing, which is what makes power-up silent (see
+// AntennaAxis::awaitingCommand). Then the deadband, which is bus courtesy --
+// one tick is 0.088 degrees, so re-sending every 20 ms would put 50 identical
+// frames/s on a 115200 bus for no mechanical gain.
+//
+// Note the interlock does not swallow the first command. lastSentTick is still
+// 0xFFFF (never sent) when it clears, and every tick differs from 0xFFFF by
+// more than the deadband -- so the first commanded position is transmitted even
+// when it happens to equal the position the model believes it holds, which it
+// may well not: the servo's real position at boot is unknown.
+inline bool shouldDriveServo(const AntennaAxis& axis, uint16_t targetTick) {
+  return !axis.awaitingCommand &&
+         shouldSendServoTick(axis.lastSentTick, targetTick);
+}
 
 // Derives the position fields an operator reads, from what was last commanded.
 //
@@ -520,7 +590,13 @@ inline void updateAxisFeedback(AntennaAxis& axis) {
   if (axis.feedbackState != rocsar_v1_FeedbackState_FEEDBACK_UNKNOWN) {
     return;
   }
-  axis.currentTick = axis.lastSentTick;
+  // 0xFFFF is "never sent", not a position: the servo's range tops out at 4095,
+  // so publishing it would read as 65535 ticks -- about 5580 degrees off centre,
+  // with feedback_state=UNKNOWN as the only hint that it is fiction. The axis
+  // that has never been commanded is held at centre (that is the boot posture),
+  // so centre is what the fallback reports until a real reading lands.
+  axis.currentTick =
+      (axis.lastSentTick == 0xFFFF) ? axis.centerTick : axis.lastSentTick;
   axis.currentAngleDeg =
       ((float)axis.currentTick - (float)axis.centerTick) / TICKS_PER_DEGREE;
 }
@@ -566,12 +642,23 @@ struct GondolaState {
   bool heater1;
   bool heater2;
 
+  // When each heater last received an "on" command, in millis(). The dead-man
+  // clock behind HEATER_AUTO_OFF_MS; see noteHeaterCommand() and
+  // expireHeaters() below. Unused while the heater is off.
+  unsigned long heater1LastOnMs;
+  unsigned long heater2LastOnMs;
+
   // Whether the heading source is currently real. It is false for a Pico with
   // no BNO055 fitted, which is the actual state of every bench unit so far --
   // so `gondolaHeading` is then a *held* bearing, not a measurement, and this
   // bit is what tells the operator the difference. It rides the wire as
-  // TelemetryMessage.imu_present; see sendTelemetryMessage() in the sketch.
+  // PicoTelemetry.imu_present; see sendTelemetryMessage() in the sketch.
   bool imuPresent;
+
+  // Consecutive getEvent() failures since the sensor last answered. Drives the
+  // IMU_MISSED_SAMPLES_MAX declaration in noteImuMiss(); reset by any answered
+  // read (clearImuMisses) and by reaching the threshold itself.
+  uint16_t imuMissCount;
 };
 
 // Projects the model onto the wire message. The whole mapping lives here so the
@@ -640,7 +727,10 @@ inline void initGondolaState(GondolaState& state) {
   state.targetHeading = 0.0f;
   state.heater1 = false;
   state.heater2 = false;
+  state.heater1LastOnMs = 0;
+  state.heater2LastOnMs = 0;
   state.imuPresent = false;
+  state.imuMissCount = 0;
 }
 
 // Folds one heading sample into the model and reports what it did.
@@ -681,6 +771,32 @@ inline ImuSample applyImuHeading(GondolaState& state, float sampleDeg, bool sens
   return IMU_SAMPLE_APPLIED;
 }
 
+// One getEvent() failure from a sensor still believed present.
+//
+// Returns true when IMU_MISSED_SAMPLES_MAX consecutive failures have landed,
+// which is the sketch's cue to declare the sensor absent -- through
+// applyImuHeading(gondola, 0.0f, false), the same call the no-sensor branch
+// makes, so presence still has exactly one writer. The counter restarts on that
+// declaration, so the next fitted session gets the full budget rather than
+// being one flapping sample away from declared-absent forever.
+//
+// A getEvent() that *answers* is not a miss, even when the value it carried is
+// NaN and applyImuHeading() rejects it: the question this counts is "did the
+// sensor speak", not "was the number usable".
+inline bool noteImuMiss(GondolaState& state) {
+  state.imuMissCount++;
+  if (state.imuMissCount < IMU_MISSED_SAMPLES_MAX) {
+    return false;
+  }
+  state.imuMissCount = 0;
+  return true;
+}
+
+// A getEvent() that answered, whatever it answered with.
+inline void clearImuMisses(GondolaState& state) {
+  state.imuMissCount = 0;
+}
+
 inline AntennaAxis* findAntenna(GondolaState& state, uint32_t servoId) {
   for (int i = 0; i < NUM_ANTENNAS; i++) {
     if (state.antennas[i].id == servoId) {
@@ -690,32 +806,96 @@ inline AntennaAxis* findAntenna(GondolaState& state, uint32_t servoId) {
   return nullptr;
 }
 
+// Latches one heater command and, for an "on", starts (or restarts) the
+// dead-man clock. `heaterId` has already been validated by applyCommand().
+//
+// An "off" is immediate and does not touch the stamp: expireHeaters() only ever
+// clears a flag that is on, so there is no timestamp to keep honest.
+inline void noteHeaterCommand(GondolaState& state, uint32_t heaterId, bool on,
+                              unsigned long nowMs) {
+  if (heaterId == 1) {
+    state.heater1 = on;
+    if (on) state.heater1LastOnMs = nowMs;
+  } else {
+    state.heater2 = on;
+    if (on) state.heater2LastOnMs = nowMs;
+  }
+}
+
+// Turns off any heater whose last "on" command is now more than
+// HEATER_AUTO_OFF_MS old. The sketch calls this every control tick and mirrors
+// the flags to the pins.
+//
+// The subtraction is unsigned on purpose: millis() wraps roughly every 49
+// days, and `nowMs - stamp` stays correct across the wrap as long as both are
+// the same width, where a signed `nowMs >= stamp + HEATER_AUTO_OFF_MS` would
+// not be. The clock is only consulted for a heater that is on, so a heater
+// turned off at t=0 cannot expire "again".
+//
+// This is the half of the dead-man that makes the system fail safe: the host
+// half (HeaterRefreshInterval in internal/command/heater_keeper.go) exists
+// only to keep pushing the window forward, and every way for it to fail --
+// crash, unplug, reboot -- leaves this function to do the turning off.
+inline void expireHeaters(GondolaState& state, unsigned long nowMs) {
+  if (state.heater1 && (nowMs - state.heater1LastOnMs) >= HEATER_AUTO_OFF_MS) {
+    state.heater1 = false;
+  }
+  if (state.heater2 && (nowMs - state.heater2LastOnMs) >= HEATER_AUTO_OFF_MS) {
+    state.heater2 = false;
+  }
+}
+
 // Applies one decoded command to the model and returns the firmware's reply
 // code. Heater pins are driven by the sketch, so only the model flag changes
 // here; the sketch mirrors it to GPIO after calling this.
+//
+// `nowMs` is the caller's clock (millis() in the sketch), and it is only read
+// by the heater path: an "on" starts the HEATER_AUTO_OFF_MS dead-man, so the
+// time the command arrived is part of what the command means. Every other
+// command ignores it, and nothing in this header reads a clock itself.
 inline rocsar_v1_ErrorCode applyCommand(
-    GondolaState& state, const rocsar_v1_PicoCommand& cmd) {
+    GondolaState& state, const rocsar_v1_PicoCommand& cmd, unsigned long nowMs) {
   AntennaAxis* axis = nullptr;
 
   switch (cmd.which_payload) {
-    case rocsar_v1_PicoCommand_set_target_tag:
-      state.targetHeading = wrap360(cmd.payload.set_target.target_heading_deg);
+    case rocsar_v1_PicoCommand_set_target_tag: {
+      // Rejected here rather than tolerated downstream. wrap360(NaN) is NaN, so
+      // a non-finite target would be latched as the heading the antennas are
+      // tracking and every calculateTargetTick() after it would take the
+      // non-finite branch and centre -- the command would appear accepted (this
+      // function returned ERROR_NONE) and silently do nothing anyone could see
+      // until they read target_heading_deg off the wire.
+      float targetHeading = cmd.payload.set_target.target_heading_deg;
+      if (!isfinite(targetHeading)) {
+        return rocsar_v1_ErrorCode_ERROR_INVALID_PARAMETER;
+      }
+      state.targetHeading = wrap360(targetHeading);
       for (int i = 0; i < NUM_ANTENNAS; i++) {
         state.antennas[i].manualMode = false;
+        // Releasing the boot interlock for both axes: a target is exactly the
+        // expressed intent it is waiting for.
+        state.antennas[i].awaitingCommand = false;
       }
       return rocsar_v1_ErrorCode_ERROR_NONE;
+    }
 
     case rocsar_v1_PicoCommand_jog_tag:
       axis = findAntenna(state, cmd.payload.jog.servo_id);
       if (axis == nullptr) return rocsar_v1_ErrorCode_ERROR_INVALID_SERVO;
       axis->manualTick = clampTick((int32_t)cmd.payload.jog.tick);
       axis->manualMode = true;
+      axis->awaitingCommand = false;
       return rocsar_v1_ErrorCode_ERROR_NONE;
 
     case rocsar_v1_PicoCommand_stop_tag:
       axis = findAntenna(state, cmd.payload.stop.servo_id);
       if (axis == nullptr) return rocsar_v1_ErrorCode_ERROR_INVALID_SERVO;
       // Freeze at the position the axis is actually holding.
+      //
+      // Deliberately does NOT release awaitingCommand: on an axis that has
+      // never been commanded, "stop" is a no-op that must stay one, because
+      // releasing would make the next tick transmit lastSentTick=0xFFFF's
+      // target -- a first move, made by a command that asks for none.
       axis->manualTick = axis->currentTick;
       axis->manualMode = true;
       return rocsar_v1_ErrorCode_ERROR_NONE;
@@ -725,32 +905,44 @@ inline rocsar_v1_ErrorCode applyCommand(
       if (axis == nullptr) return rocsar_v1_ErrorCode_ERROR_INVALID_SERVO;
       axis->centerTick = axis->currentTick;
       axis->manualTick = axis->currentTick;
+      // Also not an expressed intent to move: zero redefines centre from where
+      // the axis already is, so it must not be able to start motion either.
       return rocsar_v1_ErrorCode_ERROR_NONE;
 
-    case rocsar_v1_PicoCommand_mount_tag:
+    case rocsar_v1_PicoCommand_mount_tag: {
       axis = findAntenna(state, cmd.payload.mount.servo_id);
       if (axis == nullptr) return rocsar_v1_ErrorCode_ERROR_INVALID_SERVO;
-      axis->mountOffsetDeg = wrap360(cmd.payload.mount.offset_deg);
+      // Same seam as the target above: mountOffsetDeg feeds wrap360() and then
+      // the tick arithmetic, and a NaN there reaches the (int32_t) cast. A
+      // mount offset that is not a number cannot be applied, so say so.
+      float offsetDeg = cmd.payload.mount.offset_deg;
+      if (!isfinite(offsetDeg)) {
+        return rocsar_v1_ErrorCode_ERROR_INVALID_PARAMETER;
+      }
+      axis->mountOffsetDeg = wrap360(offsetDeg);
       return rocsar_v1_ErrorCode_ERROR_NONE;
+    }
 
     case rocsar_v1_PicoCommand_dir_tag:
       axis = findAntenna(state, cmd.payload.dir.servo_id);
       if (axis == nullptr) return rocsar_v1_ErrorCode_ERROR_INVALID_SERVO;
+      // NaN fails both comparisons, so this case already rejects it: a
+      // multiplier that is not exactly +/-1 would send the axis the wrong way
+      // or not at all, and 0 would park it permanently.
       if (cmd.payload.dir.multiplier != 1.0f && cmd.payload.dir.multiplier != -1.0f) {
         return rocsar_v1_ErrorCode_ERROR_INVALID_PARAMETER;
       }
       axis->dirMultiplier = cmd.payload.dir.multiplier;
       return rocsar_v1_ErrorCode_ERROR_NONE;
 
-    case rocsar_v1_PicoCommand_heater_tag:
-      if (cmd.payload.heater.heater_id == 1) {
-        state.heater1 = cmd.payload.heater.state;
-      } else if (cmd.payload.heater.heater_id == 2) {
-        state.heater2 = cmd.payload.heater.state;
-      } else {
+    case rocsar_v1_PicoCommand_heater_tag: {
+      uint32_t heaterId = cmd.payload.heater.heater_id;
+      if (heaterId != 1 && heaterId != 2) {
         return rocsar_v1_ErrorCode_ERROR_INVALID_HEATER;
       }
+      noteHeaterCommand(state, heaterId, cmd.payload.heater.state, nowMs);
       return rocsar_v1_ErrorCode_ERROR_NONE;
+    }
 
     case rocsar_v1_PicoCommand_status_request_tag:
       // The acknowledgement is the liveness proof; state rides the 1 Hz

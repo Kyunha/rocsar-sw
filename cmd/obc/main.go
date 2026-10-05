@@ -307,14 +307,21 @@ func run() error {
 	// ---------------------------------------------------------------------
 	// Transport
 	// ---------------------------------------------------------------------
+	// The host half of the heater dead-man. The firmware turns off anything it
+	// has not heard about within HEATER_AUTO_OFF_MS, so this is what keeps a
+	// heater on across the seconds between one operator command and the next.
+	heaterKeeper := command.NewHeaterKeeper(picoPort, log, command.HeaterRefreshInterval)
+
 	dispatcher := command.New(command.Deps{
-		Pico:   picoPort,
-		GNSS:   gnssBank,
-		Camera: cam,
-		SDR:    sdrPort,
-		Link:   shaper,
-		Log:    log,
+		Pico:    picoPort,
+		GNSS:    gnssBank,
+		Camera:  cam,
+		SDR:     sdrPort,
+		Link:    shaper,
+		Heaters: heaterKeeper,
+		Log:     log,
 	})
+	go dispatcher.Run(ctx)
 
 	zmq := transport.NewZMQ(log, func(req *rocsarv1.CommandRequest) *rocsarv1.CommandResponse {
 		return dispatcher.Handle(ctx, req)

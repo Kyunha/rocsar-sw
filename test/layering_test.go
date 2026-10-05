@@ -77,6 +77,16 @@ var layerRules = []forbiddenRule{
 			"github.com/rocsar/obc/internal/transport",
 		},
 	},
+	{
+		pkg:    "internal/gsview",
+		reason: "presentation logic must not touch the wire or a socket",
+		forbid: []string{
+			"github.com/rocsar/obc/api/rocsar/v1", // generated protobuf
+			"github.com/go-zeromq",                // the wire
+			"go.bug.st/serial",                    // the wire
+			"net", "net/http", "os/exec", "os", "io",
+		},
+	},
 }
 
 // subsystemOwners maps a package allowed to use a forbidden import to the reason
@@ -197,6 +207,15 @@ func TestGeneratedProtobufIsConfinedToCodecPackages(t *testing.T) {
 		// any of it -- it has a TelemetryFrame and that is the whole of its
 		// knowledge.
 		"internal/client": true,
+		// cmd/gs tests speak the wire to a fake OBC: the handler answers
+		// CommandRequests and the publisher emits TelemetryFrames, and naming
+		// those types requires the import. Production code in cmd/gs (app.go,
+		// main.go) must not import the bindings -- it touches every command
+		// and owns none of the schema, through internal/client's Request and
+		// Response aliases. That half is enforced separately, by
+		// TestCmdGsProductionHasNoProtobuf below, because this allowlist
+		// cannot tell a test file from the code it tests.
+		"cmd/gs": true,
 	}
 
 	for _, f := range allGoFiles(t, root) {
@@ -214,6 +233,103 @@ func TestGeneratedProtobufIsConfinedToCodecPackages(t *testing.T) {
 				"    Only %v may. Everything else goes through domain types, which is what\n"+
 				"    keeps the schema from becoming the whole system's interface.",
 				rel, imp.line, keysOf(allowed))
+		}
+	}
+}
+
+// Production code in cmd/gs must not import the generated protobuf bindings,
+// even though its tests may (see the cmd/gs entry in the allowlist above).
+// The binding layer touches every command and owns none of the schema: names
+// flow through internal/client's Request and Response aliases, and a oneof
+// constructed by hand in app.go would be a field renumbering away from a
+// silent runtime failure. Test files are exempt -- they speak the wire to a
+// fake OBC, which is what tests are for -- because they are not shipped.
+func TestCmdGsProductionHasNoProtobuf(t *testing.T) {
+	root := moduleRoot(t)
+	const genPath = "github.com/rocsar/obc/api/rocsar/v1"
+
+	files := goFilesIn(t, filepath.Join(root, "cmd", "gs"))
+	if len(files) == 0 {
+		t.Fatal("no Go files in cmd/gs; the production check is vacuous")
+	}
+	seenTest := false
+	for _, f := range files {
+		rel := rel(t, root, f)
+		if strings.HasSuffix(rel, "_test.go") {
+			seenTest = true
+			continue
+		}
+		for _, imp := range parseImports(t, f) {
+			if imp.path != genPath {
+				continue
+			}
+			t.Errorf("%s:%d imports the generated protobuf bindings in production code\n"+
+				"    Name the type through internal/client instead. A hand-built oneof\n"+
+				"    in the binding layer is a field renumbering away from silence.",
+				rel, imp.line)
+		}
+	}
+	if !seenTest {
+		t.Error("no test files in cmd/gs; untested binding code is unbound code")
+	}
+}
+
+// The browser must never decode protobuf. Go decodes once, in internal/client,
+// and the frontend receives JSON; a TypeScript protobuf runtime would be a
+// second decoder for the same wire format, in a language with none of this
+// repository's wire tests. A rule nobody checks is a comment, so this checks
+// both the dependency manifest and the sources: neither `npm install` nor a
+// vendored file may smuggle the decoder in.
+func TestFrontendHasNoProtobuf(t *testing.T) {
+	root := moduleRoot(t)
+	frontend := filepath.Join(root, "cmd", "gs", "frontend")
+
+	manifest, err := os.ReadFile(filepath.Join(frontend, "package.json"))
+	if err != nil {
+		t.Fatalf("read frontend/package.json: %v", err)
+	}
+	for _, token := range []string{
+		"protobufjs", "protobuf-es", "@bufbuild", "google-protobuf",
+		"ts-proto", "pbjs", "prost", "protojson", "gogoproto",
+	} {
+		if strings.Contains(string(manifest), token) {
+			t.Errorf("frontend/package.json depends on %q; the browser must not decode protobuf", token)
+		}
+	}
+
+	// Sources are matched on decoder-shaped tokens, not on the bare word:
+	// comments legitimately say "protobuf" when they state this very rule.
+	// What cannot appear is an import of it, a .proto file, or a generated
+	// stub.
+	src, err := os.ReadDir(filepath.Join(frontend, "src"))
+	if err != nil {
+		t.Fatalf("read frontend/src: %v", err)
+	}
+	for _, entry := range src {
+		name := entry.Name()
+		if entry.IsDir() {
+			continue
+		}
+		if strings.HasSuffix(name, ".css") {
+			continue
+		}
+		if strings.HasSuffix(name, ".proto") || strings.Contains(name, "_pb2") {
+			t.Errorf("frontend/src/%s looks like a protobuf artefact; the browser receives JSON", name)
+			continue
+		}
+		body, err := os.ReadFile(filepath.Join(frontend, "src", name))
+		if err != nil {
+			t.Fatalf("read frontend/src/%s: %v", name, err)
+		}
+		text := string(body)
+		for _, token := range []string{
+			"protobufjs", "protobuf-es", "@bufbuild", "google-protobuf",
+			"ts-proto", "pbjs", "prost", "protojson", "gogoproto", ".proto\"",
+			".proto'", "from \"buffer\"", "from 'buffer'",
+		} {
+			if strings.Contains(text, token) {
+				t.Errorf("frontend/src/%s contains %q; the browser must not decode protobuf", name, token)
+			}
 		}
 	}
 }

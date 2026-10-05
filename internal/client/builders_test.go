@@ -97,6 +97,15 @@ func TestValidArgumentsBuildTheRightCommand(t *testing.T) {
 				t.Errorf("receiver %d, want 3", g.GnssSelect.GetReceiverId())
 			}
 		}},
+		{"gnss-rotate", "gnss-rotate", nil, func(t *testing.T, r *rocsarv1.CommandRequest) {
+			g, ok := r.GetPayload().(*rocsarv1.CommandRequest_GnssSelect)
+			if !ok {
+				t.Fatalf("payload is %T, want GnssSelect", r.GetPayload())
+			}
+			if !g.GnssSelect.GetRotate() {
+				t.Error("rotate flag not set; the window's next-receiver button needs it")
+			}
+		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			reqs, err := BuildRequests(tc.cmd, tc.args)
@@ -111,6 +120,38 @@ func TestValidArgumentsBuildTheRightCommand(t *testing.T) {
 				t.Error("request_id is empty; a reply could not be matched to this command")
 			}
 		})
+	}
+}
+
+// A partial SDR update names only the fields it changes; absent stays absent,
+// because a PRF of zero is not a request to set the PRF to zero. An all-nil
+// patch is refused rather than sent as a no-op: the operator pressed the
+// button expecting a change.
+func TestSetParamsPatchIsPartial(t *testing.T) {
+	prf := 2750.0
+	req, err := BuildSetParamsRequest(SdrParamsPatch{PRFHz: &prf})
+	if err != nil {
+		t.Fatalf("partial patch refused: %v", err)
+	}
+	got, ok := req.GetPayload().(*rocsarv1.CommandRequest_SdrSetParams)
+	if !ok {
+		t.Fatalf("payload is %T, want SdrSetParams", req.GetPayload())
+	}
+	params := got.SdrSetParams.GetParams()
+	if params.GetPrfHz() != 2750.0 {
+		t.Errorf("prf = %v, want 2750", params.GetPrfHz())
+	}
+	if params.SampleRateHz != nil || params.TxFreqHz != nil ||
+		params.NormalizedGainTx != nil || params.NormalizedGainRx != nil ||
+		params.BandwidthHz != nil || params.SessionDurationS != nil {
+		t.Errorf("unset fields became present: %+v", params)
+	}
+	if req.GetRequestId() == "" {
+		t.Error("request_id is empty; a reply could not be matched to this command")
+	}
+
+	if _, err := BuildSetParamsRequest(SdrParamsPatch{}); err == nil {
+		t.Error("an empty patch was accepted; it changes nothing and reports success")
 	}
 }
 

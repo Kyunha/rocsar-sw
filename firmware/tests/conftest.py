@@ -114,7 +114,12 @@ def probe(tmp_path_factory) -> Path:
 
 
 def run(probe_path: Path, *args: str) -> str:
-    result = subprocess.run([str(probe_path), *args], capture_output=True, text=True)
+    # check=False, not omitted: the exit status is asserted on the next line so
+    # a failure can carry the probe's own stderr, which a CalledProcessError
+    # would swallow into the repr.
+    result = subprocess.run(
+        [str(probe_path), *args], capture_output=True, text=True, check=False
+    )
     assert result.returncode == 0, f"probe failed: {result.stderr}"
     return result.stdout.strip()
 

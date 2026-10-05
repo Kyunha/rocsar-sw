@@ -9,6 +9,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 
 	"google.golang.org/protobuf/proto"
@@ -34,11 +35,12 @@ import (
 const maxCommandOutput = 8192
 
 type Dispatcher struct {
-	pico   domain.Pico
-	gnss   *gnss.Bank
-	camera domain.Camera
-	sdr    domain.Sdr
-	link   domain.LinkShaper
+	pico    domain.Pico
+	gnss    *gnss.Bank
+	camera  domain.Camera
+	sdr     domain.Sdr
+	link    domain.LinkShaper
+	heaters *HeaterKeeper
 
 	log *slog.Logger
 
@@ -54,12 +56,13 @@ type Dispatcher struct {
 // with doubles, and so the composition root is the only place that decides which
 // implementation is real.
 type Deps struct {
-	Pico   domain.Pico
-	GNSS   *gnss.Bank
-	Camera domain.Camera
-	SDR    domain.Sdr
-	Link   domain.LinkShaper
-	Log    *slog.Logger
+	Pico    domain.Pico
+	GNSS    *gnss.Bank
+	Camera  domain.Camera
+	SDR     domain.Sdr
+	Link    domain.LinkShaper
+	Heaters *HeaterKeeper
+	Log     *slog.Logger
 }
 
 // New returns a dispatcher.
@@ -68,14 +71,27 @@ func New(d Deps) *Dispatcher {
 		d.Log = slog.Default()
 	}
 	return &Dispatcher{
-		pico:   d.Pico,
-		gnss:   d.GNSS,
-		camera: d.Camera,
-		sdr:    d.SDR,
-		link:   d.Link,
-		log:    d.Log,
-		seen:   make(map[string]uint64),
+		pico:    d.Pico,
+		gnss:    d.GNSS,
+		camera:  d.Camera,
+		sdr:     d.SDR,
+		link:    d.Link,
+		heaters: d.Heaters,
+		log:     d.Log,
+		seen:    make(map[string]uint64),
 	}
+}
+
+// Run starts the host half of the heater dead-man and blocks until ctx is done.
+//
+// The firmware turns anything it has not heard about off on its own; this is
+// what "the operator asked for heat, keep it" means after the button has been
+// released. The composition root starts it in its own goroutine.
+func (d *Dispatcher) Run(ctx context.Context) {
+	if d.heaters == nil {
+		return
+	}
+	d.heaters.Run(ctx)
 }
 
 // Handle dispatches one command and returns its response.
@@ -167,6 +183,17 @@ func (d *Dispatcher) picoCommand(ctx context.Context, requestID string, cmd *roc
 	if cmd == nil {
 		return fail(requestID, rocsarv1.ErrorCode_ERROR_INVALID_COMMAND, "no Pico command")
 	}
+
+	// The off side of the heater asymmetry is settled before the link is
+	// consulted: an operator who asked for OFF gets its intent recorded even if
+	// the board is unreachable, because a keep-alive the operator has cancelled
+	// must not resurrect a heater the moment the link returns. An ON waits for
+	// the acknowledgement below -- an intent that never arrived must not be
+	// revived by the keeper either. See HeaterKeeper.
+	if h := cmd.GetHeater(); h != nil && !h.GetState() {
+		d.noteHeaterIntent(h.GetHeaterId(), false)
+	}
+
 	if !d.pico.Connected() {
 		// Distinct from a timeout: this is "there is nothing to talk to", which
 		// is a cable or an unplugged board, not a wedged one.
@@ -191,6 +218,12 @@ func (d *Dispatcher) picoCommand(ctx context.Context, requestID string, cmd *roc
 		ack, err = d.pico.SetDirection(ctx, p.Dir.GetServoId(), float64(p.Dir.GetMultiplier()))
 	case *rocsarv1.PicoCommand_Heater:
 		ack, err = d.pico.SetHeater(ctx, p.Heater.GetHeaterId(), p.Heater.GetState())
+		// Only a successful ON enters the keeper: the keep-alive may re-assert
+		// exactly what the board has confirmed it received. OFF was already
+		// noted above, before the link was consulted.
+		if p.Heater.GetState() && err == nil && ack != nil && ack.Success {
+			d.noteHeaterIntent(p.Heater.GetHeaterId(), true)
+		}
 	case *rocsarv1.PicoCommand_Stop:
 		ack, err = d.pico.Stop(ctx, p.Stop.GetServoId())
 	case *rocsarv1.PicoCommand_StatusRequest:
@@ -211,6 +244,17 @@ func (d *Dispatcher) picoCommand(ctx context.Context, requestID string, cmd *roc
 	}
 
 	return ok(requestID, "acknowledged by the flight controller")
+}
+
+// noteHeaterIntent forwards the operator's word to the keeper.
+//
+// A dispatcher built without a keeper (a test, or a build that does not run
+// the keep-alive) simply has no opinion to record.
+func (d *Dispatcher) noteHeaterIntent(heaterID uint32, on bool) {
+	if d.heaters == nil {
+		return
+	}
+	d.heaters.Note(heaterID, on)
 }
 
 // classify maps a dispatch error onto the wire enum.
@@ -432,34 +476,9 @@ func containsAny(err error, subs ...string) bool {
 	if err == nil {
 		return false
 	}
-	msg := err.Error()
+	msg := strings.ToLower(err.Error())
 	for _, s := range subs {
-		if len(s) > 0 && containsFold(msg, s) {
-			return true
-		}
-	}
-	return false
-}
-
-func containsFold(haystack, needle string) bool {
-	if len(needle) > len(haystack) {
-		return false
-	}
-	lower := func(b byte) byte {
-		if b >= 'A' && b <= 'Z' {
-			return b + 32
-		}
-		return b
-	}
-	for i := 0; i+len(needle) <= len(haystack); i++ {
-		match := true
-		for j := 0; j < len(needle); j++ {
-			if lower(haystack[i+j]) != lower(needle[j]) {
-				match = false
-				break
-			}
-		}
-		if match {
+		if len(s) > 0 && strings.Contains(msg, strings.ToLower(s)) {
 			return true
 		}
 	}
@@ -470,7 +489,7 @@ func isTimeout(err error) bool {
 	if err == nil {
 		return false
 	}
-	msg := err.Error()
-	return containsFold(msg, "timeout") || containsFold(msg, "not acknowledged") ||
-		containsFold(msg, "timed out")
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "timeout") || strings.Contains(msg, "not acknowledged") ||
+		strings.Contains(msg, "timed out")
 }

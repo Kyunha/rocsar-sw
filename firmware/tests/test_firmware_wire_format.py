@@ -49,7 +49,7 @@ class TestFraming:
             assert 0 < len(frame) < 256, "frame must fit PICO_TX_BUFFER"
 
     def test_a_response_frame_differs_from_a_telemetry_frame(self, probe):
-        telemetry_frame, success_frame, error_frame = _frames(probe)
+        _telemetry_frame, success_frame, error_frame = _frames(probe)
         # The response frames are the ones the OBC's request/response
         # correlation depends on; if success and error encoded identically the
         # OBC could not tell an acknowledgement from a refusal.

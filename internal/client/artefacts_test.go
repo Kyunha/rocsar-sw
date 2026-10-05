@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -359,6 +360,36 @@ func containsAny(haystack []string, want string) bool {
 	return false
 }
 
+// Config crosses the Wails bridge as JSON in both directions: the window
+// sends endpoints to Connect, and Endpoints returns them for display. The tags
+// are the contract -- without them the generator emits Go field names and the
+// TypeScript side silently sends fields Go ignores, which reads as "the
+// connect button does nothing".
+func TestConfigJSONRoundTrip(t *testing.T) {
+	in := Config{
+		Control:   "tcp://192.168.1.50:5555",
+		Telemetry: "tcp://192.168.1.50:5556",
+		HTTP:      "http://192.168.1.50:5557",
+		Topic:     "telemetry",
+	}
+	body, err := json.Marshal(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out Config
+	if err := json.Unmarshal(body, &out); err != nil {
+		t.Fatal(err)
+	}
+	if out != in {
+		t.Errorf("config round trip changed %+v to %+v", in, out)
+	}
+	for _, key := range []string{`"control_endpoint"`, `"telemetry_endpoint"`, `"http_endpoint"`, `"topic"`} {
+		if !strings.Contains(string(body), key) {
+			t.Errorf("config JSON lacks %s; the frontend sends these names", key)
+		}
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Names
 // ---------------------------------------------------------------------------
@@ -383,6 +414,7 @@ func TestNamesAndBuildRequestsAgree(t *testing.T) {
 		{"query", nil},
 		{"photo", nil},
 		{"gnss", []string{"1"}},
+		{"gnss-rotate", nil},
 		{"heading", []string{"275.5"}},
 		{"jog", []string{"1", "3000"}},
 		{"zero", nil},

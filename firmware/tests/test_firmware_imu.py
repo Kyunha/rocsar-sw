@@ -13,11 +13,13 @@ from __future__ import annotations
 
 import math
 import re
+from itertools import pairwise
 
 import pytest
 from conftest import FIRMWARE_DIR, run
 
 SKETCH = FIRMWARE_DIR / "firmware.ino"
+MODEL = FIRMWARE_DIR / "gondola_model.h"
 
 
 def _heading(probe, *steps: str) -> list[dict[str, object]]:
@@ -39,6 +41,19 @@ def _heading(probe, *steps: str) -> list[dict[str, object]]:
             }
         )
     return steps_out
+
+
+def _final_header(probe, *steps: str) -> dict[str, str]:
+    """The probe's final STATE header: heading, presence, and the miss count.
+
+    The counter is not on the wire (the schema has no field for it and the
+    interface is frozen), so this is the only way to see it reset -- and a
+    reset that silently stopped happening would otherwise show up much later as
+    a sensor declared absent after a single dropped read.
+    """
+    out = run(probe, "--heading", *steps)
+    line = next(line for line in out.splitlines() if line.startswith("STATE "))
+    return dict(re.findall(r"(\w+)=([-\d.]+)", line.split("|")[0]))
 
 
 def _target_tick(probe, heading: str, target: str) -> int:
@@ -192,6 +207,64 @@ class TestDroppedTicks:
         assert steps[1]["imu"] is True
 
 
+class TestMissThreshold:
+    """Silence has to end somewhere, and the place has to be counted.
+
+    Before this, one dropped read and a sensor yanked out mid-run were the same
+    fact to the firmware: it held the bearing and kept saying imu_present,
+    forever. The counter is the difference -- a busy I2C bus that drops a read
+    changes nothing, a sensor that stops answering is reported absent within
+    about a second and the existing re-probe gets its chance to run.
+    """
+
+    def test_forty_nine_misses_leave_the_sensor_present(self, probe):
+        steps = _heading(probe, "90", *(["nodata"] * 49))
+        assert steps[0]["outcome"] == "APPLIED"
+        assert steps[-1]["imu"] is True, "one read short of the threshold"
+
+    def test_the_fiftieth_miss_declares_the_sensor_absent(self, probe):
+        """And the bearing is *held* through the declaration, not reset.
+
+        Losing the sensor must not move the antenna: the last real bearing is
+        still the best one available, and a hold that jumped to zero on loss
+        would swing the dish on the very failure it is meant to ride out.
+        """
+        steps = _heading(probe, "90", *(["nodata"] * 50))
+        assert steps[-1]["imu"] is False
+        assert steps[-1]["heading"] == pytest.approx(steps[0]["heading"])
+
+    def test_the_counter_starts_over_after_declaring_absence(self, probe):
+        """A sensor that flaps must not stay declared for one bad read.
+
+        The declaration resets the count, so the next session -- whether it
+        begins with a re-probe or a board that never lost the sensor -- gets
+        the full budget again instead of being a single miss away from absent.
+        """
+        steps = _heading(probe, "90", *(["nodata"] * 50), "90", *(["nodata"] * 50))
+        assert steps[50]["imu"] is False, "the 50th miss declares absence"
+        assert steps[51]["imu"] is True, "the next sample is a fresh session"
+        assert steps[51]["outcome"] == "APPLIED"
+        assert steps[-1]["imu"] is False, "and it too gets a full 50 before declaring"
+
+        header = _final_header(probe, "90", *(["nodata"] * 50))
+        assert header["miss"] == "0", "the declaration must zero the counter"
+        assert header["imu"] == "0"
+
+    def test_an_arriving_sample_resets_the_count(self, probe):
+        """Two runs of 49 misses with a sample between them never add up.
+
+        Without the reset the second run continues the first, and a sensor
+        could be declared absent while it was demonstrably answering a moment
+        ago -- from misses that were never consecutive.
+        """
+        steps = _heading(probe, "90", *(["nodata"] * 49), "90", *(["nodata"] * 49))
+        assert steps[-1]["imu"] is True
+
+        header = _final_header(probe, "90", *(["nodata"] * 49), "90", *(["nodata"] * 7))
+        assert header["miss"] == "7", "the sample must have zeroed the counter"
+        assert header["imu"] == "1"
+
+
 class TestTheSketchPlumbsTheSensor:
     """The probe cannot see the `.ino`, so the one regression it structurally
     cannot catch is asserted as text.
@@ -253,16 +326,43 @@ class TestTheSketchPlumbsTheSensor:
             "presence must live in GondolaState, not in a sketch-local variable"
         )
 
+    def test_the_miss_count_lives_in_the_model_and_reaches_the_re_probe(self):
+        """The counter is policy, so it cannot be written in the sketch.
+
+        What the sketch must do is exactly two things on the failure path --
+        count, and on the count's say-so declare absence through the one
+        function that writes presence -- plus reset on any answered read. A
+        literal threshold in the .ino would be a number no test can reach.
+        """
+        code = self._sketch_code()
+        assert "if (noteImuMiss(gondola))" in code, (
+            "the sketch must let the model decide when silence is enough"
+        )
+        assert "clearImuMisses(gondola);" in code, (
+            "an answered read must reset the counter, or two separate runs of "
+            "dropped reads add up into one declaration"
+        )
+        assert "applyImuHeading(gondola, 0.0f, false)" in code, (
+            "the declaration must go through the function that writes presence"
+        )
+        assert not re.search(r"imuMissCount\s*[<>=]", code), (
+            "the sketch must not do its own counting"
+        )
+
+        model = MODEL.read_text()
+        assert "#define IMU_MISSED_SAMPLES_MAX 50" in model, (
+            "the threshold must be a named constant in the model, not a literal"
+        )
+        assert "state.imuMissCount++" in model
+
 
 class TestHeadingIntegration:
     def test_a_real_sample_moves_the_heading_toward_itself(self, probe):
         steps = _heading(probe, "0", "90", "90", "90", "90", "90", "90")
         headings = [float(step["heading"]) for step in steps]
-        # strict=False is correct, not a waiver: the shifted list is one shorter
-        # by construction.
-        assert all(
-            later > earlier for earlier, later in zip(headings, headings[1:], strict=False)
-        ), f"the EMA should climb monotonically toward the sample: {headings}"
+        assert all(later > earlier for earlier, later in pairwise(headings)), (
+            f"the EMA should climb monotonically toward the sample: {headings}"
+        )
 
     def test_the_heading_stays_wrapped(self, probe):
         """Sustained samples across the 360/0 seam must not run away.

@@ -49,7 +49,7 @@ func EncodeTelemetry(s telemetry.Snapshot) *rocsarv1.TelemetryFrame {
 		Camera: &rocsarv1.CameraStatus{
 			State: toWireState(s.Camera),
 			PhotosTaken: func() *uint64 {
-				if s.Camera == domain.SubsystemUnspecified {
+				if !s.PhotosTakenKnown {
 					return nil
 				}
 				v := s.PhotosTaken
@@ -225,6 +225,7 @@ func DecodeTelemetry(f *rocsarv1.TelemetryFrame) telemetry.Snapshot {
 		s.LastPhoto = cam.GetLastPhotoName()
 		if cam.PhotosTaken != nil {
 			s.PhotosTaken = cam.GetPhotosTaken()
+			s.PhotosTakenKnown = true
 		}
 	}
 
@@ -236,6 +237,14 @@ func DecodeTelemetry(f *rocsarv1.TelemetryFrame) telemetry.Snapshot {
 			Accepted:   g.GetPacketsAccepted(),
 			Rejected:   g.GetPacketsRejected(),
 		}
+		// HasFix is inferred from the value, not the presence: fix_age_s is a
+		// plain (non-optional) double on the wire, so "absent" and "age exactly
+		// zero" are the same bytes and no decoder can tell them apart. A fix
+		// younger than the wire's resolution therefore decodes as never-had-a-
+		// fix -- a sub-nanosecond window, unobservable at the 1 Hz telemetry
+		// rate, where the youngest real age is milliseconds. If that ever
+		// stops being true the fix is a schema change (optional fix_age_s),
+		// not a smarter comparison here.
 		if g.GetFixAgeS() > 0 {
 			r.HasFix = true
 			r.FixAge = time.Duration(g.GetFixAgeS() * float64(time.Second))

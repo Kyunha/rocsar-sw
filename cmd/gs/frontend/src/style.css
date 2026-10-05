@@ -1,0 +1,245 @@
+/* ROCSAR Ground Station: an operator console, not a marketing page.
+ *
+ * Dark, dense, monospace-leaning. State is never colour alone: every coloured
+ * dot also has a word beside it, because "no data" must not be
+ * indistinguishable from anything by colour or by anything else. */
+:root {
+    color-scheme: dark;
+    --bg: #121418;
+    --panel: #1a1d23;
+    --line: #2a2e37;
+    --text: #d7dae0;
+    --dim: #8b909b;
+    --accent: #6aa9ff;
+    --ok: #7dd87d;
+    --bad: #ff7a7a;
+    --warn-bg: #3a2f14;
+    --err-bg: #3d1a1a;
+}
+
+* {
+    box-sizing: border-box;
+}
+
+body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+    font-size: 13px;
+    line-height: 1.45;
+}
+
+#app {
+    max-width: 1100px;
+    margin: 0 auto;
+    padding: 12px 16px 40px;
+}
+
+header {
+    display: flex;
+    align-items: baseline;
+    gap: 16px;
+    border-bottom: 1px solid var(--line);
+    padding-bottom: 8px;
+}
+
+h1 {
+    font-size: 16px;
+    margin: 0;
+}
+
+h2 {
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--dim);
+    margin: 14px 0 6px;
+}
+
+section {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 8px 12px;
+    margin-top: 10px;
+}
+
+.row {
+    display: flex;
+    gap: 12px;
+    align-items: baseline;
+    padding: 1px 0;
+}
+
+.row > span:first-child {
+    color: var(--dim);
+    min-width: 90px;
+}
+
+.row.sub > span:first-child {
+    min-width: 0;
+    margin-left: 90px;
+}
+
+.row b {
+    font-weight: 600;
+}
+
+.row i {
+    color: var(--dim);
+}
+
+#meta {
+    color: var(--dim);
+    margin-top: 6px;
+}
+
+.banner {
+    border-radius: 6px;
+    padding: 6px 10px;
+    margin-top: 10px;
+    font-weight: 600;
+}
+
+.banner.warn {
+    background: var(--warn-bg);
+}
+
+.banner.err {
+    background: var(--err-bg);
+}
+
+.ok {
+    color: var(--ok);
+}
+
+.bad {
+    color: var(--bad);
+}
+
+.err {
+    color: var(--bad);
+}
+
+button {
+    background: #242932;
+    color: var(--text);
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    padding: 3px 10px;
+    font: inherit;
+    cursor: pointer;
+}
+
+button:hover:not(:disabled) {
+    border-color: var(--accent);
+}
+
+button:disabled,
+button.disabled {
+    opacity: 0.35;
+    cursor: not-allowed;
+}
+
+button[data-motion] {
+    border-color: #6b4a1f;
+}
+
+/* The motion gate: an in-window confirmation, not a native dialog. Danger
+ * styling on Confirm only -- Cancel is the visually quiet default, because
+ * the safe action must also be the easy one. */
+.modal-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.6);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 100;
+}
+
+.modal {
+    background: var(--panel);
+    border: 1px solid #6b4a1f;
+    border-radius: 8px;
+    padding: 16px 20px;
+    max-width: 460px;
+}
+
+.modal-title {
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--dim);
+}
+
+.modal-what {
+    font-size: 15px;
+    font-weight: 600;
+    margin: 8px 0 4px;
+}
+
+.modal-detail {
+    color: var(--dim);
+    margin-bottom: 14px;
+}
+
+.modal-buttons {
+    display: flex;
+    justify-content: flex-end;
+    gap: 10px;
+}
+
+.modal-confirm {
+    border-color: var(--bad);
+}
+
+/* Stale panels dim but stay readable: the last known values are still the
+ * best information available, and blanking them would hide exactly what the
+ * operator needs to see while the link is down. */
+section.stale-dim {
+    opacity: 0.55;
+}
+
+input {
+    background: #0e1013;
+    color: var(--text);
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    padding: 3px 6px;
+    font: inherit;
+}
+
+a {
+    color: var(--accent);
+}
+
+#log {
+    max-height: 220px;
+    overflow-y: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+#cmd-result {
+    min-height: 1.45em;
+}
+
+#dlstatus {
+    min-height: 1.45em;
+    color: var(--dim);
+}
+
+#preview-img {
+    max-width: 100%;
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    margin-top: 6px;
+}
+
+#map {
+    height: 400px;
+    width: 100%;
+    margin-top: 16px;
+}

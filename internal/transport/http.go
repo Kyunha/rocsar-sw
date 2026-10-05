@@ -205,7 +205,7 @@ func serveFile(w http.ResponseWriter, r *http.Request, store *storage.Store, log
 		if r.Method == http.MethodHead {
 			return
 		}
-		if _, err := copyStream(w, lim.reader(f)); err != nil {
+		if _, err := io.Copy(w, lim.reader(f)); err != nil {
 			// The client went away mid-transfer, which on a marginal link is
 			// routine and not an error worth a stack trace.
 			log.Debug("transfer interrupted", "file", info.Name(), "err", err)
@@ -243,7 +243,7 @@ func serveFile(w http.ResponseWriter, r *http.Request, store *storage.Store, log
 		return
 	}
 
-	if _, err := copyN(w, lim.reader(f), end-start+1); err != nil {
+	if _, err := io.CopyN(w, lim.reader(f), end-start+1); err != nil {
 		log.Debug("range transfer interrupted", "file", info.Name(), "err", err)
 	}
 }
@@ -323,9 +323,4 @@ func relativeToRoot(root, abs string) string {
 	return strings.TrimPrefix(rel, string(filepath.Separator))
 }
 
-// copyStream and copyN exist so the handler does not import io directly at three
-// call sites, and so the two paths -- whole file and range -- can be swapped for
-// an instrumented reader in a test without changing the handler.
-func copyStream(dst io.Writer, src io.Reader) (int64, error) { return io.Copy(dst, src) }
 
-func copyN(dst io.Writer, src io.Reader, n int64) (int64, error) { return io.CopyN(dst, src, n) }

@@ -62,6 +62,7 @@ func worstCaseSnapshot() telemetry.Snapshot {
 		},
 		Camera: domain.SubsystemReady, CameraDevice: "/dev/video0",
 		LastPhoto: "camera-20261003-142530.jpg", PhotosTaken: 1 << 32,
+		PhotosTakenKnown: true,
 		Link: domain.LinkStatus{
 			State: domain.SubsystemBusy, Device: "eth0", RateKbps: 115, PriorityKbps: 41,
 			ShapingActive:  true,
@@ -212,6 +213,26 @@ func TestSnapshotRoundTrip(t *testing.T) {
 	}
 	if back.Pico.Axes[0].FeedbackState != s.Pico.Axes[0].FeedbackState {
 		t.Errorf("feedback state changed: %v -> %v", s.Pico.Axes[0].FeedbackState, back.Pico.Axes[0].FeedbackState)
+	}
+	if !back.PhotosTakenKnown || back.PhotosTaken != s.PhotosTaken {
+		t.Errorf("photo count known=%v count=%d, want known=true count=%d",
+			back.PhotosTakenKnown, back.PhotosTaken, s.PhotosTaken)
+	}
+}
+
+// A photo count the camera never reported must survive the round trip as
+// unknown, not as zero. Zero photographs and "the subsystem never said" render
+// differently, and the wire carries the distinction.
+func TestUnknownPhotoCountSurvivesTheRoundTrip(t *testing.T) {
+	s := worstCaseSnapshot()
+	s.PhotosTaken, s.PhotosTakenKnown = 0, false
+
+	back := transport.DecodeTelemetry(transport.EncodeTelemetry(s))
+	if back.PhotosTakenKnown {
+		t.Error("an unreported photo count came back known")
+	}
+	if enc := transport.EncodeTelemetry(s); enc.GetCamera().PhotosTaken != nil {
+		t.Error("an unreported photo count was encoded onto the wire")
 	}
 }
 

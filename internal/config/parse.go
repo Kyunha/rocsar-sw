@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"sort"
 	"time"
 
 	"github.com/pelletier/go-toml/v2"
@@ -69,11 +70,7 @@ func sortedKeys(m map[string]any) []string {
 	for k := range m {
 		out = append(out, k)
 	}
-	for i := 1; i < len(out); i++ {
-		for j := i; j > 0 && out[j] < out[j-1]; j-- {
-			out[j], out[j-1] = out[j-1], out[j]
-		}
-	}
+	sort.Strings(out)
 	return out
 }
 

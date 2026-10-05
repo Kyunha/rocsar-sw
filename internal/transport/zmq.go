@@ -296,13 +296,6 @@ func (z *ZMQ) Running() bool {
 	return z.running
 }
 
-// Endpoints returns the bound addresses.
-func (z *ZMQ) Endpoints() (control, telemetry string) {
-	z.mu.RLock()
-	defer z.mu.RUnlock()
-	return z.control, z.telemetry
-}
-
 // mustMarshal serialises a message.
 //
 // Every caller is on a path where there is nothing useful to do about a

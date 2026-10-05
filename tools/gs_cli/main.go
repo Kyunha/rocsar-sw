@@ -198,6 +198,7 @@ func printCommands() {
 		"query":         "the OBC's own status",
 		"photo":         "capture one photograph",
 		"gnss":          "<receiver-id>       select a GNSS receiver",
+		"gnss-rotate":   "trust the next receiver instead of naming one",
 		"heading":       "<degrees>          point both antenna axes at a bearing",
 		"jog":           "<servo-id> <tick>   move one axis to an absolute tick",
 		"zero":          "[<servo-id>]        centre one axis, or both",

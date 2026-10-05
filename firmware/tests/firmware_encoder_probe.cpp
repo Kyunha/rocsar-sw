@@ -14,8 +14,20 @@
 //   firmware_encoder_probe --apply <hex> [<hex>...]
 //                                                     -> runs the firmware's real
 //                                                        command handling, printing
-//                                                        one "STATE ..." line per
-//                                                        command and the final state
+//                                                        one "REPLY/STATE/DRIVE"
+//                                                        set per command; a `t=<ms>`
+//                                                        argument sets the clock the
+//                                                        commands arrive with
+//   firmware_encoder_probe --apply-synth <kind> <args...]
+//                                                     -> the same, for a command
+//                                                        built here rather than
+//                                                        decoded from a frame
+//                                                        (the host has no encoder)
+//   firmware_encoder_probe --heater-lifetime <step>...]
+//                                                     -> drives the heater dead-man
+//                                                        over a timeline of t=/on/off
+//   firmware_encoder_probe --boot-state            -> initial state plus what the
+//                                                      first control tick transmits
 //   firmware_encoder_probe --heading <step> [<step>...]
 //                                                   -> drives applyImuHeading() with a
 //                                                      sequence of samples, printing one
@@ -41,7 +53,8 @@
 //
 // A <step> for --heading is a number (a real sample), "none" (no sensor fitted),
 // "nan"/"inf" (a non-finite sample), or "nodata" (a fitted sensor that delivered
-// nothing this tick -- the sketch simply holds, so the model is untouched).
+// nothing this tick -- the sketch holds and counts the miss, declaring the
+// sensor absent after IMU_MISSED_SAMPLES_MAX of them).
 
 #include <stdio.h>
 #include <string.h>
@@ -217,18 +230,61 @@ static int decodeFrame(const char* hex, rocsar_v1_PicoCommand* out,
 }
 
 static void printState(const GondolaState& state) {
-  printf("STATE heading=%.3f target=%.3f h1=%d h2=%d imu=%d", state.gondolaHeading,
-         state.targetHeading, state.heater1 ? 1 : 0, state.heater2 ? 1 : 0,
-         state.imuPresent ? 1 : 0);
+  printf("STATE heading=%.3f target=%.3f h1=%d h2=%d imu=%d miss=%u",
+         state.gondolaHeading, state.targetHeading, state.heater1 ? 1 : 0,
+         state.heater2 ? 1 : 0, state.imuPresent ? 1 : 0,
+         (unsigned)state.imuMissCount);
   for (int i = 0; i < NUM_ANTENNAS; i++) {
     const AntennaAxis& axis = state.antennas[i];
     printf(" | a%d id=%u center=%u manual=%d manualTick=%u tick=%u offset=%.3f dir=%.1f",
            i, axis.id, axis.centerTick, axis.manualMode ? 1 : 0, axis.manualTick,
            axis.currentTick, axis.mountOffsetDeg, axis.dirMultiplier);
-    printf(" fb_state=%d fb_err=%u load=%.2f temp=%.2f", (int)axis.feedbackState,
-           axis.feedbackError, axis.load, axis.temperatureC);
+    printf(" fb_state=%d fb_err=%u load=%.2f temp=%.2f await=%d",
+           (int)axis.feedbackState, axis.feedbackError, axis.load,
+           axis.temperatureC, axis.awaitingCommand ? 1 : 0);
   }
   printf("\n");
+}
+
+// The transmit decision the control loop would make for every axis right now.
+//
+// Printed next to STATE so a test can read posture and consequence from one
+// run: manual_mode says what the firmware believes it is doing, DRIVE says
+// whether a byte would actually go on the bus. They come apart exactly when
+// the boot interlock is doing its job -- manual hold with DRIVE 0.
+static void printDrive(const GondolaState& state) {
+  printf("DRIVE");
+  for (int i = 0; i < NUM_ANTENNAS; i++) {
+    const AntennaAxis& axis = state.antennas[i];
+    uint16_t target =
+        axis.calculateTargetTick(state.gondolaHeading, state.targetHeading);
+    printf(" a%d=%d", i, shouldDriveServo(axis, target) ? 1 : 0);
+  }
+  printf("\n");
+}
+
+// The firmware's reply code as its schema name, so a test can assert *which*
+// refusal happened rather than that something was refused.
+static const char* errorName(rocsar_v1_ErrorCode code) {
+  switch (code) {
+    case rocsar_v1_ErrorCode_ERROR_NONE:
+      return "ERROR_NONE";
+    case rocsar_v1_ErrorCode_ERROR_INVALID_COMMAND:
+      return "ERROR_INVALID_COMMAND";
+    case rocsar_v1_ErrorCode_ERROR_INVALID_PARAMETER:
+      return "ERROR_INVALID_PARAMETER";
+    case rocsar_v1_ErrorCode_ERROR_INVALID_SERVO:
+      return "ERROR_INVALID_SERVO";
+    case rocsar_v1_ErrorCode_ERROR_INVALID_HEATER:
+      return "ERROR_INVALID_HEATER";
+    default:
+      return "ERROR_OTHER";
+  }
+}
+
+static void printReply(const rocsar_v1_PicoCommand& command,
+                       rocsar_v1_ErrorCode error) {
+  printf("REPLY %u %d %s\n", command.sequence, (int)error, errorName(error));
 }
 
 // Reads raw hex bus bytes into a buffer. Shared by the two status entry points.
@@ -351,22 +407,151 @@ static int applyFeedback(int argc, char** argv) {
   return 0;
 }
 
+// Applies encoded command frames through the firmware's real applyCommand().
+//
+// An argument of the form `t=<ms>` sets the clock the commands are applied
+// with -- which is how the heater dead-man is driven from this entry point,
+// since "on" records the time it arrived. Commands before any `t=` use 0.
 static int applyFrames(int argc, char** argv) {
   GondolaState state;
   initGondolaState(state);
 
+  unsigned long nowMs = 0;
   for (int i = 0; i < argc; i++) {
+    if (strncmp(argv[i], "t=", 2) == 0) {
+      nowMs = strtoul(argv[i] + 2, nullptr, 10);
+      printf("TIME %lu\n", nowMs);
+      continue;
+    }
     rocsar_v1_PicoCommand command =
         rocsar_v1_PicoCommand_init_zero;
     // Suppress the per-command DECODED line; only the resulting state matters here.
     if (decodeFrame(argv[i], &command, false) != 0) {
       return 2;
     }
-    rocsar_v1_ErrorCode error = applyCommand(state, command);
-    printf("REPLY %u %d %s\n", command.sequence, (int)error,
-           error == rocsar_v1_ErrorCode_ERROR_NONE ? "ERROR_NONE" : "ERROR");
+    rocsar_v1_ErrorCode error = applyCommand(state, command, nowMs);
+    printReply(command, error);
     printState(state);
+    printDrive(state);
   }
+  return 0;
+}
+
+// One command built here rather than decoded from a frame, for the cases a
+// host cannot encode: there is no Python or Go command encoder in this repo
+// yet (see the note at the top of test_firmware_commands.py), and NaN is not
+// something a hex frame carries in a readable way anyway.
+//
+// Output is the same REPLY/STATE/DRIVE triple --apply prints, so a test can
+// treat "how the firmware was told" as an implementation detail.
+static int applySynth(int argc, char** argv) {
+  if (argc < 2) {
+    fprintf(stderr,
+            "usage: --apply-synth set_target <heading>\n"
+            "          | jog <id> <tick> | stop <id> | zero <id>\n"
+            "          | mount <id> <offset> | dir <id> <multiplier>\n"
+            "          | heater <id> <0|1>\n");
+    return 2;
+  }
+
+  rocsar_v1_PicoCommand command = rocsar_v1_PicoCommand_init_zero;
+  command.sequence = 1;
+  const char* kind = argv[0];
+
+  if (strcmp(kind, "set_target") == 0 && argc == 2) {
+    command.which_payload = rocsar_v1_PicoCommand_set_target_tag;
+    command.payload.set_target.target_heading_deg = strtof(argv[1], nullptr);
+  } else if (strcmp(kind, "jog") == 0 && argc == 3) {
+    command.which_payload = rocsar_v1_PicoCommand_jog_tag;
+    command.payload.jog.servo_id = (uint32_t)strtoul(argv[1], nullptr, 10);
+    command.payload.jog.tick = (uint32_t)strtoul(argv[2], nullptr, 10);
+  } else if (strcmp(kind, "stop") == 0 && argc == 2) {
+    command.which_payload = rocsar_v1_PicoCommand_stop_tag;
+    command.payload.stop.servo_id = (uint32_t)strtoul(argv[1], nullptr, 10);
+  } else if (strcmp(kind, "zero") == 0 && argc == 2) {
+    command.which_payload = rocsar_v1_PicoCommand_zero_tag;
+    command.payload.zero.servo_id = (uint32_t)strtoul(argv[1], nullptr, 10);
+  } else if (strcmp(kind, "mount") == 0 && argc == 3) {
+    command.which_payload = rocsar_v1_PicoCommand_mount_tag;
+    command.payload.mount.servo_id = (uint32_t)strtoul(argv[1], nullptr, 10);
+    command.payload.mount.offset_deg = strtof(argv[2], nullptr);
+  } else if (strcmp(kind, "dir") == 0 && argc == 3) {
+    command.which_payload = rocsar_v1_PicoCommand_dir_tag;
+    command.payload.dir.servo_id = (uint32_t)strtoul(argv[1], nullptr, 10);
+    command.payload.dir.multiplier = strtof(argv[2], nullptr);
+  } else if (strcmp(kind, "heater") == 0 && argc == 3) {
+    command.which_payload = rocsar_v1_PicoCommand_heater_tag;
+    command.payload.heater.heater_id = (uint32_t)strtoul(argv[1], nullptr, 10);
+    command.payload.heater.state = strcmp(argv[2], "0") != 0;
+  } else {
+    fprintf(stderr, "unknown or wrong-arity --apply-synth command: %s\n", kind);
+    return 2;
+  }
+
+  GondolaState state;
+  initGondolaState(state);
+  rocsar_v1_ErrorCode error = applyCommand(state, command, 0);
+  printReply(command, error);
+  printState(state);
+  printDrive(state);
+  return 0;
+}
+
+// Drives the heater dead-man over a timeline.
+//
+// Each step is `t=<ms>` (advance the clock, optionally followed by nothing),
+// `on1`/`on2`, or `off1`/`off2`. Every step runs expireHeaters() at that time
+// after its operation, which is the order the sketch runs in: commands are
+// taken off the wire first, then the control tick expires what the keep-alive
+// has let lapse. One HEATER line per step is all a test needs to see when a
+// heater crossed the window.
+static int heaterLifetime(int argc, char** argv) {
+  GondolaState state;
+  initGondolaState(state);
+
+  unsigned long nowMs = 0;
+  for (int i = 0; i < argc; i++) {
+    const char* step = argv[i];
+    if (strncmp(step, "t=", 2) == 0) {
+      nowMs = strtoul(step + 2, nullptr, 10);
+    } else if (strcmp(step, "on1") == 0 || strcmp(step, "on2") == 0 ||
+               strcmp(step, "off1") == 0 || strcmp(step, "off2") == 0) {
+      rocsar_v1_PicoCommand command = rocsar_v1_PicoCommand_init_zero;
+      command.sequence = 1;
+      command.which_payload = rocsar_v1_PicoCommand_heater_tag;
+      // The id is the trailing digit, not a fixed offset: "on1" and "off1" put
+      // it at different places, and reading step[2] of "off1" yields 'f'.
+      command.payload.heater.heater_id =
+          (uint32_t)(step[strlen(step) - 1] - '0');
+      command.payload.heater.state = step[0] == 'o' && step[1] == 'n';
+      if (applyCommand(state, command, nowMs) != rocsar_v1_ErrorCode_ERROR_NONE) {
+        fprintf(stderr, "heater command refused: %s\n", step);
+        return 2;
+      }
+    } else {
+      fprintf(stderr, "bad --heater-lifetime step: %s\n", step);
+      return 2;
+    }
+    expireHeaters(state, nowMs);
+    printf("HEATER t=%lu h1=%d h2=%d\n", nowMs, state.heater1 ? 1 : 0,
+           state.heater2 ? 1 : 0);
+  }
+  return 0;
+}
+
+// The boot posture: initial state, plus what the first control tick would
+// transmit. Nothing has been commanded, so DRIVE must be all zeroes -- if it
+// is not, a board has started moving on power-up.
+static int bootState() {
+  GondolaState state;
+  initGondolaState(state);
+  // The fallback runs on tick one, before any command exists; this is that tick
+  // minus the hardware.
+  for (int i = 0; i < NUM_ANTENNAS; i++) {
+    updateAxisFeedback(state.antennas[i]);
+  }
+  printState(state);
+  printDrive(state);
   return 0;
 }
 
@@ -394,9 +579,17 @@ static int applyHeadings(int argc, char** argv) {
     if (strcmp(step, "none") == 0) {
       present = false;
     } else if (strcmp(step, "nodata") == 0) {
-      // The sketch's getEvent() failure path: nothing to fold in, so nothing is
-      // called. Modelled here as a no-op rather than as a zero sample, because
-      // a zero sample is finite and would be integrated as a real heading.
+      // The sketch's getEvent() failure path: hold, count the miss, and on the
+      // IMU_MISSED_SAMPLES_MAX'th consecutive one declare the sensor absent
+      // exactly the way readImuHeading() does -- through applyImuHeading(...,
+      // false), so the flag and the counter stay the model's to reconcile.
+      //
+      // Counted only while the sensor is believed present, because that is the
+      // branch the sketch is in: once absent, re-probing (not counting) is what
+      // runs, and this step has no clock to model IMU_REPROBE_MS with.
+      if (state.imuPresent && noteImuMiss(state)) {
+        applyImuHeading(state, 0.0f, false);
+      }
       printf("HEADING NO_DATA imu=%d heading=%.3f\n",
              state.imuPresent ? 1 : 0, state.gondolaHeading);
       continue;
@@ -408,6 +601,12 @@ static int applyHeadings(int argc, char** argv) {
       sample = strtof(step, nullptr);
     }
 
+    if (present) {
+      // getEvent() answered, whatever it answered with: any earlier run of
+      // misses is over. A non-finite sample below is still a reading that
+      // arrived; applyImuHeading() decides whether it is one to use.
+      clearImuMisses(state);
+    }
     ImuSample result = applyImuHeading(state, sample, present);
     printf("HEADING %s imu=%d heading=%.3f\n", sampleName(result),
            state.imuPresent ? 1 : 0, state.gondolaHeading);
@@ -501,6 +700,18 @@ static int telemetryFromState(int argc, char** argv) {
 int main(int argc, char** argv) {
   if (argc > 2 && strcmp(argv[1], "--apply") == 0) {
     return applyFrames(argc - 2, argv + 2);
+  }
+
+  if (argc > 2 && strcmp(argv[1], "--apply-synth") == 0) {
+    return applySynth(argc - 2, argv + 2);
+  }
+
+  if (argc > 2 && strcmp(argv[1], "--heater-lifetime") == 0) {
+    return heaterLifetime(argc - 2, argv + 2);
+  }
+
+  if (argc == 2 && strcmp(argv[1], "--boot-state") == 0) {
+    return bootState();
   }
 
   if (argc > 2 && strcmp(argv[1], "--heading") == 0) {

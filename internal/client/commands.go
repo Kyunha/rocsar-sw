@@ -10,6 +10,86 @@ import (
 	rocsarv1 "github.com/rocsar/obc/api/rocsar/v1"
 )
 
+// Request is a Ground Station command, Response its answer.
+//
+// Aliases, not wrappers: cmd/gs works with these types pervasively (submit,
+// match, report) but must not import the generated bindings -- the layering
+// test forbids it, on purpose. An alias lets a consumer name the type without
+// importing the package it comes from, which is exactly the seam a Wails
+// binding layer needs: it touches every command and owns none of the schema.
+type (
+	Request  = rocsarv1.CommandRequest
+	Response = rocsarv1.CommandResponse
+)
+
+// SdrParamsPatch is a partial SDR parameter update. A nil pointer means
+// "leave it alone" -- it does not mean zero, and a zero would brick the SDR
+// rather than fail cleanly, which is why this struct cannot be floats.
+//
+// It mirrors the wire's SdrParams field for field without importing domain:
+// domain.SdrParamsPatch describes what the OBC's service accepts, and this
+// describes what the console sends. The two agree by construction here, in the
+// one builder below, rather than by sharing a type across the link. An all-nil
+// patch is refused, mirroring the dispatcher: an operator who pressed the
+// button expects a change, and a silent success is indistinguishable from a
+// broken button.
+type SdrParamsPatch struct {
+	PRFHz            *float64 `json:"prf_hz,omitempty"`
+	SampleRateHz     *float64 `json:"sample_rate_hz,omitempty"`
+	TxFreqHz         *float64 `json:"tx_freq_hz,omitempty"`
+	NormalizedGainTx *float64 `json:"normalized_gain_tx,omitempty"`
+	NormalizedGainRx *float64 `json:"normalized_gain_rx,omitempty"`
+	BandwidthHz      *float64 `json:"bandwidth_hz,omitempty"`
+	SessionDurationS *uint32  `json:"session_duration_s,omitempty"`
+}
+
+// BuildSetParamsRequest turns a typed patch into a CommandRequest. Typed,
+// unlike BuildRequests, because the only caller is a window with numeric
+// fields -- parsing floats to strings to re-parse them would be validation
+// theatre twice over.
+func BuildSetParamsRequest(patch SdrParamsPatch) (*Request, error) {
+	if patch.PRFHz == nil && patch.SampleRateHz == nil && patch.TxFreqHz == nil &&
+		patch.NormalizedGainTx == nil && patch.NormalizedGainRx == nil &&
+		patch.BandwidthHz == nil && patch.SessionDurationS == nil {
+		return nil, fmt.Errorf("no parameters were set; a partial update must name at least one")
+	}
+	params := &rocsarv1.SdrParams{}
+	if patch.PRFHz != nil {
+		v := *patch.PRFHz
+		params.PrfHz = &v
+	}
+	if patch.SampleRateHz != nil {
+		v := *patch.SampleRateHz
+		params.SampleRateHz = &v
+	}
+	if patch.TxFreqHz != nil {
+		v := *patch.TxFreqHz
+		params.TxFreqHz = &v
+	}
+	if patch.NormalizedGainTx != nil {
+		v := *patch.NormalizedGainTx
+		params.NormalizedGainTx = &v
+	}
+	if patch.NormalizedGainRx != nil {
+		v := *patch.NormalizedGainRx
+		params.NormalizedGainRx = &v
+	}
+	if patch.BandwidthHz != nil {
+		v := *patch.BandwidthHz
+		params.BandwidthHz = &v
+	}
+	if patch.SessionDurationS != nil {
+		v := *patch.SessionDurationS
+		params.SessionDurationS = &v
+	}
+	return &rocsarv1.CommandRequest{
+		RequestId: NewRequestID("sdr-set-params"),
+		Payload: &rocsarv1.CommandRequest_SdrSetParams{
+			SdrSetParams: &rocsarv1.SdrSetParamsCommand{Params: params},
+		},
+	}, nil
+}
+
 // requestPrefix is the first field of every request_id this package generates.
 //
 // It was "gs-cli-" while this code lived in tools/gs_cli. It is neutral now
@@ -94,6 +174,17 @@ func BuildRequests(name string, args []string) ([]*rocsarv1.CommandRequest, erro
 		}
 		req.Payload = &rocsarv1.CommandRequest_GnssSelect{
 			GnssSelect: &rocsarv1.GnssSelectCommand{ReceiverId: id},
+		}
+
+	case "gnss-rotate":
+		// Trust the next receiver instead of naming one. The wire carries a
+		// Rotate flag beside the id for exactly this; the CLI never needed it
+		// spelled out, but a window's "next receiver" button does.
+		if len(args) != 0 {
+			return nil, fmt.Errorf("gnss-rotate takes no arguments, got %d", len(args))
+		}
+		req.Payload = &rocsarv1.CommandRequest_GnssSelect{
+			GnssSelect: &rocsarv1.GnssSelectCommand{Rotate: true},
 		}
 
 	case "heading":
@@ -311,7 +402,7 @@ func parseOnOff(s string) (bool, error) {
 // command palette, so the two cannot disagree about what exists.
 func Names() []string {
 	return []string{
-		"query", "photo", "gnss", "heading", "jog", "zero", "mount", "dir",
+		"query", "photo", "gnss", "gnss-rotate", "heading", "jog", "zero", "mount", "dir",
 		"heater", "stop", "pico-status", "sdr-probe", "sdr-connect",
 		"sdr-reset-usb", "link", "reboot",
 	}

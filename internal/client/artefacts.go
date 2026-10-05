@@ -119,7 +119,7 @@ type Transfer struct {
 
 // Rate is bytes per second over Elapsed.
 func (t Transfer) Rate() float64 {
-	return float64(t.Bytes) / 1024 / maxf(t.Elapsed.Seconds(), 0.001)
+	return float64(t.Bytes) / 1024 / max(t.Elapsed.Seconds(), 0.001)
 }
 
 // Fetch downloads an artefact.
@@ -290,10 +290,3 @@ func (p *progressReader) Read(b []byte) (int, error) {
 
 // progressInterval is the floor between ProgressFunc calls.
 const progressInterval = 100 * time.Millisecond
-
-func maxf(a, b float64) float64 {
-	if a > b {
-		return a
-	}
-	return b
-}
