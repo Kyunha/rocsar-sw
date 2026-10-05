@@ -35,6 +35,8 @@ PB_BIND(rocsar_v1_PicoCommand, rocsar_v1_PicoCommand, AUTO)
 
 PB_BIND(rocsar_v1_PicoAck, rocsar_v1_PicoAck, AUTO)
 
+PB_BIND(rocsar_v1_ImuVector3, rocsar_v1_ImuVector3, AUTO)
+
 
 PB_BIND(rocsar_v1_PicoTelemetry, rocsar_v1_PicoTelemetry, AUTO)
 

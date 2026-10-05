@@ -196,6 +196,15 @@ def print_telemetry(f, frames):
         p = f.pico
         conn = "connected" if f.pico_connected else "NOT connected"
         print(f"  pico         {conn}")
+        a = p.imu_acceleration
+        o = p.imu_absolute_orientation
+        m = p.imu_magnetic_field
+        w = p.imu_angular_velocity
+        print(f"    imu        acceleration ({a.x:.3f}, {a.y:.3f}, {a.z:.3f})"
+              f"  orientation ({o.x:.3f}, {o.y:.3f}, {o.z:.3f})")
+        print(f"               magnetic ({m.x:.3f}, {m.y:.3f}, {m.z:.3f})"
+              f"  angular ({w.x:.3f}, {w.y:.3f}, {w.z:.3f})"
+              f"  temperature {p.imu_temperature_c} C")
         if f.HasField("pico_last_ack"):
             a = f.pico_last_ack
             print(f"    last ack   seq {a.command_sequence}"

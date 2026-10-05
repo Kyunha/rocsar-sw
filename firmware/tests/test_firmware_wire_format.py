@@ -46,7 +46,7 @@ class TestFraming:
         # overflowing and the sketch then drops the frame, so assert the real
         # frames stay inside.
         for frame in _frames(probe):
-            assert 0 < len(frame) < 256, "frame must fit PICO_TX_BUFFER"
+            assert 0 < len(frame) < 512, "frame must fit PICO_TX_BUFFER"
 
     def test_a_response_frame_differs_from_a_telemetry_frame(self, probe):
         _telemetry_frame, success_frame, error_frame = _frames(probe)
@@ -78,7 +78,7 @@ class TestReceiveBuffer:
 
         The sketch drops an overflowing frame silently, so a buffer one byte too
         small shows up on the OBC as a control command that simply never answers.
-        256 is COBS_MAX(256), the same bound pico_wire.h encodes against.
+        512 is COBS_MAX(512), the same bound pico_wire.h encodes against.
         """
         sketch = SKETCH.read_text()
         assert "uint8_t rxBuffer[256]" in sketch

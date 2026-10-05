@@ -128,6 +128,12 @@ message PicoAck {
   ErrorCode error = 3;
 }
 
+message ImuVector3 {
+  float x = 1;
+  float y = 2;
+  float z = 3;
+}
+
 // ---------------------------------------------------------------------------
 // Pico -> OBC: telemetry, emitted once per 50 Hz control tick.
 // ---------------------------------------------------------------------------
@@ -145,6 +151,12 @@ message PicoTelemetry {
   // frame defaults to false, so a frame from a firmware predating this field
   // reads as "no measurement", which is the honest reading of one.
   bool imu_present = 6;
+
+  ImuVector3 imu_acceleration = 7;
+  ImuVector3 imu_absolute_orientation = 8;
+  ImuVector3 imu_magnetic_field = 9;
+  ImuVector3 imu_angular_velocity = 10;
+  int32 imu_temperature_c = 11;
 }
 
 // ---------------------------------------------------------------------------

@@ -31,6 +31,11 @@ func telemetryToDomain(m *rocsarv1.PicoTelemetry, now time.Time) domain.PicoTele
 		Heater1State:      m.GetHeater1State(),
 		Heater2State:      m.GetHeater2State(),
 		IMUPresent:        m.GetImuPresent(),
+		IMUAcceleration:        imuVector3(m.GetImuAcceleration()),
+		IMUAbsoluteOrientation: imuVector3(m.GetImuAbsoluteOrientation()),
+		IMUMagneticField:       imuVector3(m.GetImuMagneticField()),
+		IMUAngularVelocity:     imuVector3(m.GetImuAngularVelocity()),
+		IMUTemperatureC:        m.GetImuTemperatureC(),
 		ObservedAt:        now,
 	}
 
@@ -54,6 +59,13 @@ func telemetryToDomain(m *rocsarv1.PicoTelemetry, now time.Time) domain.PicoTele
 	}
 
 	return d
+}
+
+func imuVector3(v *rocsarv1.ImuVector3) domain.IMUVector3 {
+	if v == nil {
+		return domain.IMUVector3{}
+	}
+	return domain.IMUVector3{X: float64(v.GetX()), Y: float64(v.GetY()), Z: float64(v.GetZ())}
 }
 
 // feedbackState maps the wire int32 to the domain enum.

@@ -72,6 +72,12 @@ typedef struct _rocsar_v1_PicoAck {
     rocsar_v1_ErrorCode error;
 } rocsar_v1_PicoAck;
 
+typedef struct _rocsar_v1_ImuVector3 {
+    float x;
+    float y;
+    float z;
+} rocsar_v1_ImuVector3;
+
 typedef struct _rocsar_v1_PicoTelemetry {
     float gondola_heading_deg;
     float target_heading_deg;
@@ -85,6 +91,11 @@ typedef struct _rocsar_v1_PicoTelemetry {
  frame defaults to false, so a frame from a firmware predating this field
  reads as "no measurement", which is the honest reading of one. */
     bool imu_present;
+ rocsar_v1_ImuVector3 imu_acceleration;
+ rocsar_v1_ImuVector3 imu_absolute_orientation;
+ rocsar_v1_ImuVector3 imu_magnetic_field;
+ rocsar_v1_ImuVector3 imu_angular_velocity;
+ int32_t imu_temperature_c;
 } rocsar_v1_PicoTelemetry;
 
 typedef struct _rocsar_v1_PicoMessage {
@@ -113,7 +124,8 @@ extern "C" {
 #define rocsar_v1_StatusRequestCommand_init_default {0}
 #define rocsar_v1_PicoCommand_init_default       {0, 0, {rocsar_v1_SetTargetCommand_init_default}}
 #define rocsar_v1_PicoAck_init_default           {0, 0, _rocsar_v1_ErrorCode_MIN}
-#define rocsar_v1_PicoTelemetry_init_default     {0, 0, 0, 0, 0, {rocsar_v1_AntennaTelemetry_init_default, rocsar_v1_AntennaTelemetry_init_default}, 0}
+#define rocsar_v1_ImuVector3_init_default         {0, 0, 0}
+#define rocsar_v1_PicoTelemetry_init_default     {0, 0, 0, 0, 0, {rocsar_v1_AntennaTelemetry_init_default, rocsar_v1_AntennaTelemetry_init_default}, 0, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, 0}
 #define rocsar_v1_PicoMessage_init_default       {0, 0, 0, {rocsar_v1_PicoAck_init_default}}
 #define rocsar_v1_SetTargetCommand_init_zero     {0}
 #define rocsar_v1_JogCommand_init_zero           {0, 0}
@@ -125,7 +137,8 @@ extern "C" {
 #define rocsar_v1_StatusRequestCommand_init_zero {0}
 #define rocsar_v1_PicoCommand_init_zero          {0, 0, {rocsar_v1_SetTargetCommand_init_zero}}
 #define rocsar_v1_PicoAck_init_zero              {0, 0, _rocsar_v1_ErrorCode_MIN}
-#define rocsar_v1_PicoTelemetry_init_zero        {0, 0, 0, 0, 0, {rocsar_v1_AntennaTelemetry_init_zero, rocsar_v1_AntennaTelemetry_init_zero}, 0}
+#define rocsar_v1_ImuVector3_init_zero            {0, 0, 0}
+#define rocsar_v1_PicoTelemetry_init_zero        {0, 0, 0, 0, 0, {rocsar_v1_AntennaTelemetry_init_zero, rocsar_v1_AntennaTelemetry_init_zero}, 0, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, 0}
 #define rocsar_v1_PicoMessage_init_zero          {0, 0, 0, {rocsar_v1_PicoAck_init_zero}}
 
 /* Field tags (for use in manual encoding/decoding) */
@@ -158,6 +171,11 @@ extern "C" {
 #define rocsar_v1_PicoTelemetry_heater2_state_tag 4
 #define rocsar_v1_PicoTelemetry_antennas_tag     5
 #define rocsar_v1_PicoTelemetry_imu_present_tag  6
+#define rocsar_v1_PicoTelemetry_imu_acceleration_tag 7
+#define rocsar_v1_PicoTelemetry_imu_absolute_orientation_tag 8
+#define rocsar_v1_PicoTelemetry_imu_magnetic_field_tag 9
+#define rocsar_v1_PicoTelemetry_imu_angular_velocity_tag 10
+#define rocsar_v1_PicoTelemetry_imu_temperature_c_tag 11
 #define rocsar_v1_PicoMessage_sequence_tag       1
 #define rocsar_v1_PicoMessage_timestamp_us_tag   2
 #define rocsar_v1_PicoMessage_ack_tag            3
@@ -236,16 +254,32 @@ X(a, STATIC,   SINGULAR, UENUM,    error,             3)
 #define rocsar_v1_PicoAck_CALLBACK NULL
 #define rocsar_v1_PicoAck_DEFAULT NULL
 
+#define rocsar_v1_ImuVector3_FIELDLIST(X, a) \
+X(a, STATIC,   SINGULAR, FLOAT,    x,                 1) \
+X(a, STATIC,   SINGULAR, FLOAT,    y,                 2) \
+X(a, STATIC,   SINGULAR, FLOAT,    z,                 3)
+#define rocsar_v1_ImuVector3_CALLBACK NULL
+#define rocsar_v1_ImuVector3_DEFAULT NULL
+
 #define rocsar_v1_PicoTelemetry_FIELDLIST(X, a) \
 X(a, STATIC,   SINGULAR, FLOAT,    gondola_heading_deg,   1) \
 X(a, STATIC,   SINGULAR, FLOAT,    target_heading_deg,   2) \
 X(a, STATIC,   SINGULAR, BOOL,     heater1_state,     3) \
 X(a, STATIC,   SINGULAR, BOOL,     heater2_state,     4) \
 X(a, STATIC,   REPEATED, MESSAGE,  antennas,          5) \
-X(a, STATIC,   SINGULAR, BOOL,     imu_present,       6)
+X(a, STATIC,   SINGULAR, BOOL,     imu_present,       6) \
+X(a, STATIC,   SINGULAR, MESSAGE,  imu_acceleration,  7) \
+X(a, STATIC,   SINGULAR, MESSAGE,  imu_absolute_orientation, 8) \
+X(a, STATIC,   SINGULAR, MESSAGE,  imu_magnetic_field, 9) \
+X(a, STATIC,   SINGULAR, MESSAGE,  imu_angular_velocity, 10) \
+X(a, STATIC,   SINGULAR, INT32,    imu_temperature_c, 11)
 #define rocsar_v1_PicoTelemetry_CALLBACK NULL
 #define rocsar_v1_PicoTelemetry_DEFAULT NULL
 #define rocsar_v1_PicoTelemetry_antennas_MSGTYPE rocsar_v1_AntennaTelemetry
+#define rocsar_v1_PicoTelemetry_imu_acceleration_MSGTYPE rocsar_v1_ImuVector3
+#define rocsar_v1_PicoTelemetry_imu_absolute_orientation_MSGTYPE rocsar_v1_ImuVector3
+#define rocsar_v1_PicoTelemetry_imu_magnetic_field_MSGTYPE rocsar_v1_ImuVector3
+#define rocsar_v1_PicoTelemetry_imu_angular_velocity_MSGTYPE rocsar_v1_ImuVector3
 
 #define rocsar_v1_PicoMessage_FIELDLIST(X, a) \
 X(a, STATIC,   SINGULAR, UINT32,   sequence,          1) \
@@ -267,6 +301,7 @@ extern const pb_msgdesc_t rocsar_v1_StopCommand_msg;
 extern const pb_msgdesc_t rocsar_v1_StatusRequestCommand_msg;
 extern const pb_msgdesc_t rocsar_v1_PicoCommand_msg;
 extern const pb_msgdesc_t rocsar_v1_PicoAck_msg;
+extern const pb_msgdesc_t rocsar_v1_ImuVector3_msg;
 extern const pb_msgdesc_t rocsar_v1_PicoTelemetry_msg;
 extern const pb_msgdesc_t rocsar_v1_PicoMessage_msg;
 
@@ -281,6 +316,7 @@ extern const pb_msgdesc_t rocsar_v1_PicoMessage_msg;
 #define rocsar_v1_StatusRequestCommand_fields &rocsar_v1_StatusRequestCommand_msg
 #define rocsar_v1_PicoCommand_fields &rocsar_v1_PicoCommand_msg
 #define rocsar_v1_PicoAck_fields &rocsar_v1_PicoAck_msg
+#define rocsar_v1_ImuVector3_fields &rocsar_v1_ImuVector3_msg
 #define rocsar_v1_PicoTelemetry_fields &rocsar_v1_PicoTelemetry_msg
 #define rocsar_v1_PicoMessage_fields &rocsar_v1_PicoMessage_msg
 
@@ -292,8 +328,9 @@ extern const pb_msgdesc_t rocsar_v1_PicoMessage_msg;
 #define rocsar_v1_MountCommand_size              11
 #define rocsar_v1_PicoAck_size                   10
 #define rocsar_v1_PicoCommand_size               20
-#define rocsar_v1_PicoMessage_size               198
-#define rocsar_v1_PicoTelemetry_size             178
+#define rocsar_v1_PicoMessage_size               320
+#define rocsar_v1_PicoTelemetry_size             300
+#define rocsar_v1_ImuVector3_size               15
 #define rocsar_v1_SetTargetCommand_size          5
 #define rocsar_v1_StatusRequestCommand_size      0
 #define rocsar_v1_StopCommand_size               6

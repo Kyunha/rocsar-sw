@@ -45,6 +45,7 @@ GondolaState gondola;
 Adafruit_BNO055 bno = Adafruit_BNO055(55, 0x28, &Wire);
 
 unsigned long lastLoopTime = 0;
+unsigned long lastImuReadTime = 0;
 // The heading policy lives in applyImuHeading() in gondola_model.h. Sensor
 // presence has one home -- GondolaState.imuPresent, written by that function and
 // read back here -- rather than a parallel latch that could disagree with the
@@ -57,6 +58,11 @@ size_t rxLen = 0;
 
 // Outgoing sequence numbers for the PicoMessage wrapper
 uint32_t txSequence = 0;
+float imuAcceleration[3];
+float imuAbsoluteOrientation[3];
+float imuMagneticField[3];
+float imuAngularVelocity[3];
+int8_t imuTemperature;
 
 // ============================================================================
 // PROTOBUF & COBS COMMUNICATIONS
@@ -140,6 +146,89 @@ void readImuHeading(unsigned long now) {
   applyImuHeading(gondola, event.orientation.x, true);
 }
 
+
+void readImuAcceleration(float *result)
+{
+    sensors_event_t acceleration;
+    bno.getEvent(&acceleration, Adafruit_BNO055::VECTOR_ACCELEROMETER);
+
+    float x = -1000000, y = -1000000 , z = -1000000; //dumb values, easy to spot problem
+    if (acceleration.type == SENSOR_TYPE_ACCELEROMETER) {
+        //digital compass upside down (-1)
+        x =  acceleration.acceleration.x;
+        y =  acceleration.acceleration.y;
+        z =  acceleration.acceleration.z;
+
+    }
+
+    result[0]=x;
+    result[1]=y;
+    result[2]=z;
+
+}
+void readImuAbsoluteOrientaion(float *result)
+{
+    sensors_event_t absoluteOrientation;
+    bno.getEvent(&absoluteOrientation, Adafruit_BNO055::VECTOR_EULER);
+    float x = -1000000, y = -1000000 , z = -1000000; //dumb values, easy to spot problem
+    if (absoluteOrientation.type == SENSOR_TYPE_ORIENTATION)
+    {
+        x = absoluteOrientation.orientation.x;
+        y = absoluteOrientation.orientation.y;
+        z = absoluteOrientation.orientation.z;
+
+    }
+
+    result[0]=x;
+    result[1]=y;
+    result[2]=z;
+
+}
+
+void readImuMagneticField(float *result)
+{
+    sensors_event_t magneticField;
+    bno.getEvent(&magneticField, Adafruit_BNO055::VECTOR_MAGNETOMETER);
+
+    float x = -1000000, y = -1000000 , z = -1000000; //dumb values, easy to spot problem
+    if (magneticField.type == SENSOR_TYPE_MAGNETIC_FIELD) {
+        x = magneticField.magnetic.x  ; //stays equal
+        y = magneticField.magnetic.y ;
+        z = magneticField.magnetic.z ;
+
+    }
+
+    result[0]=x;
+    result[1]=y;
+    result[2]=z;
+}
+void readImuAngularVelocity(float *result)
+{
+    sensors_event_t angularVelocity;
+    bno.getEvent(&angularVelocity, Adafruit_BNO055::VECTOR_GYROSCOPE);
+
+    float x = -1000000, y = -1000000 , z = -1000000; //dumb values, easy to spot problem
+    if ((angularVelocity.type == SENSOR_TYPE_GYROSCOPE) || (angularVelocity.type == SENSOR_TYPE_ROTATION_VECTOR)) {
+       //digital compass upside down (-1)
+        x = angularVelocity.gyro.x ;
+        y = angularVelocity.gyro.y ;
+        z = angularVelocity.gyro.z ;
+    }
+
+    result[0]=x;
+    result[1]=y;
+    result[2]=z;
+
+}
+
+#define TEMPERATURE_OFFSET -8
+void readImuTemperature(int8_t *result)
+{
+
+  *result = bno.getTemp()+TEMPERATURE_OFFSET;
+}
+
+
 void sendTelemetryMessage() {
   rocsar_v1_PicoMessage message = rocsar_v1_PicoMessage_init_zero;
 
@@ -150,6 +239,19 @@ void sendTelemetryMessage() {
   // The mapping from model to wire lives in gondola_model.h, so this calls
   // fillTelemetryMessage() rather than filling the struct by hand; see there.
   fillTelemetryMessage(gondola, message.payload.telemetry);
+  message.payload.telemetry.imu_acceleration.x = imuAcceleration[0];
+  message.payload.telemetry.imu_acceleration.y = imuAcceleration[1];
+  message.payload.telemetry.imu_acceleration.z = imuAcceleration[2];
+  message.payload.telemetry.imu_absolute_orientation.x = imuAbsoluteOrientation[0];
+  message.payload.telemetry.imu_absolute_orientation.y = imuAbsoluteOrientation[1];
+  message.payload.telemetry.imu_absolute_orientation.z = imuAbsoluteOrientation[2];
+  message.payload.telemetry.imu_magnetic_field.x = imuMagneticField[0];
+  message.payload.telemetry.imu_magnetic_field.y = imuMagneticField[1];
+  message.payload.telemetry.imu_magnetic_field.z = imuMagneticField[2];
+  message.payload.telemetry.imu_angular_velocity.x = imuAngularVelocity[0];
+  message.payload.telemetry.imu_angular_velocity.y = imuAngularVelocity[1];
+  message.payload.telemetry.imu_angular_velocity.z = imuAngularVelocity[2];
+  message.payload.telemetry.imu_temperature_c = imuTemperature;
 
   sendMessage(message);
 }
@@ -341,6 +443,13 @@ void loop() {
   // 2. Deterministic 50 Hz Control Loop
   unsigned long now = millis();
   if (now - lastLoopTime >= CONTROL_LOOP_MS) {
+
+    readImuAcceleration(imuAcceleration);
+    readImuAbsoluteOrientaion(imuAbsoluteOrientation);
+    readImuMagneticField(imuMagneticField);
+    readImuAngularVelocity(imuAngularVelocity);
+    readImuTemperature(&imuTemperature);
+
     lastLoopTime = now;
 
     // Smooth IMU Reading

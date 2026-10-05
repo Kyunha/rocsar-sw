@@ -132,6 +132,11 @@ func picoTelemetry(p domain.PicoTelemetry) *rocsarv1.PicoTelemetry {
 		Heater1State:      p.Heater1State,
 		Heater2State:      p.Heater2State,
 		ImuPresent:        p.IMUPresent,
+		ImuAcceleration:        imuVector3ToWire(p.IMUAcceleration),
+		ImuAbsoluteOrientation: imuVector3ToWire(p.IMUAbsoluteOrientation),
+		ImuMagneticField:       imuVector3ToWire(p.IMUMagneticField),
+		ImuAngularVelocity:     imuVector3ToWire(p.IMUAngularVelocity),
+		ImuTemperatureC:        p.IMUTemperatureC,
 	}
 	for _, a := range p.Axes {
 		t.Antennas = append(t.Antennas, &rocsarv1.AntennaTelemetry{
@@ -148,7 +153,19 @@ func picoTelemetry(p domain.PicoTelemetry) *rocsarv1.PicoTelemetry {
 			FeedbackError:   a.FeedbackError,
 		})
 	}
+
 	return t
+}
+
+func imuVector3ToWire(v domain.IMUVector3) *rocsarv1.ImuVector3 {
+	return &rocsarv1.ImuVector3{X: float32(v.X), Y: float32(v.Y), Z: float32(v.Z)}
+}
+
+func imuVector3FromWire(v *rocsarv1.ImuVector3) domain.IMUVector3 {
+	if v == nil {
+		return domain.IMUVector3{}
+	}
+	return domain.IMUVector3{X: float64(v.GetX()), Y: float64(v.GetY()), Z: float64(v.GetZ())}
 }
 
 // EncodedSize returns the serialised size of a snapshot's frame.
@@ -267,6 +284,11 @@ func DecodeTelemetry(f *rocsarv1.TelemetryFrame) telemetry.Snapshot {
 			Heater1State:      p.GetHeater1State(),
 			Heater2State:      p.GetHeater2State(),
 			IMUPresent:        p.GetImuPresent(),
+			IMUAcceleration: imuVector3FromWire(p.GetImuAcceleration()),
+			IMUAbsoluteOrientation: imuVector3FromWire(p.GetImuAbsoluteOrientation()),
+			IMUMagneticField: imuVector3FromWire(p.GetImuMagneticField()),
+			IMUAngularVelocity: imuVector3FromWire(p.GetImuAngularVelocity()),
+			IMUTemperatureC: p.GetImuTemperatureC(),
 		}
 		for _, a := range p.GetAntennas() {
 			s.Pico.Axes = append(s.Pico.Axes, domain.Axis{

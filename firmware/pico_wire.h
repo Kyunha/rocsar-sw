@@ -18,15 +18,16 @@
 // PICO_TX_BUFFER bounds the protobuf payload. cobs_encode() does not bounds-check
 // its output buffer, so the COBS buffer must be sized from the documented worst
 // case (length + length/254 + 1) rather than from a guessed constant.
-#define PICO_TX_BUFFER 256
+#define PICO_TX_BUFFER 512
 #define COBS_MAX(length) ((length) + ((length) / 254) + 1)
 
 // Largest frame the sender can ever emit, including the 0x00 delimiter.
 #define PICO_TX_FRAME_MAX (COBS_MAX(PICO_TX_BUFFER) + 1)
 
 // nanopb publishes the worst-case encoded size of every message it generates.
-// It is currently 198 bytes: two antennas at 89 each, plus the PicoMessage
-// header. PICO_TX_BUFFER is 256, so there is 58 bytes of headroom.
+// It is currently 320 bytes: two antennas plus the IMU vectors and the
+// PicoMessage header. PICO_TX_BUFFER is 512, leaving room for future telemetry
+// fields without silently dropping the frame.
 //
 // This is asserted rather than assumed, because the failure without it is
 // silent and total: pb_encode() returns false when the message does not fit,

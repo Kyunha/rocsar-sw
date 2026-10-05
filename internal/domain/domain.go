@@ -232,8 +232,19 @@ type PicoTelemetry struct {
 	// IMUPresent is whether GondolaHeadingDeg is a measurement. False when no
 	// BNO055 is fitted, in which case the heading is the last bearing held and
 	// the two are indistinguishable without this bit.
-	IMUPresent bool
-	ObservedAt time.Time
+	IMUPresent             bool
+	IMUAcceleration        IMUVector3
+	IMUAbsoluteOrientation IMUVector3
+	IMUMagneticField       IMUVector3
+	IMUAngularVelocity     IMUVector3
+	IMUTemperatureC        int32
+	ObservedAt             time.Time
+}
+
+type IMUVector3 struct {
+	X float64
+	Y float64
+	Z float64
 }
 
 // Photo is a captured image on disk, not in memory.
