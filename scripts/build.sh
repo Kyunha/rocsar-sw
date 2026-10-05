@@ -17,6 +17,15 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
+if ! command -v buf >/dev/null 2>&1; then
+    echo "[build] buf is required to regenerate protobuf bindings before building." >&2
+    echo "[build] install buf or run the build inside the project's development shell." >&2
+    exit 1
+fi
+
+echo "[build] generating protobuf bindings"
+buf generate
+
 RELEASE=false
 case "${1:-}" in
     --release) RELEASE=true ;;

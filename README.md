@@ -118,6 +118,10 @@ Both console defaults point at the aircraft (`192.168.1.50`), so the `-control` 
 ./scripts/build.sh --release    # stripped, -trimpath, for deployment
 ```
 
+The build regenerates the protobuf bindings before compiling. This requires
+`buf`; use the committed development shell or install the protobuf toolchain
+listed under [Prerequisites](#prerequisites).
+
 Both write to `bin/`. `--release` adds `-trimpath -ldflags "-s -w"`.
 
 The equivalent `go build` invocations, if you would rather not use the script:
