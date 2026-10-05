@@ -424,6 +424,7 @@ func TestNamesAndBuildRequestsAgree(t *testing.T) {
 		{"stop", []string{"all"}},
 		{"pico-status", nil},
 		{"sdr-probe", nil},
+		{"sdr-get-params", nil},
 		{"sdr-connect", nil},
 		{"sdr-reset-usb", nil},
 		{"link", []string{"115"}},

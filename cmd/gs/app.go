@@ -56,14 +56,13 @@ type App struct {
 	dlMu sync.Mutex
 	dl   *activeDownload
 
-	// emitFn and saveFn are the two seams that make the App testable without
-	// a window. runtime.EventsEmit and runtime.SaveFileDialog both kill the
-	// process when called on a bare context (log.Fatalf, unrecoverable), so a
-	// headless test cannot exercise any path that reaches them. Both default
-	// to the Wails runtime and are overridden only in tests -- same pattern
-	// as the newStream/newQueue seams in internal/client.
+	// emitFn is the seam that makes the App testable without a window.
+	// runtime.EventsEmit kills the process when called on a bare context
+	// (log.Fatalf, unrecoverable), so a headless test cannot exercise any path
+	// that reaches it. It defaults to the Wails runtime and is overridden only
+	// in tests -- same pattern as the newStream/newQueue seams in
+	// internal/client.
 	emitFn func(event string, data ...interface{})
-	saveFn func(suggestedName string) (string, error)
 }
 
 // activeDownload is the running transfer, if any. A pointer, not a cancel func,
@@ -83,10 +82,16 @@ func NewApp(cfg client.Config) *App {
 // frontend loads, so bound methods never run before ctx exists.
 func (a *App) startup(ctx context.Context) {
 	a.ctx = ctx
+	a.logf("gs %s starting", version)
 	if err := a.Connect(a.initial); err != nil {
 		a.logf("connect: %v", err)
 	}
 }
+
+// Version reports the build version stamped at compile time ("dev" if the
+// build did not stamp one). The header shows it so provenance questions end
+// at a glance instead of in a guessing thread.
+func (a *App) Version() string { return version }
 
 // shutdown releases everything. Idempotent: Disconnect guards on connection
 // state, and the client's own Close methods are safe to call twice.
@@ -472,6 +477,33 @@ func (a *App) PicoStatusRequest() CommandResult { return a.runCommand("pico-stat
 // to what fits in a reply.
 func (a *App) SdrProbe() CommandResult { return a.runCommand("sdr-probe") }
 
+// SdrGetParams reads parameters/params.json via the OBC and returns it as JSON
+// with the params.json key names. The Ground Station shows the values as
+// placeholder hints while blank inputs keep meaning "leave alone".
+//
+// An OBC that predates the command answers ERROR_INVALID_COMMAND (unknown
+// oneof payload, refused at dispatch, never a hang). That error is returned
+// verbatim rather than translated: the frontend distinguishes "the OBC is too
+// old for this" from every other failure and falls back to blank hints.
+func (a *App) SdrGetParams() (string, error) {
+	q := a.getQueue()
+	if q == nil {
+		return "", client.ErrNotConnected
+	}
+	reqs, err := client.BuildRequests("sdr-get-params", nil)
+	if err != nil {
+		return "", err
+	}
+	resp, err := q.Submit(a.ctx, reqs[0])
+	if err != nil {
+		return "", err
+	}
+	if !resp.GetSuccess() {
+		return "", errors.New(resp.GetMessage())
+	}
+	return resp.GetMessage(), nil
+}
+
 // SetSdrParams applies a partial SDR parameter update. Nil fields are left
 // alone; an all-nil patch is refused before anything travels, because a value
 // the program cannot use bricks the SDR rather than failing at runtime.
@@ -521,21 +553,26 @@ func (a *App) ListArtefacts(path string) ([]client.Entry, error) {
 // capture is an hour, and a bound method that blocks for an hour is a window
 // that never answers. One transfer at a time; a second call while one runs is
 // refused rather than queued.
-func (a *App) DownloadArtefact(name string) error {
+//
+// The destination is an in-window input, not a native file dialog: GTK's file
+// chooser aborts the whole process with SIGABRT when GSettings schemas are
+// missing from the environment, which is uncatchable from Go and unfixable
+// from here. A text input cannot abort anything. See GUI_ARCHITECTURE.md 9.
+func (a *App) DownloadArtefact(name, destPath string) error {
 	if err := client.SafeName(name); err != nil {
 		return err
+	}
+	if destPath == "" {
+		return errors.New("no destination given")
 	}
 	cli := a.getClient()
 	if cli == nil {
 		return client.ErrNotConnected
 	}
 
-	path, err := a.saveFile(name)
+	path, err := expandHome(destPath)
 	if err != nil {
 		return err
-	}
-	if path == "" {
-		return errors.New("download cancelled")
 	}
 
 	dlCtx, cancel := context.WithCancel(a.ctx)
@@ -551,6 +588,23 @@ func (a *App) DownloadArtefact(name string) error {
 
 	go a.download(cli, dlCtx, dl, name, path)
 	return nil
+}
+
+// expandHome resolves a leading ~/ against the user's home directory. The
+// download destination is typed, not dialogued, so ~/rocsar/<name> has to work
+// as written.
+func expandHome(path string) (string, error) {
+	if path == "~" || len(path) > 2 && path[:2] == "~/" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("cannot resolve ~: %w", err)
+		}
+		if path == "~" {
+			return home, nil
+		}
+		return filepath.Join(home, path[2:]), nil
+	}
+	return path, nil
 }
 
 // CancelDownload aborts the running transfer, if any. Idempotent: no active
@@ -678,19 +732,6 @@ func previewMIME(name string) string {
 	default:
 		return "application/octet-stream"
 	}
-}
-
-// saveFile asks where to put a download. The native dialog in production, an
-// injected path in tests -- a headless test cannot answer a file dialog, and
-// the runtime kills the process for trying on a bare context.
-func (a *App) saveFile(suggestedName string) (string, error) {
-	if a.saveFn != nil {
-		return a.saveFn(suggestedName)
-	}
-	return runtime.SaveFileDialog(a.ctx, runtime.SaveDialogOptions{
-		DefaultFilename: filepath.Base(suggestedName),
-		Title:           "Save artefact " + suggestedName,
-	})
 }
 
 // ---------------------------------------------------------------------------

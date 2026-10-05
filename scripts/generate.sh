@@ -41,7 +41,7 @@ PROTOC="${PROTOC:-$ROOT/third_party/nanopb/generator-bin/protoc}"
 FIRMWARE_PROTOS=(rocsar/v1/common.proto rocsar/v1/pico.proto)
 
 # Ground-station types that must never appear in the generated C.
-FORBIDDEN_IN_FIRMWARE=(CommandRequest CommandResponse TelemetryFrame SdrStatus CameraStatus LinkStatus)
+FORBIDDEN_IN_FIRMWARE=(CommandRequest CommandResponse TelemetryFrame SdrStatus CameraStatus LinkStatus SdrGetParamsCommand)
 
 command -v buf >/dev/null || { echo "[gen] buf not found in PATH" >&2; exit 1; }
 [[ -x "$PROTOC" ]] || { echo "[gen] vendored protoc not found at $PROTOC" >&2; exit 1; }

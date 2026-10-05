@@ -59,6 +59,11 @@ message SdrResetUSBCommand {}
 
 message SdrProbeCommand {}
 
+// Reads parameters/params.json. The read side of sdr_set_params: the GUI
+// shows current values as placeholder hints while blank inputs keep meaning
+// "leave alone", and a read that fails is surfaced, never guessed.
+message SdrGetParamsCommand {}
+
 // ---------------------------------------------------------------------------
 // Camera
 // ---------------------------------------------------------------------------
@@ -114,6 +119,7 @@ message CommandRequest {
     SdrSetParamsCommand sdr_set_params = 4;
     SdrResetUSBCommand sdr_reset_usb = 5;
     SdrProbeCommand sdr_probe = 6;
+    SdrGetParamsCommand sdr_get_params = 12;
     TakePhotoCommand take_photo = 7;
     GnssSelectCommand gnss_select = 8;
     LinkSetLimitCommand link_set_limit = 9;

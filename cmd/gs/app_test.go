@@ -4,7 +4,7 @@ package main
 //
 // The App's two untestable dependencies -- Wails events (EventsEmit kills the
 // process on a bare context) and the save-file dialog (same) -- are injected
-// through emitFn and saveFn. Everything else runs for real: commands cross
+// through emitFn. Everything else runs for real: commands cross
 // ZeroMQ to a transport server bound on loopback, telemetry arrives as framed
 // protobuf, and artefact bytes come from the OBC's own file handler over a
 // test HTTP server. A fake that stubbed any of those would test the stub.
@@ -16,6 +16,7 @@ package main
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -146,6 +147,8 @@ func (h *harness) answer(req *rocsarv1.CommandRequest) *rocsarv1.CommandResponse
 			ArtefactSizeBytes: uint64ptr(16),
 			ArtefactKind:      strptr("camera"),
 		}
+	case *rocsarv1.CommandRequest_SdrGetParams:
+		return ok(`{"PRF":2750,"FS":31251000,"TX_FREQ":5800000000,"SESSION_DURATION":60}`)
 	default:
 		return ok(fmt.Sprintf("fake obc answered %T", p))
 	}
@@ -209,12 +212,11 @@ func (r *recorder) last(event string) interface{} {
 	return got[len(got)-1]
 }
 
-// testApp builds an App wired to the harness with injected events and dialog.
-func (h *harness) testApp(t *testing.T, rec *recorder, savePath string) *App {
+// testApp builds an App wired to the harness with injected events.
+func (h *harness) testApp(t *testing.T, rec *recorder) *App {
 	t.Helper()
 	app := NewApp(h.endpoints)
 	app.emitFn = rec.emit
-	app.saveFn = func(string) (string, error) { return savePath, nil }
 	app.startup(context.Background())
 	t.Cleanup(func() { app.shutdown(context.Background()) })
 	return app
@@ -238,7 +240,7 @@ func TestAppDeliversTelemetryFrames(t *testing.T) {
 	h := newHarness(t)
 	defer h.close()
 	rec := newRecorder()
-	app := h.testApp(t, rec, "")
+	app := h.testApp(t, rec)
 
 	for i := 0; i < 8; i++ {
 		h.publish(t)
@@ -276,7 +278,7 @@ func TestAppBoundCommandsRoundTrip(t *testing.T) {
 	h := newHarness(t)
 	defer h.close()
 	rec := newRecorder()
-	app := h.testApp(t, rec, "")
+	app := h.testApp(t, rec)
 
 	if r := app.QueryStatus(); !r.Success || r.Error != "ERROR_NONE" {
 		t.Errorf("query: %+v, want success", r)
@@ -298,6 +300,21 @@ func TestAppBoundCommandsRoundTrip(t *testing.T) {
 	}
 	if r := app.TakePhoto(); !r.Success || r.Artefact == nil || r.Artefact.Name != "photos/fake.jpg" {
 		t.Errorf("photo: %+v, want artefact metadata not bytes", r)
+	}
+
+	// Params read returns the JSON the dispatcher put in message, verbatim.
+	// The keys are asserted, not just parsability: the GUI maps them to form
+	// placeholders, so a renamed key is a silent blank field.
+	raw, err := app.SdrGetParams()
+	if err != nil {
+		t.Fatalf("sdr-get-params: %v", err)
+	}
+	var params map[string]any
+	if err := json.Unmarshal([]byte(raw), &params); err != nil {
+		t.Fatalf("params reply is not JSON: %v (%q)", err, raw)
+	}
+	if params["PRF"] != 2750.0 || params["SESSION_DURATION"] != 60.0 {
+		t.Errorf("params = %v, want the harness values", params)
 	}
 
 	// A tick outside the ST3215 range is refused before anything travels: the
@@ -329,7 +346,7 @@ func TestAppListsAndDownloadsArtefacts(t *testing.T) {
 	defer h.close()
 	rec := newRecorder()
 	dst := filepath.Join(t.TempDir(), "saved.jpg")
-	app := h.testApp(t, rec, dst)
+	app := h.testApp(t, rec)
 
 	entries, err := app.ListArtefacts("")
 	if err != nil {
@@ -350,7 +367,7 @@ func TestAppListsAndDownloadsArtefacts(t *testing.T) {
 		t.Fatalf("photos listing = %+v, want the seeded photograph", entries)
 	}
 
-	if err := app.DownloadArtefact("photos/fake.jpg"); err != nil {
+	if err := app.DownloadArtefact("photos/fake.jpg", dst); err != nil {
 		t.Fatalf("download start: %v", err)
 	}
 	eventually(t, 15*time.Second, func() bool { return rec.count(eventDone) > 0 },
@@ -376,10 +393,9 @@ func TestAppListsAndDownloadsArtefacts(t *testing.T) {
 	rec2 := newRecorder()
 	app2 := NewApp(h.endpoints)
 	app2.emitFn = rec2.emit
-	app2.saveFn = func(string) (string, error) { return filepath.Join(t.TempDir(), "drip.bin"), nil }
 	app2.startup(context.Background())
 	defer app2.shutdown(context.Background())
-	if err := app2.DownloadArtefact("drip.bin"); err != nil {
+	if err := app2.DownloadArtefact("drip.bin", filepath.Join(t.TempDir(), "drip.bin")); err != nil {
 		t.Fatalf("drip download start: %v", err)
 	}
 	eventually(t, 15*time.Second, func() bool { return rec2.count(eventProgress) >= 2 },
@@ -397,7 +413,7 @@ func TestAppDisconnectStopsDelivery(t *testing.T) {
 	h := newHarness(t)
 	defer h.close()
 	rec := newRecorder()
-	app := h.testApp(t, rec, "")
+	app := h.testApp(t, rec)
 
 	for i := 0; i < 8; i++ {
 		h.publish(t)
@@ -441,7 +457,7 @@ func TestAppPreviewArtefact(t *testing.T) {
 	h := newHarness(t)
 	defer h.close()
 	rec := newRecorder()
-	app := h.testApp(t, rec, "")
+	app := h.testApp(t, rec)
 
 	url, err := app.PreviewArtefact("photos/fake.jpg")
 	if err != nil {

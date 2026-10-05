@@ -28,6 +28,7 @@ import {
     QueryStatus,
     RotateReceiver,
     SdrConnect,
+    SdrGetParams,
     SdrProbe,
     SdrResetUSB,
     SelectReceiver,
@@ -40,6 +41,7 @@ import {
     StopAll,
     StopServo,
     TakePhoto,
+    Version,
     ZeroAll,
     ZeroServo,
 } from '../wailsjs/go/main/App';
@@ -207,6 +209,41 @@ function numOrUndef(id: string): number | undefined {
 function clearParams(): void {
     for (const id of ['in-prf', 'in-fs', 'in-tx', 'in-gtx', 'in-grx', 'in-bw', 'in-sess']) {
         (req(id) as HTMLInputElement).value = '';
+    }
+}
+
+/* Input id to params.json key. One table, used for both directions: refresh
+ * writes placeholders from it, apply reads values for it. A key renamed on
+ * either side breaks visibly (placeholder shows "(unknown)") rather than
+ * silently mapping to the wrong field. */
+const PARAM_FIELDS: Array<[string, string]> = [
+    ['in-prf', 'PRF'],
+    ['in-fs', 'FS'],
+    ['in-tx', 'TX_FREQ'],
+    ['in-gtx', 'NORMALIZED_GAIN_TX'],
+    ['in-grx', 'NORMALIZED_GAIN_RX'],
+    ['in-bw', 'BW'],
+    ['in-sess', 'SESSION_DURATION'],
+];
+
+/* Current values arrive as placeholder hints; inputs stay empty so blank keeps
+ * meaning "leave alone". A read failure leaves "(unavailable)" hints rather
+ * than stale numbers: a placeholder from a previous connection is a lie about
+ * the current one. */
+async function refreshParams(): Promise<void> {
+    let vals: Record<string, unknown> | null = null;
+    try {
+        vals = JSON.parse(await SdrGetParams()) as Record<string, unknown>;
+    } catch (err) {
+        logLine(`params read unavailable: ${err}`);
+    }
+    for (const [id, key] of PARAM_FIELDS) {
+        const el = req(id) as HTMLInputElement;
+        const v = vals === null ? undefined : vals[key];
+        el.placeholder = typeof v === 'number' ? String(v) : '(unknown)';
+    }
+    if (vals !== null) {
+        logLine('params refreshed from OBC');
     }
 }
 
@@ -413,10 +450,15 @@ async function downloadByName(name: string, list: client.Entry[]): Promise<void>
     if (!list.some((e) => e.name === name)) {
         return;
     }
+    // No native file dialog: GTK's file chooser aborts the process when
+    // GSettings schemas are missing, which is uncatchable. The destination is
+    // typed instead, defaulting under ~/rocsar; the Go side expands the ~.
+    const dir = strArg('in-destdir').trim() || '~/rocsar';
     const full = currentPath === '' ? name : `${currentPath}/${name}`;
+    const dest = dir.endsWith('/') ? `${dir}${name}` : `${dir}/${name}`;
     try {
-        await DownloadArtefact(full);
-        logLine(`download started: ${full}`);
+        await DownloadArtefact(full, dest);
+        logLine(`download started: ${full} -> ${dest}`);
     } catch (err) {
         logLine(`download refused: ${err}`);
     }
@@ -494,7 +536,7 @@ function wireCommands(): void {
     on('b-link', () => void SetLinkLimit(numArg('in-link')).then((r) => cmdLine('link', r)));
     on('b-params', () => void (async () => {
         try {
-            cmdLine('sdr-set-params', await SetSdrParams({
+            const r = await SetSdrParams({
                 prf_hz: numOrUndef('in-prf'),
                 sample_rate_hz: numOrUndef('in-fs'),
                 tx_freq_hz: numOrUndef('in-tx'),
@@ -502,12 +544,18 @@ function wireCommands(): void {
                 normalized_gain_rx: numOrUndef('in-grx'),
                 bandwidth_hz: numOrUndef('in-bw'),
                 session_duration_s: numOrUndef('in-sess'),
-            }));
+            });
+            cmdLine('sdr-set-params', r);
+            if (r.success) {
+                clearParams();
+                await refreshParams();
+            }
         } catch (err) {
             logLine(`params input: ${err}`);
         }
     })());
     on('b-params-clear', () => clearParams());
+    on('b-params-refresh', () => void refreshParams());
     on('b-ls', () => void refreshListing());
     on('b-dlcancel', () => void CancelDownload().then(
         () => logLine('download cancel requested'),
@@ -546,21 +594,26 @@ function wireEvents(): void {
 
 function layout(): void {
     req('app').innerHTML = `
-    <header><h1>ROCSAR Ground Station</h1><div id="linkline">…</div></header>
+    <header>
+      <h1>ROCSAR Ground Station</h1>
+      <div id="linkline">…</div>
+      <div class="conn">
+        <input id="in-control" size="22" title="control endpoint">
+        <input id="in-telemetry" size="22" title="telemetry endpoint">
+        <input id="in-http" size="20" title="artefact server">
+        <button id="b-conn">connect</button>
+        <button id="b-disconn">disconnect</button>
+      </div>
+    </header>
     <div id="stale" class="banner err" style="display:none">LINK STALE — showing last known values; motion stands down</div>
     <div id="health"></div>
     <div id="meta"></div>
-    <section><h2>connection</h2>
-      <div class="row"><span>control</span><input id="in-control" size="28"></div>
-      <div class="row"><span>telemetry</span><input id="in-telemetry" size="28"></div>
-      <div class="row"><span>http</span><input id="in-http" size="28"></div>
-      <div class="row"><button id="b-conn">connect</button> <button id="b-disconn">disconnect</button></div>
-    </section>
-    <section><h2>system</h2><div id="sys"></div></section>
-    <section><h2>gnss</h2><div id="gnss"></div>
+    <div id="panels">
+    <section class="p-sys"><h2>system</h2><div id="sys"></div></section>
+    <section class="p-gnss"><h2>gnss</h2><div id="gnss"></div>
       <div class="row"><input id="in-gnss" size="4" value="1"><button id="b-gnss">select</button> <button id="b-gnss-rot">rotate</button></div>
     </section>
-    <section><h2>flight controller</h2><div id="pico"></div>
+    <section class="p-pico motion-zone"><h2>flight controller</h2><div id="pico"></div>
       <div class="row"><input id="in-heading" size="8" value="0"><button data-motion id="b-heading">set heading</button> <button id="b-pico">status</button></div>
       <div class="row"><input id="in-jog-id" size="3" value="1"><input id="in-jog-tick" size="6" value="2048"><button data-motion id="b-jog">jog</button> <button data-motion id="b-zero">zero both</button></div>
       <div class="row"><input id="in-mount-id" size="3" value="1"><input id="in-mount-deg" size="6" value="0"><button data-motion id="b-mount">mount</button></div>
@@ -568,25 +621,27 @@ function layout(): void {
       <div class="row"><input id="in-heater-id" size="3" value="1"><input id="in-heater-state" size="4" value="on"><button data-motion id="b-heater">heater</button></div>
       <div class="row"><button data-motion id="b-stop">stop all</button></div>
     </section>
-    <section><h2>map</h2>
+    <section class="p-map"><h2>map</h2>
       <div id="map" style="height: 400px; width: 100%; margin-top: 8px;"></div>
       <div id="position" style="font-size: 12px; color: var(--dim); margin-top: 4px;"></div>
     </section>
-    </section><h2>camera · sdr · link</h2><div id="csl"></div>
+    <section class="p-csl"><h2>camera · sdr · link</h2><div id="csl"></div>
       <div class="row"><button id="b-photo">photo</button> <button id="b-probe">sdr probe</button> <button id="b-sdrcon">sdr connect</button> <button id="b-sdrusb">sdr reset usb</button></div>
       <div class="row"><input id="in-link" size="6" value="115"><button id="b-link">set limit kbit</button> <button id="b-query">query</button></div>
       <div class="row" id="cmd-result"></div>
       <div class="row"><span>sdr params (blank = leave alone)</span></div>
       <div class="row"><span>prf</span><input id="in-prf" size="8"><span>fs</span><input id="in-fs" size="10"><span>tx</span><input id="in-tx" size="10"></div>
       <div class="row"><span>gain tx</span><input id="in-gtx" size="6"><span>gain rx</span><input id="in-grx" size="6"><span>bw</span><input id="in-bw" size="10"></div>
-      <div class="row"><span>session s</span><input id="in-sess" size="6"><button id="b-params">apply</button> <button id="b-params-clear">clear</button></div>
+      <div class="row"><span>session s</span><input id="in-sess" size="6"><button id="b-params">apply</button> <button id="b-params-clear">clear</button> <button id="b-params-refresh">refresh</button></div>
     </section>
-    <section><h2>artefacts <span id="pathline">/</span></h2><div id="files"></div>
+    <section class="p-art"><h2>artefacts <span id="pathline">/</span></h2><div id="files"></div>
       <div class="row"><button id="b-ls">refresh</button> <button id="b-dlcancel">cancel download</button></div>
+      <div class="row"><span>save to</span><input id="in-destdir" size="24" value="~/rocsar"></div>
       <div class="row" id="dlstatus"></div>
     </section>
-    <section><h2>preview</h2><div id="preview"><i>no preview — fetch one from a camera file above</i></div></section>
-    <section><h2>log</h2><div id="log"></div></section>`;
+    <section class="p-prev"><h2>preview</h2><div id="preview"><i>no preview — fetch one from a camera file above</i></div></section>
+    <section class="p-log"><h2>log</h2><div id="log"></div></section>
+    </div>`;
 }
 
 async function firstPaint(): Promise<void> {
@@ -600,6 +655,7 @@ async function firstPaint(): Promise<void> {
             renderFrame({view: snap, gaps: 0, restart: false});
         }
         await refreshListing();
+        await refreshParams();
     } catch (err) {
         logLine(`first paint: ${err}`);
     }
@@ -607,6 +663,14 @@ async function firstPaint(): Promise<void> {
 
 function boot(): void {
     layout();
+    // Viewport and version go to the log first: layout complaints ("single
+    // column") are undecidable without the CSS pixel width, and binary
+    // provenance questions end at the stamped version, not in a thread.
+    logLine(`viewport ${window.innerWidth}x${window.innerHeight}`);
+    void Version().then(
+        (v) => logLine(`gs version ${v}`),
+        (err: unknown) => logLine(`version: ${err}`),
+    );
     wireEvents();
     wireCommands();
     wireServoButtons();

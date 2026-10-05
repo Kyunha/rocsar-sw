@@ -27,6 +27,15 @@ import (
 //go:embed all:frontend/dist
 var assets embed.FS
 
+// version identifies the binary in logs and crash traces. "dev" unless stamped
+// at build time:
+//
+//	wails build -ldflags "-X main.version=$(git rev-parse --short HEAD)"
+//
+// Binary provenance questions ("which build produced this layout?") end here
+// instead of in a guessing thread.
+var version = "dev"
+
 func main() {
 	if err := run(); err != nil {
 		fmt.Fprintf(os.Stderr, "gs: %v\n", err)
@@ -39,6 +48,7 @@ func run() error {
 		control   = flag.String("control", "tcp://192.168.1.50:5555", "OBC control socket (ROUTER)")
 		telemetry = flag.String("telemetry", "tcp://192.168.1.50:5556", "OBC telemetry socket (PUB)")
 		httpAddr  = flag.String("http", "http://192.168.1.50:5557", "OBC artefact server")
+		showVer   = flag.Bool("version", false, "print the build version and exit")
 	)
 	flag.Usage = func() {
 		fmt.Fprintf(flag.CommandLine.Output(),
@@ -53,6 +63,10 @@ func run() error {
 		flag.PrintDefaults()
 	}
 	flag.Parse()
+	if *showVer {
+		fmt.Println(version)
+		return nil
+	}
 
 	app := NewApp(client.Config{
 		Control:   *control,

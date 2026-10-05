@@ -354,6 +354,9 @@ func BuildRequests(name string, args []string) ([]*rocsarv1.CommandRequest, erro
 	case "sdr-probe":
 		req.Payload = &rocsarv1.CommandRequest_SdrProbe{SdrProbe: &rocsarv1.SdrProbeCommand{}}
 
+	case "sdr-get-params":
+		req.Payload = &rocsarv1.CommandRequest_SdrGetParams{SdrGetParams: &rocsarv1.SdrGetParamsCommand{}}
+
 	case "sdr-connect":
 		req.Payload = &rocsarv1.CommandRequest_SdrConnect{SdrConnect: &rocsarv1.SdrConnectCommand{}}
 
@@ -404,6 +407,6 @@ func Names() []string {
 	return []string{
 		"query", "photo", "gnss", "gnss-rotate", "heading", "jog", "zero", "mount", "dir",
 		"heater", "stop", "pico-status", "sdr-probe", "sdr-connect",
-		"sdr-reset-usb", "link", "reboot",
+		"sdr-reset-usb", "sdr-get-params", "link", "reboot",
 	}
 }

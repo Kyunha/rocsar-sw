@@ -7,6 +7,7 @@ package command
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -121,6 +122,8 @@ func (d *Dispatcher) Handle(ctx context.Context, req *rocsarv1.CommandRequest) *
 		return d.sdrResetUSB(ctx, req.GetRequestId())
 	case *rocsarv1.CommandRequest_SdrProbe:
 		return d.sdrProbe(ctx, req.GetRequestId())
+	case *rocsarv1.CommandRequest_SdrGetParams:
+		return d.sdrGetParams(ctx, req.GetRequestId())
 	case *rocsarv1.CommandRequest_TakePhoto:
 		return d.takePhoto(ctx, req.GetRequestId())
 	case *rocsarv1.CommandRequest_GnssSelect:
@@ -157,6 +160,8 @@ func commandName(req *rocsarv1.CommandRequest) string {
 		return "sdr.reset_usb"
 	case *rocsarv1.CommandRequest_SdrProbe:
 		return "sdr.probe"
+	case *rocsarv1.CommandRequest_SdrGetParams:
+		return "sdr.get_params"
 	case *rocsarv1.CommandRequest_TakePhoto:
 		return "camera.take_photo"
 	case *rocsarv1.CommandRequest_GnssSelect:
@@ -357,6 +362,34 @@ func (d *Dispatcher) sdrProbe(ctx context.Context, requestID string) *rocsarv1.C
 		out = out[:maxCommandOutput] + "\n[truncated]"
 	}
 	return ok(requestID, out)
+}
+
+// sdrGetParams reads parameters/params.json and returns it as JSON.
+//
+// The read side of sdr_set_params: the Ground Station shows current values as
+// placeholder hints while blank inputs keep meaning "leave alone". The JSON
+// shape is domain.SdrParams marshalled as-is, so the keys are the params.json
+// keys (PRF, FS, TX_FREQ, ...) the operator already knows, not a second
+// vocabulary. Like sdr_probe, the output is verbatim; unlike sdr_probe it
+// cannot overflow the message cap, but the truncation guard stays because a
+// params file is operator-edited and unbounded in principle.
+func (d *Dispatcher) sdrGetParams(ctx context.Context, requestID string) *rocsarv1.CommandResponse {
+	if d.sdr == nil {
+		return fail(requestID, rocsarv1.ErrorCode_ERROR_NOT_CONNECTED, "no SDR is configured")
+	}
+	params, err := d.sdr.Params(ctx)
+	if err != nil {
+		return fail(requestID, classify(err), err.Error())
+	}
+	out, err := json.Marshal(params)
+	if err != nil {
+		return fail(requestID, rocsarv1.ErrorCode_ERROR_INTERNAL,
+			fmt.Sprintf("could not encode parameters: %v", err))
+	}
+	if len(out) > maxCommandOutput {
+		out = out[:maxCommandOutput]
+	}
+	return ok(requestID, string(out))
 }
 
 // ---------------------------------------------------------------------------

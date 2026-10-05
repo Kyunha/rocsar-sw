@@ -448,14 +448,14 @@ before the first event.
 
 **Camera** — `TakePhoto()`
 
-**SDR** — `SdrProbe()`, `SdrConnect()`, `SdrResetUSB()`, `SetSdrParams(patch)`
+**SDR** — `SdrProbe()`, `SdrGetParams()`, `SdrConnect()`, `SdrResetUSB()`, `SetSdrParams(patch)`
 
 **Link** — `SetLinkLimit(kbit)`
 
-**Artefacts** — `ListArtefacts(path)`, `DownloadArtefact(name)`,
+**Artefacts** — `ListArtefacts(path)`, `DownloadArtefact(name, destPath)`,
 `CancelDownload()`, `PreviewArtefact(name)`
 
-**System** — `QueryStatus()`
+**System** — `QueryStatus()`, `Version()`
 
 Three absences, all deliberate:
 
@@ -526,6 +526,11 @@ their age is displayed alongside them.
   frontend draws the distinction it is given and does not invent one.
 - Retain a command it has sent. The reply arrives as an event, matched on
   request id.
+- Open a native file dialog. GTK's file chooser aborts the whole process with
+  SIGABRT when GSettings schemas are missing from the environment, which is
+  uncatchable from Go (`git log` the `SaveFileDialog` removal for the trace).
+  Destinations are typed into the window instead. This is not a styling choice;
+  it is the only file picker that cannot kill the console.
 
 ---
 

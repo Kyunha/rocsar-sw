@@ -7,6 +7,12 @@
  *
  * Per GUI_ARCHITECTURE.md: no protobuf in the browser, degrees displayed
  * as-is, absence handled by internal/gsview.
+ *
+ * PMtiles integration: the file pmtiles/porto.pmtiles is embedded as a
+ * frontend asset by Wails. If the Leaflet PmTiles plugin becomes available
+ * or is added as a dependency, the map can be initialised with:
+ *   L.pmtile('pmtiles/porto.pmtiles').addTo(map);
+ * For now the map operates in full offline mode without tile requests.
  */
 
 import * as L from 'leaflet';
@@ -37,7 +43,9 @@ interface TelemetryFrameView {
 
 /* Initialise the Leaflet map, marker, and event subscription.
  * No tile layer: background color shows the operating area;
- * all map assets are bundled into the Go binary at wails build time. */
+ * all map assets are bundled into the Go binary at wails build time.
+ * The pmtiles file pmtiles/porto.pmtiles is embedded as a frontend asset;
+ * it may be used with L.pmtile() when the plugin is available. */
 function initMap(): void {
     map = L.map('map', {
         center: [39, -8],   // Portugal approximate centre
@@ -65,6 +73,14 @@ function initMap(): void {
         const frame = ev as TelemetryFrameView;
         updateFromFrame(frame);
     });
+
+    /* NOTE: pmtiles integration point.
+     * When the Leaflet PmTiles plugin is available, the following can be
+     * uncommented to load the embedded porto.pmtiles tile set:
+     *   L.pmtile('pmtiles/porto.pmtiles').addTo(map);
+     * The pmtiles file is embedded as a Wails frontend asset at
+     * frontend/pmtiles/porto.pmtiles and is available offline in the binary.
+     */
 }
 
 /* Update marker position, trail, and readout from a decoded telemetry frame. */
