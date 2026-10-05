@@ -31,3 +31,8 @@ rocsar.local.toml
 
 # Runtime data
 /data/
+
+# Map tile data: large binary blob, not code. The frontend copy is embedded by
+# Wails at build time; the root copy is a duplicate for offline use.
+/pmtiles/
+cmd/gs/frontend/pmtiles/
