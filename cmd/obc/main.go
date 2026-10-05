@@ -164,64 +164,15 @@ func run() error {
 	// ---------------------------------------------------------------------
 	// Flight controller
 	// ---------------------------------------------------------------------
-	var picoPort domain.Pico = pico.NewMock()
-	if mocked["pico"] {
-		log.Warn("using a simulated flight controller")
-	} else {
-		// The Link is a protocol layer. It does not open the port and it does not
-		// close it: NewSerialTransport returns an unopened port precisely so the
-		// composition root decides when the device is touched, and Link.Shutdown
-		// stops the protocol without reaching past its transport.
-		//
-		// That separation is only worth anything if both halves are actually
-		// called. OpenPort was missing, so the link handshook with a port it never
-		// opened and every start degraded with "serial transport is not open" --
-		// which reads like a missing device and is not one.
-		serial := pico.NewSerialTransport(cfg.Pico.Port, cfg.Pico.Baudrate)
-
-		switch {
-		case !serial.Exists():
-			msg := fmt.Sprintf("no flight controller at %s", cfg.Pico.Port)
-			if cfg.RequireHardware {
-				return errors.New(msg)
-			}
-			log.Error(msg + "; continuing degraded")
-
-		default:
-			// A node that exists but will not open is a different fault from a
-			// node that is not there: wrong permissions, already in use, or it
-			// enumerated as something else. It gets its own message because the
-			// operator action is different.
-			if err := serial.OpenPort(); err != nil {
-				msg := fmt.Sprintf("cannot open flight controller at %s: %v", cfg.Pico.Port, err)
-				if cfg.RequireHardware {
-					return errors.New(msg)
-				}
-				log.Error(msg + "; continuing degraded")
-				break
-			}
-			// Registered before the link so the port is closed after it, not
-			// before. Both are idempotent, so shutdown order is not load-bearing,
-			// but a port closed out from under a running read loop is a race
-			// nobody needs to have.
-			defer func() { _ = serial.Close() }()
-
-			link := pico.NewLink(serial, log)
-			if err := link.Open(ctx); err != nil {
-				// Degrade rather than abort, unless the operator asked otherwise.
-				// A missing flight controller must be visible in telemetry, not
-				// fatal -- except when --require-hardware says it should be.
-				if cfg.RequireHardware {
-					return fmt.Errorf("flight controller at %s: %w", cfg.Pico.Port, err)
-				}
-				log.Error("flight controller did not answer; continuing degraded",
-					"port", cfg.Pico.Port, "err", err)
-			} else {
-				log.Info("flight controller connected", "port", cfg.Pico.Port, "baud", cfg.Pico.Baudrate)
-			}
-			picoPort = link
-		}
+	picoPort, closePicoPort, err := openPico(ctx, cfg, log, mocked["pico"])
+	if err != nil {
+		return err
 	}
+	// Registered before anything that depends on the port being open, so it runs
+	// after them: LIFO unwinding stops the link first and closes the device
+	// second. A port closed out from under a running read loop is a race nobody
+	// needs to have.
+	defer closePicoPort()
 
 	// ---------------------------------------------------------------------
 	// Camera
@@ -382,6 +333,98 @@ func mockedNames(m map[string]bool) []string {
 		}
 	}
 	return out
+}
+
+// openPico decides which flight controller the system runs against.
+//
+// Three outcomes, and only three:
+//
+//   - asked to simulate: a mock, and the caller names it in the telemetry frame;
+//   - the device is there: the real link, opened and proved with a
+//     status_request round trip;
+//   - the device is absent, will not open, or will not answer: the real link,
+//     unopened. It reports Connected() == false, holds no telemetry, and refuses
+//     every command with ErrNotConnected.
+//
+// The third case is the easy one to get wrong, and it was. This block used to
+// seed the variable with a mock and overwrite it on the happy path, so every
+// degraded branch left the mock installed: an absent Pico reported
+// pico_connected: true and answered jog, heading and heater commands with
+// "acknowledged by the flight controller" against no hardware -- and because the
+// mock was reached by a `break` rather than by --mock-pico, "pico" was absent
+// from the mocked set, so nothing in telemetry said so either. That is the
+// failure mode ARCHITECTURE.md 9 exists to prevent, running in the opposite
+// direction, and it is exactly what --mock-gnss used to do.
+//
+// So a mock is constructed in exactly one place: when it is asked for by name.
+// Everywhere else the real Link is installed, opened or not, because an unopened
+// Link already *is* the degraded adapter.
+//
+// The returned func closes the serial port if this call opened one, and is never
+// nil. Closing is separate from opening because the Link deliberately does not
+// own the port: it is a protocol layer, and Link.Shutdown stops the protocol
+// without reaching past its transport.
+func openPico(ctx context.Context, cfg config.Config, log *slog.Logger, mock bool) (domain.Pico, func(), error) {
+	noop := func() {}
+
+	if mock {
+		log.Warn("using a simulated flight controller")
+		return pico.NewMock(), noop, nil
+	}
+
+	// The Link is a protocol layer. It does not open the port and it does not
+	// close it: NewSerialTransport returns an unopened port precisely so the
+	// composition root decides when the device is touched, and Link.Shutdown
+	// stops the protocol without reaching past its transport.
+	//
+	// That separation is only worth anything if both halves are actually
+	// called. OpenPort was missing, so the link handshook with a port it never
+	// opened and every start degraded with "serial transport is not open" --
+	// which reads like a missing device and is not one.
+	serial := pico.NewSerialTransport(cfg.Pico.Port, cfg.Pico.Baudrate)
+
+	// Built before the switch and returned whichever way the switch goes. There
+	// is no branch in which the caller is handed anything but this or a mock
+	// that was asked for.
+	link := pico.NewLink(serial, log)
+
+	switch {
+	case !serial.Exists():
+		msg := fmt.Sprintf("no flight controller at %s", cfg.Pico.Port)
+		if cfg.RequireHardware {
+			return nil, noop, errors.New(msg)
+		}
+		log.Error(msg + "; continuing degraded")
+
+	default:
+		// A node that exists but will not open is a different fault from a
+		// node that is not there: wrong permissions, already in use, or it
+		// enumerated as something else. It gets its own message because the
+		// operator action is different.
+		if err := serial.OpenPort(); err != nil {
+			msg := fmt.Sprintf("cannot open flight controller at %s: %v", cfg.Pico.Port, err)
+			if cfg.RequireHardware {
+				return nil, noop, errors.New(msg)
+			}
+			log.Error(msg + "; continuing degraded")
+			break
+		}
+
+		if err := link.Open(ctx); err != nil {
+			// Degrade rather than abort, unless the operator asked otherwise.
+			// A missing flight controller must be visible in telemetry, not
+			// fatal -- except when --require-hardware says it should be.
+			if cfg.RequireHardware {
+				return nil, func() { _ = serial.Close() }, fmt.Errorf("flight controller at %s: %w", cfg.Pico.Port, err)
+			}
+			log.Error("flight controller did not answer; continuing degraded",
+				"port", cfg.Pico.Port, "err", err)
+		} else {
+			log.Info("flight controller connected", "port", cfg.Pico.Port, "baud", cfg.Pico.Baudrate)
+		}
+	}
+
+	return link, func() { _ = serial.Close() }, nil
 }
 
 // cpuTemperature reads the SoC temperature.

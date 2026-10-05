@@ -681,6 +681,10 @@ type DownloadDone struct {
 // bridge would freeze the window for the duration; the cap is load-bearing,
 // not aesthetic. The UI offers preview only for small camera files, and this
 // refuses everything over the cap regardless of what the button said.
+//
+// Enforced by the transfer, not after it. This used to fetch the whole file and
+// then test xfer.Bytes, which is the freeze the cap exists to prevent followed by
+// an error explaining why the window is frozen.
 const previewCapBytes = 5 << 20
 
 // PreviewArtefact fetches one artefact and returns it as a data URL for
@@ -703,13 +707,13 @@ func (a *App) PreviewArtefact(name string) (string, error) {
 	defer os.RemoveAll(dir)
 	path := filepath.Join(dir, filepath.Base(name))
 
-	xfer, err := cli.Fetch(a.ctx, name, path, true, client.FetchHooks{})
+	_, err = cli.Fetch(a.ctx, name, path, true, client.FetchHooks{Limit: previewCapBytes})
 	if err != nil {
+		if errors.Is(err, client.ErrTooLarge) {
+			return "", fmt.Errorf("%s is larger than the %d byte preview limit; fetch it instead",
+				name, previewCapBytes)
+		}
 		return "", err
-	}
-	if xfer.Bytes > previewCapBytes {
-		return "", fmt.Errorf("client: %s is %d bytes; preview refuses over %d (fetch it instead)",
-			name, xfer.Bytes, previewCapBytes)
 	}
 	body, err := os.ReadFile(path)
 	if err != nil {

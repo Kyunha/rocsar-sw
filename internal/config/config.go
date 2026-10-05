@@ -22,6 +22,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -231,16 +232,69 @@ func findBase() (string, error) {
 // Apply layers the environment over the file-derived configuration. Call it
 // after Load and before applying flags, which are the highest priority.
 func (c *Config) Apply() error {
+	keys := make([]string, 0, len(KnownKeys))
 	for key := range KnownKeys {
+		keys = append(keys, key)
+	}
+	// Sorted so that a shell with two bad variables always reports the same one
+	// first. Map order is random, and a startup error that names a different key
+	// on each run is maddening to diagnose.
+	sort.Strings(keys)
+
+	for _, key := range keys {
 		env, ok := os.LookupEnv(EnvName(key))
 		if !ok {
 			continue
 		}
-		if err := c.set(key, env); err != nil {
+		if err := c.applyEnv(key, env); err != nil {
 			return fmt.Errorf("%s: %w", EnvName(key), err)
 		}
 	}
 	return nil
+}
+
+// applyEnv layers one environment variable over the configuration.
+//
+// The value is handed to the TOML parser rather than converted here, so the
+// environment and rocsar.toml pass through exactly one parser and cannot come to
+// disagree about what a value means. That is not tidiness; it was a working
+// outage.
+//
+// This used to hand the raw string straight to assign(), which type-asserts on
+// the shapes go-toml produces. Every non-string key was therefore rejected --
+// "expected a number, got string", "expected true or false, got string" -- and
+// since Apply returned on the first error, setting one of them aborted startup.
+// Seven of the nineteen keys were affected: both link settings, the pico baud,
+// the GNSS port list, the GNSS selection, the QoS rate, and require_hardware.
+// README's two worked examples were both of them.
+//
+// Two forms are tried, because an environment variable is a bare token and TOML
+// is not: the value as written, then the value quoted. "115" and "true" and
+// "[2001,2002,2003]" are TOML in the first form; "tcp://*:5555" and "2s" and
+// "/dev/ttyACM0" are only TOML in the second. Whichever the key accepts wins, so
+// applyEnv never has to know a key's type -- assign already does.
+func (c *Config) applyEnv(key, env string) error {
+	bare, bareErr := parseTOML(key + " = " + env)
+	if bareErr == nil {
+		if raw, ok := bare[key]; ok {
+			if err := c.assign(key, raw); err == nil {
+				return nil
+			}
+		}
+	}
+
+	quoted, err := parseTOML(key + " = " + strconv.Quote(env))
+	if err != nil {
+		// The bare form's complaint is the informative one: it is what the
+		// operator wrote, and for the keys that are not strings it names the
+		// type they wanted.
+		return bareErr
+	}
+	raw, ok := quoted[key]
+	if !ok {
+		return bareErr
+	}
+	return c.assign(key, raw)
 }
 
 // EnvName maps a dotted configuration key to its environment variable.

@@ -104,7 +104,7 @@ func DecodeMessage(cobs []byte) (*rocsarv1.PicoMessage, error) {
 // Not wrapped in PicoMessage. The envelope is the Pico-to-Pi direction only --
 // it carries what the flight controller reports and acknowledges. The Pi's
 // commands are bare PicoCommand payloads, which is what the sketch decodes:
-// `pb_decode(&stream, CommandMessage_fields, &cmd)` straight onto the
+// `pb_decode(&stream, rocsar_v1_PicoCommand_fields, &cmd)` straight onto the
 // deframed buffer, with no envelope and no timestamp.
 //
 // A command frame carries no timestamp because the RP2040 has no reason to
@@ -139,12 +139,50 @@ func EncodeCommand(cmd *rocsarv1.PicoCommand) ([]byte, error) {
 	return append(frame, Delimiter), nil
 }
 
-// EncodeTelemetryRequest asks the flight controller for an immediate status
-// report, rather than waiting up to CONTROL_LOOP_MS for the next of its own.
+// DecodeCommand parses the protobuf payload of one already-deframed command
+// block.
 //
-// Open() uses this to prove the link. Opening a serial port successfully is not
-// evidence that a device is on the other end of it -- an unplugged Pico leaves
-// the port openable on Linux for a while.
+// The exact mirror of EncodeCommand: cobs must be the bytes BETWEEN delimiters,
+// delimiter excluded, and the payload is a bare PicoCommand.
+//
+// DecodeMessage is NOT a substitute, and using it here is a bug that reads like
+// a dead link. The two payloads share field 1 (sequence), so decoding a command
+// as an envelope succeeds at the protobuf layer and then fails the envelope's
+// own payload check -- "message has no payload set" -- which is what Mock.respond
+// did. Every command through a mocked flight controller failed, and
+// `obc --mock-pico` could not command anything.
+func DecodeCommand(cobs []byte) (*rocsarv1.PicoCommand, error) {
+	payload, err := CobsDecode(cobs)
+	if err != nil {
+		return nil, fmt.Errorf("deframe: %w", err)
+	}
+
+	cmd := &rocsarv1.PicoCommand{}
+	if err := proto.Unmarshal(payload, cmd); err != nil {
+		// A block that survives COBS but fails protobuf is a sender bug or a
+		// desynchronised stream. Either way it is not a command, so it is
+		// reported and never partially applied.
+		return nil, fmt.Errorf("unmarshal: %w", err)
+	}
+	if cmd.GetPayload() == nil {
+		// Symmetric with EncodeCommand. An empty oneof names no command, and the
+		// firmware answers one with ERROR_INVALID_COMMAND rather than doing
+		// nothing, so the decoder refuses it here where it can still be named.
+		return nil, ErrNoPayload
+	}
+	return cmd, nil
+}
+
+// EncodeTelemetryRequest asks the flight controller to prove the link.
+//
+// The name is historical: it asks for nothing. The sketch's status_request arm
+// changes no state -- it acknowledges, and the acknowledgement is the proof -- so
+// this is a liveness ping, not a request for a report. State arrives on the
+// flight controller's own 50 Hz telemetry stream either way.
+//
+// Open() uses it because opening a serial port successfully is not evidence that
+// a device is on the other end of it: an unplugged Pico leaves the port openable
+// on Linux for a while.
 func EncodeTelemetryRequest(sequence uint32) ([]byte, error) {
 	return EncodeCommand(&rocsarv1.PicoCommand{
 		Sequence: sequence,

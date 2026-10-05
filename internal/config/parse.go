@@ -34,6 +34,19 @@ func parseFile(path string) (map[string]any, error) {
 	return flatten("", doc), nil
 }
 
+// parseTOML returns every leaf of a TOML document as a dotted key, from a
+// string rather than a file.
+//
+// The environment layer needs this so that ROCSAR_* values and rocsar.toml values
+// go through one parser and cannot come to disagree about what a value means.
+func parseTOML(doc string) (map[string]any, error) {
+	var out map[string]any
+	if err := toml.Unmarshal([]byte(doc), &out); err != nil {
+		return nil, err
+	}
+	return flatten("", out), nil
+}
+
 func flatten(prefix string, in map[string]any) map[string]any {
 	out := make(map[string]any, len(in))
 	for k, v := range in {

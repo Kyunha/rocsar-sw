@@ -34,6 +34,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 
@@ -74,6 +75,32 @@ func (v flagValue) Set(s string) error {
 // settings that are about output rather than about the link.
 type console struct {
 	cli *client.Client
+
+	// axisIDs are the servo ids the flight controller last reported, in the order
+	// it reported them. Held so `stop all` can be expanded against them.
+	//
+	// Not a hardcoded {1, 2}. The firmware's ANTENNA_0_SERVO_ID and
+	// ANTENNA_1_SERVO_ID are overridable at build time
+	// (-DANTENNA_0_SERVO_ID=3), so a bench build numbers its axes differently and
+	// a fixed list would silently stop the wrong thing -- or nothing. The board
+	// is the only authority on its own ids, which is why client.BuildRequests
+	// refuses `stop all` and leaves the expansion to the caller.
+	axisIDs []uint32
+}
+
+// noteAxes records the ids from a telemetry frame.
+func (c *console) noteAxes(f *rocsarv1.TelemetryFrame) {
+	pico := f.GetPico()
+	if pico == nil {
+		return
+	}
+	ids := make([]uint32, 0, len(pico.GetAntennas()))
+	for _, a := range pico.GetAntennas() {
+		ids = append(ids, a.GetServoId())
+	}
+	if len(ids) > 0 {
+		c.axisIDs = ids
+	}
 }
 
 func main() {
@@ -205,7 +232,7 @@ func printCommands() {
 		"mount":          "<servo-id> <deg>    set an axis's mount offset",
 		"dir":            "<servo-id> <+1|-1>  set an axis's direction",
 		"heater":         "<1|2> <on|off>     switch a heater",
-		"stop":           "<servo-id|all>     stop one axis, or every axis",
+		"stop":           "<servo-id>       stop one axis (use `status` first for ids)",
 		"pico-status":    "ask the flight controller to re-announce itself",
 		"sdr-probe":      "run uhd_usrp_probe",
 		"sdr-get-params": "read parameters/params.json as JSON",
@@ -271,6 +298,7 @@ func (c *console) pump(ctx context.Context, s *client.Subscription, raw, forever
 		} else {
 			printTelemetry(frame)
 		}
+		c.noteAxes(frame)
 		if !forever {
 			return nil
 		}
@@ -281,9 +309,39 @@ func (c *console) pump(ctx context.Context, s *client.Subscription, raw, forever
 // Commands
 // ---------------------------------------------------------------------------
 
+// build turns a command line into requests, expanding `all` where the shared
+// builder cannot.
+//
+// Only `stop all` needs this, and only because the axis ids are a property of
+// the firmware build rather than of the schema. One request per axis, in the
+// order the board reported them.
+func (c *console) build(name string, args []string) ([]*rocsarv1.CommandRequest, error) {
+	if name == "stop" && len(args) == 1 && strings.EqualFold(args[0], "all") {
+		if len(c.axisIDs) == 0 {
+			// Not an error about the command: the operator has not heard from a
+			// flight controller yet, so there is nothing to stop and no way to
+			// know what the axes are called. `gs_cli status` gets a frame in one
+			// round trip.
+			return nil, fmt.Errorf(
+				"no axis ids seen yet: run `gs_cli status` first, then `stop <servo-id>` " +
+					"for each axis it reports")
+		}
+		out := make([]*rocsarv1.CommandRequest, 0, len(c.axisIDs))
+		for _, id := range c.axisIDs {
+			req, err := client.BuildRequests(name, []string{strconv.FormatUint(uint64(id), 10)})
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, req...)
+		}
+		return out, nil
+	}
+	return client.BuildRequests(name, args)
+}
+
 // command sends one request and waits for its reply.
 func (c *console) command(ctx context.Context, name string, args []string) error {
-	reqs, err := client.BuildRequests(name, args)
+	reqs, err := c.build(name, args)
 	if err != nil {
 		return err
 	}

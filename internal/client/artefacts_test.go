@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -421,7 +422,10 @@ func TestNamesAndBuildRequestsAgree(t *testing.T) {
 		{"mount", []string{"1", "0.5"}},
 		{"dir", []string{"1", "+1"}},
 		{"heater", []string{"1", "on"}},
-		{"stop", []string{"all"}},
+		// A servo id, not "all": `stop all` is recognised but refused here,
+		// because the axis ids are a property of the firmware build and only the
+		// board can report them. See TestStopAllIsRefusedRatherThanSentAsServoZero.
+		{"stop", []string{"1"}},
 		{"pico-status", nil},
 		{"sdr-probe", nil},
 		{"sdr-get-params", nil},
@@ -462,4 +466,124 @@ func validArgsFor(name string) []string {
 		return []string{"1", "on"}
 	}
 	return nil
+}
+
+// ---------------------------------------------------------------------------
+// FetchHooks.Limit
+// ---------------------------------------------------------------------------
+
+// A cap has to stop the transfer, not check it afterwards.
+//
+// cmd/gs's PreviewArtefact fetched the whole file and then compared xfer.Bytes
+// against the cap -- which is the freeze the cap exists to prevent, followed by
+// an error explaining why the window is frozen. Over a 115 kbit/s link with a
+// 30 MB SAR bin, "refused afterwards" takes four minutes.
+func TestFetchLimitStopsTheTransferRatherThanCheckingAfterwards(t *testing.T) {
+	const (
+		limit = 4096
+		total = 512 << 10 // comfortably over the limit
+	)
+	body := strings.Repeat("x", total)
+
+	c, done := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, body)
+	})
+	defer done()
+
+	dir := t.TempDir()
+	out := filepath.Join(dir, "big.bin")
+
+	_, err := c.Fetch(context.Background(), "big.bin", out, true, FetchHooks{Limit: limit})
+	if err == nil {
+		t.Fatal("an over-limit fetch succeeded")
+	}
+	if !errors.Is(err, ErrTooLarge) {
+		t.Fatalf("error is %v, want ErrTooLarge so the caller can say \"too big\" "+
+			"rather than \"the link broke\"", err)
+	}
+
+	// The bytes must never have been written, which is the whole point. The file
+	// must not exist and the partial must not either: a refused fetch that leaves
+	// a file behind is a file that looks like a saved artefact.
+	if _, err := os.Stat(out); !os.IsNotExist(err) {
+		t.Errorf("the destination exists after a refused fetch: %v", err)
+	}
+	if _, err := os.Stat(out + ".part"); !os.IsNotExist(err) {
+		t.Errorf("a .part file was left behind after a refused fetch: %v", err)
+	}
+}
+
+// A file exactly at the limit is allowed. Reading limit+1 bytes to prove that is
+// what makes "over the limit" provable rather than probable.
+func TestFetchLimitAllowsAFileExactlyAtTheLimit(t *testing.T) {
+	const limit = 8192
+	body := strings.Repeat("y", limit)
+
+	c, done := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, body)
+	})
+	defer done()
+
+	out := filepath.Join(t.TempDir(), "exact.bin")
+	x, err := c.Fetch(context.Background(), "exact.bin", out, true, FetchHooks{Limit: limit})
+	if err != nil {
+		t.Fatalf("a file exactly at the limit was refused: %v", err)
+	}
+	if x.Bytes != limit {
+		t.Errorf("reported %d bytes, want %d", x.Bytes, limit)
+	}
+	got, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatalf("reading the result: %v", err)
+	}
+	if len(got) != limit {
+		t.Errorf("wrote %d bytes, want %d", len(got), limit)
+	}
+}
+
+// Zero must stay unlimited: FetchHooks{} is what every other caller passes, and
+// a cap that appeared by default would silently break every download.
+func TestFetchWithoutALimitIsUnlimited(t *testing.T) {
+	body := strings.Repeat("z", 64<<10)
+	c, done := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, body)
+	})
+	defer done()
+
+	out := filepath.Join(t.TempDir(), "any.bin")
+	x, err := c.Fetch(context.Background(), "any.bin", out, true, FetchHooks{})
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	if x.Bytes != int64(len(body)) {
+		t.Errorf("reported %d bytes, want %d", x.Bytes, len(body))
+	}
+}
+
+// The limit counts the whole file, not this attempt's remainder, so it cannot be
+// walked past by resuming into it.
+func TestFetchLimitCountsResumedBytesToo(t *testing.T) {
+	const limit = 4096
+	full := strings.Repeat("q", limit*2)
+
+	c, done := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, full)
+	})
+	defer done()
+
+	dir := t.TempDir()
+	out := filepath.Join(dir, "resumable.bin")
+
+	// A partial already on disk, as a previous interrupted attempt would leave.
+	first := int64(1000)
+	if err := os.WriteFile(out+".part", []byte(strings.Repeat("q", int(first))), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := c.Fetch(context.Background(), "resumable.bin", out, true, FetchHooks{Limit: limit}); err == nil {
+		t.Fatal("a file over the limit was accepted after resuming")
+	}
+	if _, err := os.Stat(out + ".part"); !os.IsNotExist(err) {
+		t.Error("the .part file survived a refused fetch")
+	}
 }

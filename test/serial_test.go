@@ -100,8 +100,8 @@ func (p *ptyPair) SetDeadline(t time.Time) error { return p.Far.SetReadDeadline(
 
 // fakePico is a flight controller that speaks the real wire format.
 //
-// It decodes COBS and unmarshals protobuf exactly as rocsar_pico.ino does --
-// `pb_decode(&stream, CommandMessage_fields, &cmd)` onto the deframed buffer --
+// It decodes COBS and unmarshals protobuf exactly as firmware.ino does --
+// `pb_decode(&stream, rocsar_v1_PicoCommand_fields, &cmd)` onto the deframed buffer --
 // and replies through the same encoder. So a test against this exercises framing
 // in both directions over a real device, not a stub that returns structs.
 type fakePico struct {

@@ -94,7 +94,23 @@ type FetchHooks struct {
 	// not measurements, and a progress bar that occasionally prints a sentence
 	// reads as a bug in the bar.
 	Note func(string)
+
+	// Limit caps the bytes this Fetch will write. Zero, the default, means no cap.
+	//
+	// A hard stop DURING the copy, not a check afterwards. A cap enforced at the
+	// end has already paid the cost the cap exists to avoid: cmd/gs's
+	// PreviewArtefact fetched the whole 30 MB SAR bin over the radio link and
+	// through the JSON bridge, and only then refused it. That is the frozen
+	// window the cap was written to prevent, followed by an error about it.
+	Limit int64
 }
+
+// ErrTooLarge reports that a Fetch reached its FetchHooks.Limit with bytes still
+// to go.
+//
+// Distinct from a transport failure so a caller can say "too big" rather than
+// "the link broke", which are different problems with different operator actions.
+var ErrTooLarge = errors.New("client: transfer is larger than the caller allows")
 
 func (h FetchHooks) note(s string) {
 	if h.Note != nil {
@@ -216,12 +232,30 @@ func (c *Client) Fetch(ctx context.Context, name, out string, resume bool, hooks
 			every: progressInterval,
 		}
 	}
+	if hooks.Limit > 0 {
+		// One byte past the limit, so a file that is exactly the limit is
+		// allowed and anything larger is provably larger rather than possibly
+		// larger. The extra byte is never written: the check below refuses the
+		// transfer and removes the partial.
+		body = io.LimitReader(body, hooks.Limit+1)
+	}
 
 	start := time.Now()
 	written, err := io.Copy(dst, body)
 	if err != nil {
 		return Transfer{}, fmt.Errorf("client: %s: interrupted after %d bytes: %w", name, written, err)
 	}
+
+	if hooks.Limit > 0 && written > hooks.Limit {
+		// The partial goes, and so does anything already renamed into place: a
+		// refused fetch must not leave a file that looks like a saved artefact.
+		// The over-limit copy was never renamed, because the rename is below.
+		_ = os.Remove(partial)
+		_ = os.Remove(out)
+		return Transfer{}, fmt.Errorf("client: %s: %w (stopped at %d bytes, limit %d)",
+			name, ErrTooLarge, hooks.Limit, hooks.Limit)
+	}
+
 	if f != nil {
 		if err := f.Close(); err != nil {
 			return Transfer{}, err

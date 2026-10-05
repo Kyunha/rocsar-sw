@@ -1,6 +1,7 @@
 package client
 
 import (
+	"strconv"
 	"strings"
 	"testing"
 
@@ -208,5 +209,48 @@ func TestRequestIDsAreDistinct(t *testing.T) {
 			t.Fatalf("request_id %q was reused", id)
 		}
 		seen[id] = true
+	}
+}
+
+// TestStopAllIsRefusedRatherThanSentAsServoZero guards a bug that shipped.
+//
+// `stop all` used to be encoded as StopCommand{ServoId: 0}. The firmware
+// resolves an axis with findAntenna(), which matches on the id the axis was
+// built with, and 0 is not one of them -- so the operator typed "stop
+// everything" and got ERROR_INVALID_SERVO, naming a servo they never mentioned.
+//
+// It cannot be fixed by substituting {1, 2} here. The axis ids come from the
+// firmware's ANTENNA_0_SERVO_ID / ANTENNA_1_SERVO_ID, which are overridable at
+// build time, so a fixed list would stop the wrong axes on a bench build and look
+// like it worked. The builder refuses; the caller expands against what the board
+// reports.
+func TestStopAllIsRefusedRatherThanSentAsServoZero(t *testing.T) {
+	for _, arg := range []string{"all", "ALL", "All"} {
+		reqs, err := BuildRequests("stop", []string{arg})
+		if err == nil {
+			t.Fatalf("stop %q produced %d request(s); it must be refused", arg, len(reqs))
+		}
+		if !strings.Contains(err.Error(), "axis ids") {
+			t.Errorf("stop %q: error %q does not say the caller has to expand it", arg, err)
+		}
+		for _, r := range reqs {
+			if id := r.GetPico().GetStop().GetServoId(); id == 0 {
+				t.Errorf("stop %q still put servo_id 0 on the wire", arg)
+			}
+		}
+	}
+}
+
+// The refusal must not have cost the per-axis form, which is how both consoles
+// actually stop everything.
+func TestStopOneAxisStillWorks(t *testing.T) {
+	for _, id := range []uint32{1, 2, 3} {
+		reqs, err := BuildRequests("stop", []string{strconv.FormatUint(uint64(id), 10)})
+		if err != nil {
+			t.Fatalf("stop %d: %v", id, err)
+		}
+		if got := reqs[0].GetPico().GetStop().GetServoId(); got != id {
+			t.Errorf("stop %d encoded servo_id %d", id, got)
+		}
 	}
 }

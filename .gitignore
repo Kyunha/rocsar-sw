@@ -36,3 +36,6 @@ rocsar.local.toml
 # Wails at build time; the root copy is a duplicate for offline use.
 /pmtiles/
 cmd/gs/frontend/pmtiles/
+
+# graft's local graph cache — regenerable, not committed (run `graft build`).
+/graft/

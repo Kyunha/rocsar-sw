@@ -328,13 +328,27 @@ func BuildRequests(name string, args []string) ([]*rocsarv1.CommandRequest, erro
 		if err := need(1); err != nil {
 			return nil, err
 		}
-		id := uint32(0)
-		if !strings.EqualFold(args[0], "all") {
-			v, err := u32(0)
-			if err != nil {
-				return nil, err
-			}
-			id = v
+		if strings.EqualFold(args[0], "all") {
+			// Refused, and it used to be sent as servo_id 0 -- which the firmware
+			// answers with ERROR_INVALID_SERVO, because findAntenna() matches on
+			// the id the axis was built with and 0 is not one of them. An
+			// operator typing `stop all` got a refusal naming a servo they never
+			// mentioned.
+			//
+			// The builder cannot expand it, and must not guess: the axis ids come
+			// from the firmware's ANTENNA_0_SERVO_ID / ANTENNA_1_SERVO_ID, which
+			// are overridable at build time (-DANTENNA_0_SERVO_ID=3), and the only
+			// trustworthy list is the one the board reports in telemetry. So the
+			// caller expands "all" against reported ids and sends one command per
+			// axis -- which is what cmd/gs's StopAll already does, and what
+			// tools/pico_bench does for the same reason.
+			return nil, fmt.Errorf(
+				"stop all must be expanded by the caller against the axis ids the " +
+					"flight controller reports; this builder cannot know them")
+		}
+		id, err := u32(0)
+		if err != nil {
+			return nil, err
 		}
 		req.Payload = &rocsarv1.CommandRequest_Pico{
 			Pico: &rocsarv1.PicoCommand{

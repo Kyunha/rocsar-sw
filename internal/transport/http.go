@@ -322,5 +322,3 @@ func relativeToRoot(root, abs string) string {
 	rel := strings.TrimPrefix(abs, root)
 	return strings.TrimPrefix(rel, string(filepath.Separator))
 }
-
-

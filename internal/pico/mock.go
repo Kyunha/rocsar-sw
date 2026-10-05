@@ -85,12 +85,16 @@ func (m *Mock) respond(cmd *rocsarv1.PicoCommand) (*domain.Ack, error) {
 	if frame[len(frame)-1] != Delimiter {
 		return nil, fmt.Errorf("mock: encoded frame is not delimited")
 	}
-	inner, err := DecodeMessage(frame[:len(frame)-1])
+	inner, err := DecodeCommand(frame[:len(frame)-1])
 	if err != nil {
 		return nil, fmt.Errorf("mock: own frame did not decode: %w", err)
 	}
-	if inner.GetAck() != nil {
-		return nil, fmt.Errorf("mock: a command frame decoded as an envelope")
+	if inner.GetSequence() != cmd.GetSequence() {
+		return nil, fmt.Errorf("mock: sequence %d survived the round trip as %d",
+			cmd.GetSequence(), inner.GetSequence())
+	}
+	if inner.GetPayload() == nil {
+		return nil, fmt.Errorf("mock: the payload did not survive the round trip")
 	}
 
 	return &domain.Ack{CommandSequence: cmd.GetSequence(), Success: true, At: m.now()}, nil

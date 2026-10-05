@@ -52,10 +52,10 @@ header .conn {
     align-items: baseline;
 }
 
-/* Fixed ops grid. Positions are stable across frames so the eye finds the
- * changed panel instead of re-scanning the page -- the same argument as the
- * fixed-shape telemetry block. Two columns at full width, one below ~1100px
- * (the window minimum is 1000px; operators snap windows aside). */
+/* Fixed ops grid. Two stable columns so the eye finds the changed panel
+ * instead of re-scanning the page. Left column: system, GNSS, flight
+ * controller, artefacts. Right column: map, camera·SDR·link, preview, log.
+ * Narrow window: one column. */
 #panels {
     display: grid;
     grid-template-columns: 1fr 1fr;
@@ -67,30 +67,20 @@ header .conn {
     min-width: 0;
 }
 
+/* Left column */
+.p-sys,
+.p-gnss,
 .p-pico,
-.p-map,
-.p-csl,
-.p-log {
-    grid-column: 1 / -1;
-}
-
 .p-art {
     grid-column: 1;
 }
 
-.p-prev {
+/* Right column */
+.p-map,
+.p-csl,
+.p-prev,
+.p-log {
     grid-column: 2;
-}
-
-/* The motion zone is visually distinct: every control inside it can move an
- * antenna, and nothing outside it can. A misclicked button is bad; a
- * misclicked panel is worse. */
-.motion-zone {
-    border-color: #6b4a1f;
-}
-
-.motion-zone > h2 {
-    color: #c99a4b;
 }
 
 @media (max-width: 1100px) {
@@ -98,8 +88,7 @@ header .conn {
         grid-template-columns: 1fr;
     }
 
-    .p-art,
-    .p-prev {
+    #panels > section {
         grid-column: 1 / -1;
     }
 }

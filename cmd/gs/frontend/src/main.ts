@@ -11,6 +11,7 @@
  * them, which is why the frontend builds only through wails.
  */
 import 'leaflet/dist/leaflet.css';
+import { initMap } from './map';
 import './style.css';
 import {EventsOn} from '../wailsjs/runtime/runtime';
 import {
@@ -58,7 +59,29 @@ const STALE_AFTER_S = 3;
 type View = gsview.View;
 type Cmd = main.CommandResult;
 
-let lastFrameMs = 0;
+/* Staleness is measured on the laptop's own clock, by the laptop's own
+ * arithmetic, and never by comparing two clocks.
+ *
+ * It used to be done the other way: parse the OBC's `generated_at` -- the Pi's
+ * wall clock -- and subtract it from Date.now(). Those are different machines,
+ * and the failure modes are not symmetric. A laptop running fast marks every
+ * frame instantly stale and disables motion forever with nothing on screen to
+ * explain why; a laptop running slow reads a link that died an hour ago as
+ * fresh, which is the fail-open direction on the one rule this project calls a
+ * safety property. A malformed timestamp made Date.parse return NaN, and NaN
+ * comparisons are false, so it read fresh too -- silently, permanently.
+ *
+ * `last_frame_age_s` is the right number and was already here: cmd/gs/app.go
+ * converts it from a duration that internal/client measured with time.Since
+ * against a time.Now() taken on this machine when the frame arrived. Both ends
+ * of the subtraction are ours, so there is nothing to disagree with.
+ *
+ * `frames_received` is the companion, because age alone cannot tell "a frame
+ * arrived just now" from "no frame has ever arrived" -- ageSince reports zero
+ * for both. Zero frames means we are looking at a cached picture of a vehicle we
+ * have never reached, which is more stale than any age, not less. */
+let frameAgeS = 0;
+let framesSeen = 0;
 let currentPath = '';
 
 function req(id: string): HTMLElement {
@@ -340,7 +363,7 @@ function renderHealth(v: View): string {
     return `<div class="banner err">not healthy${reasons ? `: ${reasons}` : ''}</div>`;
 }
 
-function renderFrame(ev: {view: View; gaps: number; restart: boolean}): void {
+function renderFrame(ev: {view: View; gaps: number; restart: boolean; link?: main.LinkState}): void {
     const v = ev.view;
     req('sys').innerHTML = renderSystem(v);
     req('gnss').innerHTML = renderGnss(v);
@@ -355,10 +378,13 @@ function renderFrame(ev: {view: View; gaps: number; restart: boolean}): void {
         meta.push('OBC RESTARTED');
     }
     req('meta').textContent = meta.join(' · ');
-    /* generated_at crosses as RFC3339 (time.Time has no TS mapping; the single
-     * cast in this file). It is the frame's age source for staleness. */
-    const genAt = v.generated_at as unknown as string;
-    lastFrameMs = Date.parse(genAt);
+    /* The frame event carries the link health as it was at this instant, so a
+     * live link refreshes staleness on the 1 Hz frame as well as on the 2 s poll.
+     * A replayed frame -- Snapshot() at first paint -- has no link, and must not
+     * clear a stale verdict by looking recent. */
+    if (ev.link !== undefined) {
+        noteLink(ev.link);
+    }
     refreshStale();
 }
 
@@ -369,10 +395,23 @@ function renderLink(l: main.LinkState): void {
         `<span class="${l.telemetry_connected ? 'ok' : 'bad'}">${dot(l.telemetry_connected)} telemetry</span> ` +
         `<span>frames ${l.frames_received} gaps ${l.sequence_gaps} dropped ${l.frames_discarded}</span> ` +
         `<span>${l.last_error ? esc(l.last_error) : ''}</span>`;
+    noteLink(l);
+}
+
+/* Records the two numbers staleness is decided from. Deliberately separate from
+ * renderLink: the link line is what the operator reads, and these are what the
+ * motion gate reads, and conflating them is how one ends up gating on a
+ * rendered string. */
+function noteLink(l: main.LinkState): void {
+    frameAgeS = l.last_frame_age_s;
+    framesSeen = l.frames_received;
 }
 
 function refreshStale(): void {
-    const stale = lastFrameMs > 0 && Date.now() - lastFrameMs > STALE_AFTER_S * 1000;
+    /* No frame ever is stale, not fresh. See the note on framesSeen: a console
+     * launched against an unreachable OBC used to come up with every motion
+     * button live, because age zero read as "a frame just arrived". */
+    const stale = framesSeen === 0 || frameAgeS > STALE_AFTER_S;
     req('stale').style.display = stale ? 'block' : 'none';
     /* No frame for three intervals means the console looks at a picture of a
      * vehicle it can no longer reach. Motion stands down; everything else stays.
@@ -663,6 +702,7 @@ async function firstPaint(): Promise<void> {
 
 function boot(): void {
     layout();
+    initMap();
     // Viewport and version go to the log first: layout complaints ("single
     // column") are undecidable without the CSS pixel width, and binary
     // provenance questions end at the stamped version, not in a thread.
