@@ -2,7 +2,7 @@
 //
 // It was promoted out of tools/gs_cli, which was `package main` and therefore
 // not importable. Both consoles now share it: the terminal one in tools/, and
-// the Wails one in cmd/gs. Two clients against one wire format is one more
+// the web one in cmd/gs. Two clients against one wire format is one more
 // thing that can disagree with the server, so there is one.
 //
 // What lives here and what does not is a deliberate line. Sockets, framing,

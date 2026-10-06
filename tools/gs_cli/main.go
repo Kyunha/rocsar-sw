@@ -1,10 +1,10 @@
 // Command gs_cli is the operator console for the OBC, from a terminal.
 //
 // Everything else in tools/ talks to hardware directly. This is the one tool that
-// speaks to the server, and it exists because a laptop with no webkit still has to
+// speaks to the server, and it exists because a laptop with no browser still has to
 // be able to see and drive the system.
 //
-// The link itself lives in internal/client, which the Wails console in cmd/gs
+// The link itself lives in internal/client, which the web console in cmd/gs
 // also uses. This is the presentation and the argument parsing; the sockets, the
 // framing, the validation and the artefact transfer are the shared package's. One
 // client against the OBC rather than two, because two would be two things to

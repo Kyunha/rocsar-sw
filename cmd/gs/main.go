@@ -7,19 +7,21 @@
 // disagree about the wire.
 //
 // This file is the composition root and nothing else, like cmd/obc/main.go:
-// flags become a client.Config, the App wires Stream + Queue + view, and Wails
-// serves the window. Read GUI_ARCHITECTURE.md before changing anything here.
+// flags become a client.Config, the App wires Stream + Queue + view, and a
+// plain HTTP server serves the frontend and the WebSocket bridge. The console
+// is a pure web app: the operator opens the printed URL in their own browser.
+// There is no embedded browser, no window management and no CGO. Read
+// GUI_ARCHITECTURE.md before changing anything here.
 package main
 
 import (
+	"context"
 	"embed"
 	"flag"
 	"fmt"
 	"os"
-
-	"github.com/wailsapp/wails/v2"
-	"github.com/wailsapp/wails/v2/pkg/options"
-	"github.com/wailsapp/wails/v2/pkg/options/assetserver"
+	"os/signal"
+	"syscall"
 
 	"github.com/rocsar/obc/internal/client"
 )
@@ -30,7 +32,7 @@ var assets embed.FS
 // version identifies the binary in logs and crash traces. "dev" unless stamped
 // at build time:
 //
-//	wails build -ldflags "-X main.version=$(git rev-parse --short HEAD)"
+//	go build -ldflags "-X main.version=$(git rev-parse --short HEAD)"
 //
 // Binary provenance questions ("which build produced this layout?") end here
 // instead of in a guessing thread.
@@ -68,6 +70,9 @@ func run() error {
 		return nil
 	}
 
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
 	app := NewApp(client.Config{
 		Control:   *control,
 		Telemetry: *telemetry,
@@ -75,26 +80,20 @@ func run() error {
 		Topic:     "telemetry",
 	})
 
-	// 1400x900 is the [gui] default in GUI_ARCHITECTURE.md section 11: the
-	// window opens at the size the configuration will eventually own.
-	err := wails.Run(&options.App{
-		Title:     "ROCSAR Ground Station",
-		Width:     1400,
-		Height:    900,
-		MinWidth:  1000,
-		MinHeight: 700,
-		AssetServer: &assetserver.Options{
-			Assets: assets,
-		},
-		BackgroundColour: &options.RGBA{R: 18, G: 20, B: 24, A: 1},
-		OnStartup:        app.startup,
-		OnShutdown:       app.shutdown,
-		Bind: []interface{}{
-			app,
-		},
-	})
+	srv := newServer(app, assets)
+	baseURL, err := srv.run(ctx)
 	if err != nil {
 		return err
 	}
-	return nil
+	app.hub = srv.hub
+
+	fmt.Printf("Ground station: %s\n", baseURL)
+	fmt.Println("Open that URL in your browser. Ctrl-C to stop.")
+
+	if err := app.Connect(app.initial); err != nil {
+		fmt.Fprintf(os.Stderr, "connect: %v\n", err)
+	}
+
+	<-ctx.Done()
+	return app.Disconnect()
 }

@@ -9,9 +9,9 @@
 #   --no-sync     build what is already on the OBC, do not rsync sources
 #
 # What "everything" means on the OBC: the seven Go binaries (obc and the bench
-# tools). The Wails console `gs` is the operator laptop's, and the OBC has
-# neither npm nor webkit2gtk -- it is skipped with a message when the toolchain
-# is absent, exactly as scripts/build.sh skips it without Node.
+# tools). The console `gs` is the operator laptop's, and the OBC has neither
+# npm nor a browser -- it is not built here, exactly as scripts/build.sh skips
+# it without Node.
 #
 # The build runs NATIVELY on the OBC. Cross-compiling needs an arm64
 # cross-toolchain and matching libzmq; the Pi has a Go toolchain and builds
@@ -75,13 +75,9 @@ $SSH "set -e
     mkdir -p bin
     CGO_ENABLED=1 go build -o bin/obc ./cmd/obc
     for t in gs_cli gs_probe camera_bench gnss_bench pico_bench sdr_bench; do
-        CGO_ENABLED=1 go build -o \"bin/\$t\" \"./tools/\$t\"
+        CGO_ENABLED=1 go build -o "bin/\$t" "./tools/\$t"
     done
-    if command -v wails >/dev/null 2>&1 && command -v npm >/dev/null 2>&1; then
-        (cd cmd/gs && wails build -s)
-    else
-        echo '[obc] skipping gs: no wails/npm on the OBC (build it on the laptop)'
-    fi
+    echo '[obc] gs is built on the operator laptop, not the OBC'
     ls -la bin/
 "
 

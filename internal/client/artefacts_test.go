@@ -361,7 +361,7 @@ func containsAny(haystack []string, want string) bool {
 	return false
 }
 
-// Config crosses the Wails bridge as JSON in both directions: the window
+// Config crosses the WebSocket bridge as JSON in both directions: the window
 // sends endpoints to Connect, and Endpoints returns them for display. The tags
 // are the contract -- without them the generator emits Go field names and the
 // TypeScript side silently sends fields Go ignores, which reads as "the

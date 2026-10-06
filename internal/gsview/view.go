@@ -1,7 +1,7 @@
 // Package gsview renders a telemetry snapshot as plain structs.
 //
 // It is the Ground Station's presentation logic without a presentation: no
-// sockets, no window, no clock. The Wails console in cmd/gs serialises a View
+// sockets, no window, no clock. The web console in cmd/gs serialises a View
 // to JSON and draws it; the terminal console keeps its own text renderer. Both
 // consume the same absence discipline, implemented once, here.
 //

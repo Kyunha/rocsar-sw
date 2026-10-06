@@ -1,17 +1,21 @@
-// Package main is the Wails console. See cmd/gs/main.go for what it is; this
-// file is what it does.
+// Package main is the Ground Station console. See cmd/gs/main.go for what it
+// is; this file is what it does.
 //
-// The App owns one Stream and one Queue and nothing else. Every bound method
-// below is a thin wrapper over internal/client (sockets, validation) and
+// The App owns one Stream and one Queue and nothing else. Every method below
+// is a thin wrapper over internal/client (sockets, validation) and
 // internal/gsview (rendering): there is no wire format, no socket and no
 // protobuf import in this file, and the layering test enforces all three
-// absences. A bound method that grew logic would be presentation swallowing
-// the client, so the rule is that a method either delegates or does not exist.
+// absences. A method that grew logic would be presentation swallowing the
+// client, so the rule is that a method either delegates or does not exist.
+//
+// The browser talks to this file over the WebSocket bridge (bridge.go) through
+// Dispatch. The methods are the typed surface; Dispatch is the transport.
 package main
 
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -20,8 +24,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/wailsapp/wails/v2/pkg/runtime"
 
 	"github.com/rocsar/obc/internal/client"
 	"github.com/rocsar/obc/internal/gsview"
@@ -52,6 +54,7 @@ type App struct {
 	done   chan struct{}
 	wg     sync.WaitGroup
 	latest *gsview.View
+	hub    *hub
 
 	dlMu sync.Mutex
 	dl   *activeDownload
@@ -59,7 +62,7 @@ type App struct {
 	// emitFn is the seam that makes the App testable without a window.
 	// runtime.EventsEmit kills the process when called on a bare context
 	// (log.Fatalf, unrecoverable), so a headless test cannot exercise any path
-	// that reaches it. It defaults to the Wails runtime and is overridden only
+	// that reaches it. It defaults to the WebSocket hub and is overridden only
 	// in tests -- same pattern as the newStream/newQueue seams in
 	// internal/client.
 	emitFn func(event string, data ...interface{})
@@ -78,7 +81,7 @@ func NewApp(cfg client.Config) *App {
 	return &App{initial: cfg}
 }
 
-// startup connects with the startup endpoints. Wails calls it before the
+// startup connects with the startup endpoints. main.go calls it before the
 // frontend loads, so bound methods never run before ctx exists.
 func (a *App) startup(ctx context.Context) {
 	a.ctx = ctx
@@ -95,7 +98,7 @@ func (a *App) Version() string { return version }
 
 // shutdown releases everything. Idempotent: Disconnect guards on connection
 // state, and the client's own Close methods are safe to call twice.
-func (a *App) shutdown(_ context.Context) {
+func (a *App) shutdown() {
 	_ = a.Disconnect()
 }
 
@@ -753,15 +756,168 @@ func (a *App) emitLink() {
 	a.emit(eventLink, link)
 }
 
+// Dispatch routes one WebSocket call to the typed method it names. This is
+// the entire bound surface (§8): the frontend never constructs a
+// CommandRequest or touches a oneof — it sends a method name and JSON args,
+// and the typed method below validates and executes. Adding a method here is
+// cheap; renaming one is not, which is why the names are a contract.
+func (a *App) Dispatch(method string, args []json.RawMessage) (interface{}, error) {
+	switch method {
+	// Connection
+	case "Connect":
+		var cfg client.Config
+		if err := unmarshalArg(args, 0, &cfg); err != nil {
+			return nil, err
+		}
+		return nil, a.Connect(cfg)
+	case "Disconnect":
+		return nil, a.Disconnect()
+	case "LinkState":
+		return a.LinkState(), nil
+	case "Endpoints":
+		return a.Endpoints(), nil
+	case "Snapshot":
+		return a.Snapshot(), nil
+	case "Version":
+		return a.Version(), nil
+
+	// Commands
+	case "QueryStatus":
+		return a.QueryStatus(), nil
+	case "TakePhoto":
+		return a.TakePhoto(), nil
+	case "SelectReceiver":
+		id, err := argUint(args, 0)
+		if err != nil {
+			return nil, err
+		}
+		return a.SelectReceiver(id), nil
+	case "RotateReceiver":
+		return a.RotateReceiver(), nil
+	case "SetHeading":
+		deg, err := argFloat(args, 0)
+		if err != nil {
+			return nil, err
+		}
+		return a.SetHeading(deg), nil
+	case "Jog":
+		servoID, err := argUint(args, 0)
+		if err != nil {
+			return nil, err
+		}
+		tick, err := argUint(args, 1)
+		if err != nil {
+			return nil, err
+		}
+		return a.Jog(servoID, tick), nil
+	case "ZeroServo":
+		id, err := argUint(args, 0)
+		if err != nil {
+			return nil, err
+		}
+		return a.ZeroServo(id), nil
+	case "ZeroAll":
+		return a.ZeroAll(), nil
+	case "MountOffset":
+		id, err := argUint(args, 0)
+		if err != nil {
+			return nil, err
+		}
+		deg, err := argFloat(args, 1)
+		if err != nil {
+			return nil, err
+		}
+		return a.MountOffset(id, deg), nil
+	case "SetDirection":
+		id, err := argUint(args, 0)
+		if err != nil {
+			return nil, err
+		}
+		mult, err := argFloat(args, 1)
+		if err != nil {
+			return nil, err
+		}
+		return a.SetDirection(id, mult), nil
+	case "SetHeater":
+		id, err := argUint(args, 0)
+		if err != nil {
+			return nil, err
+		}
+		on, err := argBool(args, 1)
+		if err != nil {
+			return nil, err
+		}
+		return a.SetHeater(id, on), nil
+	case "StopServo":
+		id, err := argUint(args, 0)
+		if err != nil {
+			return nil, err
+		}
+		return a.StopServo(id), nil
+	case "StopAll":
+		return a.StopAll(), nil
+	case "PicoStatusRequest":
+		return a.PicoStatusRequest(), nil
+	case "SdrProbe":
+		return a.SdrProbe(), nil
+	case "SdrGetParams":
+		return a.SdrGetParams()
+	case "SetSdrParams":
+		var patch client.SdrParamsPatch
+		if err := unmarshalArg(args, 0, &patch); err != nil {
+			return nil, err
+		}
+		return a.SetSdrParams(patch), nil
+	case "SdrConnect":
+		return a.SdrConnect(), nil
+	case "SdrResetUSB":
+		return a.SdrResetUSB(), nil
+	case "SetLinkLimit":
+		kbps, err := argUint(args, 0)
+		if err != nil {
+			return nil, err
+		}
+		return a.SetLinkLimit(kbps), nil
+
+	// Artefacts
+	case "ListArtefacts":
+		path, err := argString(args, 0)
+		if err != nil {
+			return nil, err
+		}
+		return a.ListArtefacts(path)
+	case "DownloadArtefact":
+		name, err := argString(args, 0)
+		if err != nil {
+			return nil, err
+		}
+		dest, err := argString(args, 1)
+		if err != nil {
+			return nil, err
+		}
+		return nil, a.DownloadArtefact(name, dest)
+	case "CancelDownload":
+		return nil, a.CancelDownload()
+	case "PreviewArtefact":
+		name, err := argString(args, 0)
+		if err != nil {
+			return nil, err
+		}
+		return a.PreviewArtefact(name)
+
+	default:
+		return nil, fmt.Errorf("unknown method %q", method)
+	}
+}
+
 func (a *App) emit(event string, data ...interface{}) {
 	if a.emitFn != nil {
 		a.emitFn(event, data...)
 		return
 	}
-	if a.ctx == nil {
-		return
+	if a.hub != nil && len(data) > 0 {
+		a.hub.broadcast(event, data[0])
 	}
-	runtime.EventsEmit(a.ctx, event, data...)
 }
 
 // Endpoints returns the endpoints this console is pointed at, for the

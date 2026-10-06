@@ -15,7 +15,7 @@ import (
 // Aliases, not wrappers: cmd/gs works with these types pervasively (submit,
 // match, report) but must not import the generated bindings -- the layering
 // test forbids it, on purpose. An alias lets a consumer name the type without
-// importing the package it comes from, which is exactly the seam a Wails
+// importing the package it comes from, which is exactly the seam a web
 // binding layer needs: it touches every command and owns none of the schema.
 type (
 	Request  = rocsarv1.CommandRequest

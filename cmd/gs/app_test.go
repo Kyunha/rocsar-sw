@@ -1,13 +1,13 @@
 package main
 
-// Headless tests for the binding layer: no window, no display, no webkit.
+// Headless tests for the binding layer: no window, no display, no browser.
 //
-// The App's two untestable dependencies -- Wails events (EventsEmit kills the
-// process on a bare context) and the save-file dialog (same) -- are injected
-// through emitFn. Everything else runs for real: commands cross
-// ZeroMQ to a transport server bound on loopback, telemetry arrives as framed
-// protobuf, and artefact bytes come from the OBC's own file handler over a
-// test HTTP server. A fake that stubbed any of those would test the stub.
+// The App's two untestable dependencies -- the WebSocket hub (a real browser
+// connection) and the save-file dialog (same) -- are injected through emitFn.
+// Everything else runs for real: commands cross ZeroMQ to a transport server
+// bound on loopback, telemetry arrives as framed protobuf, and artefact bytes
+// come from the OBC's own file handler over a test HTTP server. A fake that
+// stubbed any of those would test the stub.
 //
 // Naming the wire types requires importing the generated bindings, which is
 // allowed here and only here: TestCmdGsProductionHasNoProtobuf forbids the
@@ -218,7 +218,7 @@ func (h *harness) testApp(t *testing.T, rec *recorder) *App {
 	app := NewApp(h.endpoints)
 	app.emitFn = rec.emit
 	app.startup(context.Background())
-	t.Cleanup(func() { app.shutdown(context.Background()) })
+	t.Cleanup(func() { app.shutdown() })
 	return app
 }
 
@@ -394,7 +394,7 @@ func TestAppListsAndDownloadsArtefacts(t *testing.T) {
 	app2 := NewApp(h.endpoints)
 	app2.emitFn = rec2.emit
 	app2.startup(context.Background())
-	defer app2.shutdown(context.Background())
+	defer app2.shutdown()
 	if err := app2.DownloadArtefact("drip.bin", filepath.Join(t.TempDir(), "drip.bin")); err != nil {
 		t.Fatalf("drip download start: %v", err)
 	}

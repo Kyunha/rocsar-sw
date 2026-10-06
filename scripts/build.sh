@@ -46,7 +46,6 @@ build_frontend() {
     if ! command -v npm >/dev/null 2>&1; then
         echo "[build] skipping gs: cmd/gs/frontend/dist does not exist and npm is not installed."
         echo "[build]          install Node, then: (cd cmd/gs/frontend && npm install && npm run build)"
-        echo "[build]          or build it with: wails build -s ./cmd/gs"
         return 1
     fi
 

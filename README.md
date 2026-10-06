@@ -17,7 +17,7 @@ non-obvious constraints are.
 | :--- | :--- | :--- |
 | **OBC** | Raspberry Pi 4B | Process of record. Owns the SSD, the SDR, the camera, and the link to the operator. Binary: `cmd/obc`. |
 | **Flight controller** | RP2040 Pico | Real-time control loop at 50 Hz. Owns the IMU, the servo bus and the heaters. `firmware/`. |
-| **GS** | Operator laptop | Console. Wails app (`cmd/gs`) or terminal (`tools/gs_cli`). |
+| **GS** | Operator laptop | Web console (`cmd/gs`) or terminal (`tools/gs_cli`). |
 | **SDR** | Ettus B200mini | SAR acquisition, USB to the OBC. |
 | **GNSS ×3** | u-blox receivers | Redundant positioning via `Read_uB` on the Pi. |
 
@@ -64,7 +64,7 @@ are wrong.
 | `gcc` / `g++` | firmware tests | They compile `gondola_model.h` and link it against the real nanopb sources. Without a compiler those tests skip rather than fail. |
 | `buf` + `protoc-gen-go` | regenerating protobuf | Only needed when a `.proto` changes. |
 | `arduino-cli` | flashing firmware | Not needed to build or test the Go side. |
-| Node + npm | building `gs` | `cmd/gs` embeds `frontend/dist`; see [Build](#build). |
+| Node + npm | building `gs` frontend | `cmd/gs` serves `frontend/dist`; see [Build](#build). |
 
 The whole set is available through the committed dev shell:
 
@@ -72,8 +72,9 @@ The whole set is available through the committed dev shell:
 nix-shell          # or: nix-shell --run '...'
 ```
 
-`shell.nix` supplies Go, buf, Python with the test packages, wails, Node, webkitgtk
-and zeromq. It drops you into `fish`.
+`shell.nix` supplies Go, buf, Python with the test packages, Node and zeromq.
+It drops you into `fish`. There is no browser package — the operator's browser is
+a runtime fact, not a build dependency.
 
 ---
 
@@ -147,23 +148,28 @@ cd cmd/gs/frontend && npm install && npm run build && cd -
 go build -o bin/gs ./cmd/gs
 ```
 
-Or drive the frontend through wails, which reads the same config:
+Build the frontend, then run the console:
 
 ```sh
-wails dev -d ./cmd/gs        # hot-reloading development window
-wails build -s ./cmd/gs      # production build -> cmd/gs/build/bin/gs
+cd cmd/gs/frontend && npm install && npm run build && cd -
+go run ./cmd/gs             # prints a URL, open it in your browser
+```
+
+For frontend development with hot reload, run the Go server in one terminal
+and Vite in another (Vite proxies `/ws` to Go):
+
+```sh
+go run ./cmd/gs &
+cd cmd/gs/frontend && npm run dev
 ```
 
 `scripts/build.sh` does the npm step for you when `npm` is present, and skips `gs`
 with an explanatory message when it is not. Every other target builds with no Node
-toolchain at all — the webview packages hang off the `desktop` tag, which only
-wails sets, so a plain `go build ./...` never reaches cgo.
+toolchain at all — there is no webview and no cgo in the GUI, so a plain
+`go build ./...` never reaches a browser.
 
-The `webkit2_41` build tag lives in `cmd/gs/wails.json` as `build:tags`. It does
-**not** belong in `GOFLAGS`: wails passes its own `-tags` on the `go build` command
-line, which overrides `GOFLAGS`, and the tag is then silently dropped and the build
-dies in cgo looking for a `pkg-config` module that does not exist. See
-`GUI_ARCHITECTURE.md` §12.
+There is no build tag. The console is a plain `net/http` server; the browser is
+the operator's. See `GUI_ARCHITECTURE.md` §12.
 
 ### Protobuf
 
@@ -308,8 +314,8 @@ motion, for reasons that do not transfer to a terminal.
 ### Ground Station window
 
 ```sh
-wails dev -d ./cmd/gs       # development, hot reload
-wails build -s ./cmd/gs     # production
+npm run dev                 # frontend dev server (hot reload)
+go run ./cmd/gs             # Go server + bridge
 ```
 
 Flags: `-control`, `-telemetry`, `-http`. The defaults point at the aircraft.

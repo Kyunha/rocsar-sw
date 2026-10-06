@@ -42,7 +42,7 @@ Four computers and one radio link are involved:
 | :--- | :--- | :--- |
 | **OBC** | Raspberry Pi 4B | Process of record. Owns the SSD, the SDR, the camera, and the link to the operator. |
 | **Flight controller** | RP2040 Pico | Real-time control loop at 50 Hz. Owns the IMU, the servo bus and the heaters. |
-| **GS** | Operator laptop | Go console (`tools/gs_cli`, over `internal/client`). Telemetry display and command surface. |
+| **GS** | Operator laptop | Web console (`cmd/gs`, Go server + browser) or terminal (`tools/gs_cli`). Telemetry display and command surface. |
 | **SDR** | Ettus B200mini | SAR acquisition, USB to the OBC. |
 | **GNSS ×3** | u-blox receivers | Redundant positioning, `Read_uB` on the Pi. |
 
@@ -1003,7 +1003,7 @@ buf generate            # api/rocsar/v1 → Go, Python
 scripts/generate.sh     # firmware → nanopb C, common + pico only (§4.4)
 go build ./...
 go test ./...
-go run ./tools/gs_cli   # the Ground Station console
+go run ./tools/gs_cli   # the Ground Station terminal console
 arduino-cli compile -u -p /dev/ttyACM0 --fqbn rp2040:rp2040:rpipicow firmware/
 ```
 

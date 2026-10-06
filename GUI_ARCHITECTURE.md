@@ -23,13 +23,13 @@ describes the one program that consumes that link.
 
 | §  | Amendment |
 | :--- | :--- |
-| 1 | The GS row of the node table is Go + Wails, not PySide6. |
+| 1 | The GS row of the node table is Go + a browser, not PySide6. |
 | 1 | The topology diagram's GS box is `cmd/gs`. |
 | 2 | `gs/` (Python) leaves the layout; `cmd/gs/`, `internal/client/`, `internal/gsview/` enter it. |
 | 5.1 | The topic vocabulary is **one** topic, not five. `ARCHITECTURE.md` §5.1 is wrong. |
 | 11 | `[client]` gains an HTTP endpoint key and a `[gui]` section appears. |
 | 12 | Two more mechanical checks, and the scan roots widen. |
-| 13 | `python -m pytest gs/` leaves the build; `wails build` enters it. |
+| 13 | `python -m pytest gs/` leaves the build; `npm run build` enters it. |
 | 14 | One more known limit: no second-implementation check of the ZeroMQ wire. |
 
 ---
@@ -37,7 +37,7 @@ describes the one program that consumes that link.
 ## 1. What this adds
 
 The Ground Station is the operator console: it displays telemetry and sends
-commands. It is `cmd/gs`, a Wails v2 application on the operator laptop.
+commands. It is `cmd/gs`, a web app (Go server + browser) on the operator laptop.
 
 **It is a second binary, not a mode of the first.** The OBC stays headless on
 the Pi. The reasoning is constraint H4 — the link may die, nothing in the
@@ -49,8 +49,8 @@ hang.
 
 Consequences that follow, and are not revisited:
 
-- The OBC builds and runs with no Wails, no webkit and no node.
-- `go build ./...` at the repo root does not need webkit either (§12).
+- The OBC builds and runs with no browser, no webkit and no node.
+- `go build ./...` at the repo root does not need a browser either (§12).
 - A GS crash loses the operator's view and nothing else.
 
 ### 1.1 Decisions, with the alternatives
@@ -58,11 +58,90 @@ Consequences that follow, and are not revisited:
 | Decision | Chosen | Rejected | Why |
 | :--- | :--- | :--- | :--- |
 | Deployment | Laptop, separate binary | GUI on the Pi | H2/H3/H4. A webview under the aircraft. |
-| Toolkit | Wails **v2.16.0** | Wails v3 beta | v3 is beta (2026-09) and moves Linux to GTK4/WebKitGTK 6.0 at GA. This console supports a vehicle in flight. |
+| Toolkit | Pure web app (external browser) | Wails v2/v3, Lorca, go-gui | The map (§1.2) needs WebGL; the system browser has the most mature pipeline. No embedded engine, no CGO, no window management. See §1.3–§1.4. |
 | Frontend | Vanilla TS + Vite | Svelte, React | The binding layer is framework-agnostic; a GUI that is mostly 1 Hz panels does not earn a component model. Swapping later is mechanical. |
 | Wire format in the browser | **none** — Go decodes once | `protoc-gen-ts`, protobuf-es | One decoder, in Go, with the tests §13 lists. A second decoder in TypeScript is a second thing to disagree. |
 | Client code | Promote `tools/gs_cli` | Write fresh | It already exists and is good. See §6.1. |
 | Python `gs/` | Delete | Keep alongside | Half-maintained frontends rot. Loss recorded in §14.3. |
+
+### 1.2 The map requirements (new, and they drive the toolkit question)
+
+§15 deferred the map. It is no longer deferred: the map is a primary input
+surface, and three requirements come with it. They are stated here because
+they constrain the toolkit more than anything else in this document.
+
+1. **Offline, always.** No network at runtime. The operating area's tiles are
+   bundled into the binary as a single `pmtiles` archive
+   (`frontend/pmtiles/porto.pmtiles` exists as a placeholder). A tile server, a
+   CDN, and a `fetch()` to the open internet are all equally wrong: the console
+   runs on a laptop that may be in a field, on a plane, or on a ship. The
+   archive is embedded, not fetched.
+2. **Interactive.** The operator clicks a point on the map to command the
+   antennas to point at it. This is not a future nicety — it is the primary
+   input method for the console's most common action. The map must report
+   click coordinates (latitude/longitude, degrees, unconverted — §7.3) to the
+   command path, and render a marker at the commanded bearing. Pan, zoom, and
+   a position trail are the minimum viable set.
+3. **Correct rendering.** The console is dense, dark, monospace-leaning and
+   CSS-heavy. An engine that mis-renders it is not a console. This is the
+   requirement the current WebKitGTK shell fails.
+
+**`pmtiles` is a JavaScript-first format.** Its reference implementation and
+its ecosystem are JavaScript: MapLibre GL JS and Leaflet both load it directly
+from a local file or an embedded asset, with no server. There is no maintained
+Go renderer — `protomaps/go-pmtiles` is a server, not a renderer. **The map
+must be drawn by a browser engine.** This is the constraint that decides the
+toolkit question, and it is why every Go-native option below is rejected
+regardless of its other merits.
+
+### 1.3 Toolkit options
+
+The console needs a browser engine for exactly one reason: the map. Everything
+else (telemetry panels, command buttons, artefact browser) is ordinary HTML.
+So the question is not "which GUI framework" but "which browser engine, and
+how is it launched". The candidates, with what was found on each:
+
+| Option | Engine | Map | Verdict |
+| :--- | :--- | :--- | :--- |
+| **Wails v2** (current) | WebKitGTK 4.1 | JS (Leaflet) | **Rejected.** The rendering bug that started this. WebKitGTK 4.1 is old and the console is mis-formatted. |
+| **Wails v3** (beta) | WebKitGTK 6.0 (GTK4) | JS (Leaflet) | **Possible, with reservations.** Newer WebKit may render correctly — 6.0 is a large jump from 4.1. But it is still WebKitGTK: the same engine family that failed, one version later. Beta (v3.0.0-beta.26, 2026-09). GTK3 + WebKit2GTK 4.1 remains as a `-tags gtk3` legacy option through v3.0.x. Hot reload, in-memory IPC, auto-generated bindings. |
+| **Lorca** | Chrome/Chromium (CDP) | JS (Leaflet/MapLibre) | **Possible.** Different engine family (Blink, not WebKit). Chrome is the most-tested rendering engine in the world. Requires Chrome installed on the operator's laptop (weakens G1 — §2). The library is small and stable but lightly maintained. |
+| **Pure web app** | Any browser the operator chooses | JS (Leaflet/MapLibre) | **Possible.** The Go binary serves the UI over HTTP on `127.0.0.1`; the operator opens Chrome, Firefox or Safari. No embedded engine, no rendering surprises, no single-binary constraint, no window management. The frontend is identical to the embedded case; only the launch differs. Loses the "app" feel (a browser tab, not a window) and requires the operator to open the URL. |
+| **go-gui + go-map** | Native (no browser) | Native widget | **Rejected for the map.** `go-gui-org/go-map` is a slippy-tile widget (raster + vector, pan/zoom, markers) but has no pmtiles support, draws tiles itself, and is very new (2 stars, Aug 2026). The offline pmtiles archive would need a Go renderer written. The rest of go-gui (immediate-mode, GPU, no JS) is interesting but does not help with the map. |
+| **Fyne** | Native (OpenGL) | None | **Rejected.** No map support. No JS. |
+| **Gio** | Native (no browser) | None | **Rejected.** No map support. |
+| **Tauri** | WebKitGTK (Linux) | JS | **Rejected.** Same WebKitGTK engine as Wails on Linux, plus a Rust backend this project does not have. |
+| **Neutralinojs** | System WebView | JS | **Rejected.** Same system-webview problem. |
+
+### 1.4 The decision
+
+**Chosen: the pure web app (external browser).** The Go binary is a plain
+`net/http` server on `127.0.0.1`; the operator opens the URL in their own
+browser. The deciding factor is WebGL: MapLibre GL JS renders vector tiles
+through WebGL, Web Workers and hardware acceleration, and the system browsers
+(Chrome, Firefox, Edge, Safari) have the most mature WebGL pipelines available.
+An embedded engine — WebKitGTK or a bundled Chromium — is a less-tested WebGL
+path and the one that already failed (§1.3, Wails v2).
+
+Consequences, recorded rather than implied:
+
+- **No CGO, no GTK, no webkit, no browser process.** The Go binary is a
+  self-contained `net/http` server. It cross-compiles trivially to Linux,
+  macOS and Windows with no C bindings and no OS-specific build toolchain.
+- **No window management.** The console is a browser tab, not a managed
+  window. There is no frameless mode, no title bar control, no window
+  lifecycle — the browser owns all of it.
+- **The operator opens the URL.** The binary prints
+  `http://127.0.0.1:<port>` on startup. This is the whole of the "launch".
+- **Pivot-friendly.** The frontend, the bridge (§8) and `internal/client` +
+  `internal/gsview` are identical to the embedded case. If a dedicated window
+  is wanted later, the same architecture wraps into Wails, Tauri or a
+  webview with no frontend change.
+
+Wails v3 is the fallback if the system browser also mis-renders: it is the
+same codebase with a newer WebKitGTK, and the migration from v2 is smaller
+than the migration to a web app. It is a fallback, not a first choice,
+because the engine family is the one that already failed.
 
 ---
 
@@ -85,7 +164,7 @@ H1–H5 from `ARCHITECTURE.md` §1.1 bind the console. Restated as they bear on 
 Two that are new because this is a client:
 
 - **G1 — a single static binary.** The laptop may have no Go toolchain, no
-  node, no protobuf compiler. `wails build` produces one file that runs. This
+  node, no protobuf compiler. `go build` produces one file that runs. This
   is why the Python stubs were committed for the old GS and why nothing
   generated is required at install time now.
 - **G2 — the console is not in the control path.** No GS behaviour may be
@@ -98,14 +177,14 @@ Two that are new because this is a client:
 
 ```
 +---------------------------------------------------------------------------+
-|  GROUND STATION   cmd/gs, Wails v2, operator laptop                       |
+|  GROUND STATION   cmd/gs, pure web app, operator laptop                     |
 |                                                                          |
 |    internal/client ── ZMQ DEALER -> :5555   (commands)                   |
 |                  ├─ ZMQ SUB     <- :5556   (telemetry, topic "telemetry") |
 |                  └─ HTTP        <- :5557   (artefact listing + bytes)    |
 |                                                                          |
 |    internal/gsview ── TelemetryFrame + CommandResponse -> plain structs   |
-|    cmd/gs (wails)  ── structs -> JSON -> frontend                         |
+|    cmd/gs (web app) ── structs -> JSON -> frontend                        |
 +---------------------------------------------------------------------------+
                                    |
                     Ethernet, 115 kbit/s
@@ -141,10 +220,10 @@ rocsar/
 ├── shell.nix             ← GS toolchain, §12
 ├── cmd/
 │   ├── obc/              ← unchanged. headless.
-│   └── gs/               ← the console: Wails app
+│   └── gs/               ← the console: web app (Go server + browser)
 │       ├── main.go       ← composition root, like cmd/obc
-│       ├── app.go        ← wails.Run, bound methods, event fan-out
-│       ├── wails.json    ← "build:tags": "webkit2_41", §12
+│       ├── app.go        ← http server, bound methods, event fan-out
+│       ├── bridge.go     ← WebSocket hub + dispatch (replaces wailsjs)
 │       └── frontend/     ← vanilla TS + Vite, §9
 ├── internal/
 │   ├── client/           ← the GS side of the link. §6. promoted from tools/gs_cli.
@@ -181,7 +260,7 @@ cmd/gs  ──▶  internal/gsview  ──▶  internal/client  ──▶  api/r
   assembly must be testable without a socket.
 - `internal/client` owns every socket, every timeout and every retry. It is the
   only new package permitted to import `api/rocsar/v1`.
-- `cmd/gs` may not talk to a socket. It wires the two together and calls Wails.
+- `cmd/gs` may not talk to a socket. It wires the two together and serves the web app.
 
 ### 5.1 Consequences for the boundary test
 
@@ -428,7 +507,8 @@ a terminal.
 
 ## 8. The bound surface
 
-Wails exposes Go methods to TypeScript and generates bindings from them. This
+The browser talks to Go over the WebSocket bridge (bridge.go). The bridge
+exposes Go methods as WebSocket RPCs and events as WebSocket pushes. This
 list is a **contract**, in the same sense `internal/domain/ports.go` is: adding
 to it is cheap, renaming is not.
 
@@ -468,7 +548,7 @@ Three absences, all deliberate:
   `tools/gs_cli/client.go:229`. A generic escape hatch would put a protobuf
   oneof in the browser, where a renumbering is a silent runtime failure.
 - **No `RevealArtefact`.** Showing a file in the OS file manager needs either
-  a platform API (Wails v2 has none on Linux) or `os/exec` (forbidden to
+  a platform API (a browser has none) or `os/exec` (forbidden to
   everything but `internal/sdr` and `internal/qos` by the layering test). The
   browser row copies the path to the clipboard instead, through the runtime's
   own clipboard -- no new bound method needed, because the frontend already
@@ -619,70 +699,48 @@ look like mistakes.
 
 `shell.nix` adds, in `nativeBuildInputs`:
 
-| Package | Version | Why |
-| :--- | :--- | :--- |
-| `wails` | 2.16.0 | the CLI, and the pinned version |
-| `nodejs` | 24.21.0 | Vite build of the frontend |
-| `pkg-config` | 0.29.2 | cgo needs it to find webkit |
-| `webkitgtk_4_1` | 2.54.1 | the webview |
-| `zeromq` | 4.3.5 | cgo for `go-zeromq/zmq4`, OBC **and** console |
+| Package | Why |
+| :--- | :--- |
+| `nodejs` | Vite build of the frontend |
+| `pkg-config` | cgo needs it to find libzmq |
+| `gcc` | cgo for `go-zeromq/zmq4` |
 
-Two nixpkgs names are wrong in the obvious way and cost time:
+And in `buildInputs`:
 
-- **`webkitgtk_4_1`, not `webkit2gtk_4_1`.** The latter does not exist, and a
-  shell naming it fails to evaluate with an unhelpful "attribute not found"
-  rather than a build error.
-- **`wails` is the CLI. There is no `wails-cli`.**
+| Package | Why |
+| :--- | :--- |
+| `zeromq` | cgo for `go-zeromq/zmq4`, OBC **and** console |
 
-### 12.2 `nativeBuildInputs`, not `packages`
+There is no browser package. The operator's browser is not a build-time
+dependency — it is a runtime fact of the laptop, like the display server.
 
-`packages` prepends to `PATH`. `nativeBuildInputs` additionally runs each
-derivation's setup hooks, and pkg-config's setup hook is what puts `.pc` files
-on the search path.
+### 12.2 No build tags
 
-With `webkitgtk_4_1` in `packages`, the library downloads into the store in full
-and `pkg-config --modversion webkit2gtk-4.1` still reports *not found* — a
-failure that reads as a missing dependency and is really a misplaced list.
-
-### 12.3 The build tag lives in `wails.json`
-
-```json
-{ "build:tags": "webkit2_41" }
-```
-
-**Not in `GOFLAGS`, which does not work and fails silently.** Wails assembles
-its own tag list — output type, mode, obfuscation, plus `-tags` — and always
-passes it as an explicit `-tags` on the `go build` command line. A command-line
-`-tags` overrides `GOFLAGS`. With the tag in `GOFLAGS`, `wails build` printed
-`Tags | []` and died inside cgo looking for `webkit2gtk-4.0`, a pkg-config module
-that exists on no current distribution.
-
-The tag selects the WebKit2GTK **4.1** API over the default 4.0 one. Both are
-present in wails as cgo directives; only 4.1 is installable.
-
-`wails.json` is read by both `wails build` and `wails dev`, so it is the one
-place that cannot be forgotten.
-
-### 12.4 What does *not* need webkit
-
-`go build ./...` and `go test ./...` at the repo root, with no webkit, no node
-and no Wails. The webview packages hang off the `desktop` tag, which only Wails
-sets, so a plain build never reaches them and cgo is never invoked.
+The `webkit2_41` build tag is gone with Wails. There is no webview package, no
+cgo webview, and no tag to forget. `go build ./...` and `go test ./...` at the
+repo root need only `libzmq` (for `zmq4` cgo) and nothing else.
 
 This is load-bearing: **the OBC's build and test path stays free of the GUI's
 dependencies.** A laptop that only needs to compile and flash the OBC does not
-install a webkit.
+install a browser, a webkit or a node.
 
-### 12.5 Commands
+### 12.3 Commands
 
 ```
 nix-shell                                  # the toolchain
 buf generate                               # Go + Python + nanopb, §14
 go build ./... && go test ./...            # the OBC and the shared packages
-cd cmd/gs && wails dev                     # console with live reload
-cd cmd/gs && wails build -clean            # build/bin/gs
+cd cmd/gs/frontend && npm run build        # frontend (tsc + vite)
+go run ./cmd/gs                            # console: prints a URL, open it
 ./obc --mock-pico --mock-camera --mock-sdr # degraded OBC to point the console at
 ./tools/gs_cli watch                       # the terminal console, same client
+```
+
+For frontend development with hot reload:
+
+```
+go run ./cmd/gs &                          # Go server on :PORT
+cd cmd/gs/frontend && npm run dev          # vite on :5173, proxies /ws to Go
 ```
 
 ---
@@ -798,8 +856,10 @@ Stated so nobody mistakes silence for coverage.
 - **`decoded` does not mean `trusted`.** `internal/gsview` renders what the OBC
   sent. It cannot tell a correct reading from a plausible one, and nothing here
   claims otherwise.
-- **A map panel is being developed in parallel and is not covered here.** The
+- **The map is now in scope (§1.2) but its implementation is not built.** The
+  requirements are stated and the toolkit question is open (§1.3–§1.4). The
   `telemetry:frame` event shape (`{view, gaps, restart}` with `view` per §7)
-  is the contract it builds against and will not move under it. Open questions
-  on that track -- tile sourcing for offline field use, projection of degrees,
-  marker assets -- belong to it, not to this document.
+  is the contract the map builds against and will not move under it. Open
+  questions -- tile sourcing for offline field use, projection of degrees,
+  marker assets, click-to-point wiring -- belong to the map track, not to the
+  console shell.

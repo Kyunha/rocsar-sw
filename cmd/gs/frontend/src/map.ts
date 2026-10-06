@@ -2,21 +2,21 @@
  *
  * Display GNSS position on a fixed offline map using Leaflet.
  * Tiles are not required: the map shows a position marker and trail
- * over a background representing the operating area (Portugal/Northern Europe),
- * fully bundled into the Go binary via Wails — zero network at runtime.
+ * over a background representing the operating area (Porto/Northern Europe),
+ * fully bundled into the Go binary — zero network at runtime.
  *
  * Per GUI_ARCHITECTURE.md: no protobuf in the browser, degrees displayed
  * as-is, absence handled by internal/gsview.
  *
  * PMtiles integration: the file pmtiles/porto.pmtiles is embedded as a
- * frontend asset by Wails. If the Leaflet PmTiles plugin becomes available
+ * frontend asset. If the Leaflet PmTiles plugin becomes available
  * or is added as a dependency, the map can be initialised with:
  *   L.pmtile('pmtiles/porto.pmtiles').addTo(map);
  * For now the map operates in full offline mode without tile requests.
  */
 
 import * as L from 'leaflet';
-import { EventsOn } from '../wailsjs/runtime/runtime';
+import { on } from './bridge';
 
 const MAP_ZOOM = 5;
 const MAX_ZOOM = 6;
@@ -43,7 +43,7 @@ interface TelemetryFrameView {
 
 /* Initialise the Leaflet map, marker, and event subscription.
  * No tile layer: background color shows the operating area;
- * all map assets are bundled into the Go binary at wails build time.
+ * all map assets are bundled into the Go binary at build time.
  * The pmtiles file pmtiles/porto.pmtiles is embedded as a frontend asset;
  * it may be used with L.pmtile() when the plugin is available. */
 function initMap(): void {
@@ -69,7 +69,7 @@ function initMap(): void {
     marker.bindPopup('Current Position').openPopup();
 
     /* Subscribe to telemetry frames to update position + trail */
-    EventsOn('telemetry:frame', (ev: unknown) => {
+    on('telemetry:frame', (ev: unknown) => {
         const frame = ev as TelemetryFrameView;
         updateFromFrame(frame);
     });
@@ -78,7 +78,7 @@ function initMap(): void {
      * When the Leaflet PmTiles plugin is available, the following can be
      * uncommented to load the embedded porto.pmtiles tile set:
      *   L.pmtile('pmtiles/porto.pmtiles').addTo(map);
-     * The pmtiles file is embedded as a Wails frontend asset at
+     * The pmtiles file is embedded as a frontend asset at
      * frontend/pmtiles/porto.pmtiles and is available offline in the binary.
      */
 }
