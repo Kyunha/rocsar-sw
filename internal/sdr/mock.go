@@ -73,6 +73,11 @@ func (m *Mock) LastLog() string {
 	return m.lastLog
 }
 
+// LastError is always empty: a simulated acquisition never fails, and a mock
+// that invented a failure would be fabricating hardware state, which is the
+// one thing ARCHITECTURE.md 9 exists to forbid.
+func (m *Mock) LastError() string { return "" }
+
 func (m *Mock) LastOutput() string {
 	m.mu.Lock()
 	defer m.mu.Unlock()

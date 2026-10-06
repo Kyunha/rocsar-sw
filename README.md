@@ -424,12 +424,46 @@ The sketch is split so the interesting half is testable: `gondola_model.h` holds
 the kinematics, the heading filter, command handling and the ST3215 wire protocol
 and includes no Arduino headers, so `firmware/tests/` compiles it on the host.
 `firmware.ino` keeps only what needs pins, timers and the UART.
+`calibration.h` is split the same way from `calibration_store.h`: the record's
+format is host-testable, only the EEPROM that holds it is not.
+
+### Zeroing a servo
+
+`zero <servo>` teaches the ST3215 its own centre by writing a position offset
+into its EEPROM (register `0x1F`), so the encoder reports 2048 at the airframe
+boresight. The write sequence — unlock `0x37`, write, re-lock, 20 ms either side
+— is the vendor's, from `docs/ST3215_Configure/ST3215_Configure.ino`. The
+verification is ours: the firmware reads the register back and reads the position
+back, and refuses with `ERROR_CALIBRATION_FAILED` unless both agree.
+
+**It does not move the axis.** A teach relabels the tick the axis is already
+sitting at, so `current_angle_deg` reads 0 afterwards because that position has
+become the centre. It takes 100–250 ms and burns one servo EEPROM cycle, so it
+is a deliberate ground action and should not be issued on a schedule.
+
+It is **idempotent**: the offset is always recomputed from wherever the servo
+actually is, so a run that half-failed — a write lost to bus contention — is
+fixed by running it again. There is no reset command and none is needed.
+
+The centre therefore survives a reflash, since it lives in the servo. What the
+firmware stores, in its own EEPROM, is only the *fact* that a teach took —
+an axis taught while sitting at exactly 2048 stores an offset of zero, which is
+indistinguishable from one never taught. That bit rides the wire as
+`center_zeroed`, and an untaught axis renders as `UNTAUGHT` in both the console
+and `gs_cli`, because it reports the same 2048 as a centred one.
+
+An untaught axis still aims, using 2048 as the assumption. Register `0x28`
+(torque) is never written: a third-party table claims EEPROM writes need torque
+disabled, the vendor's tool does not do that, and torque-off on a 5:1 gear train
+means the antenna drops. The read-back settles it per write either way.
 
 ### What the firmware does without being asked
 
 - **It boots silent.** Power-up transmits nothing to the servo bus until a
   `set_target` or `jog` arrives; `stop`, `zero`, `mount` and `dir` do not
-  release the interlock, because none of them asks a servo to go anywhere.
+  release the interlock, because none of them asks a servo to go anywhere. A
+  teach leaves the interlock alone for the same reason, even though it writes to
+  hardware — see "Zeroing a servo" above.
   Before this, roughly four boots in five ran an axis to the rail within one
   control tick of power-up — `target 0` with a 270° mount offset and a 5:1 gear
   is reachable only for a 72° window of headings.

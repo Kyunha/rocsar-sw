@@ -20,9 +20,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/fs"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 
 	"github.com/gorilla/websocket"
@@ -128,6 +130,7 @@ func (s *server) run(ctx context.Context) (string, error) {
 	}
 
 	mux := http.NewServeMux()
+	mux.HandleFunc("/geojson/", gzipFS(sub))
 	mux.Handle("/", http.FileServer(http.FS(sub)))
 	mux.HandleFunc("/ws", s.handleWS)
 
@@ -147,6 +150,37 @@ func (s *server) run(ctx context.Context) (string, error) {
 	}()
 
 	return "http://" + ln.Addr().String(), nil
+}
+
+// gzipFS serves the pre-compressed basemap.
+//
+// The Natural Earth GeoJSON is embedded gzipped (see scripts/fetch-basemap.py):
+// 4.4 MB raw becomes 1.5 MB compressed, and the embedded copy is what ships in
+// the binary. A request for /geojson/foo.json is answered from foo.json.gz with
+// Content-Encoding: gzip, so the browser decompresses it transparently and the
+// frontend still reads it as a plain JSON URL — MapLibre's GeoJSON source takes
+// a URL, and this is why it can.
+//
+// Requests outside /geojson/ never reach here. A path without a .json suffix or
+// without its .gz sibling is a 404, which keeps the handler from becoming a
+// second, weaker file server for the whole embedded tree.
+func gzipFS(fsys fs.FS) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		name := strings.TrimPrefix(r.URL.Path, "/")
+		if !strings.HasSuffix(name, ".json") {
+			http.NotFound(w, r)
+			return
+		}
+		f, err := fsys.Open(name + ".gz")
+		if err != nil {
+			http.NotFound(w, r)
+			return
+		}
+		defer f.Close()
+		w.Header().Set("Content-Encoding", "gzip")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.Copy(w, f)
+	}
 }
 
 // handleWS runs one browser connection. A writer goroutine drains the send

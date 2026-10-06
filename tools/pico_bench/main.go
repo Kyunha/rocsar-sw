@@ -161,7 +161,7 @@ func runConsole(ctx context.Context, link *pico.Link, port string, seconds int) 
   ids                         the servo ids THIS board reports
   set <deg>                   point both axes at a bearing
   jog <tick>                  move the selected axis to an absolute tick   (needs arm)
-  zero                        centre the selected axis                    (needs arm)
+  zero                        teach the selected axis its centre           (needs arm)
   mount <deg>                 set the selected axis's mount offset        (needs arm)
   dir <+1|-1>                 set the selected axis's direction           (needs arm)
   heater <1|2> <on|off>       switch a heater

@@ -58,7 +58,9 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 
+#include "calibration.h"
 #include "cobs.h"
 #include "gondola_model.h"
 #include "pb_decode.h"
@@ -236,9 +238,10 @@ static void printState(const GondolaState& state) {
          (unsigned)state.imuMissCount);
   for (int i = 0; i < NUM_ANTENNAS; i++) {
     const AntennaAxis& axis = state.antennas[i];
-    printf(" | a%d id=%u center=%u manual=%d manualTick=%u tick=%u offset=%.3f dir=%.1f",
-           i, axis.id, axis.centerTick, axis.manualMode ? 1 : 0, axis.manualTick,
-           axis.currentTick, axis.mountOffsetDeg, axis.dirMultiplier);
+    printf(" | a%d id=%u center=%u zeroed=%d manual=%d manualTick=%u tick=%u offset=%.3f dir=%.1f",
+           i, axis.id, axis.centerTick, axis.centerZeroed ? 1 : 0,
+           axis.manualMode ? 1 : 0, axis.manualTick, axis.currentTick,
+           axis.mountOffsetDeg, axis.dirMultiplier);
     printf(" fb_state=%d fb_err=%u load=%.2f temp=%.2f await=%d",
            (int)axis.feedbackState, axis.feedbackError, axis.load,
            axis.temperatureC, axis.awaitingCommand ? 1 : 0);
@@ -697,6 +700,215 @@ static int telemetryFromState(int argc, char** argv) {
   return 0;
 }
 
+// ===========================================================================
+// Teaching a servo its centre
+// ===========================================================================
+// The bus half of `zero` is in the sketch and needs hardware; everything that
+// decides whether the bus half worked is in the model and is here. That split is
+// the point -- it means the failure modes, which are the part worth testing, are
+// all reachable from a host.
+//
+// The outcome strings stand in for what the hardware reported. `after` is either
+// ST3215_SERVO_CENTRE_TICK or the unchanged starting position, and that is not a
+// simplification: a teach that stored its offset but did not move the reported
+// position is exactly the hypothesis that Position Offset might not affect
+// feedback at all, and modelling it that way is what makes `position-odd` the
+// case that catches it.
+static const char* outcomeName(ServoZeroOutcome outcome) {
+  switch (outcome) {
+    case ZERO_OK: return "ok";
+    case ZERO_NO_SERVO_REPLY: return "no-servo-reply";
+    case ZERO_OFFSET_MISMATCH: return "offset-mismatch";
+    case ZERO_POSITION_MISMATCH: return "position-mismatch";
+    case ZERO_ANGULAR_RESOLUTION: return "angular-resolution";
+  }
+  return "?";
+}
+
+static ServoZeroOutcome outcomeFromName(const char* name) {
+  if (strcmp(name, "ok") == 0) return ZERO_OK;
+  if (strcmp(name, "no-reply") == 0) return ZERO_NO_SERVO_REPLY;
+  if (strcmp(name, "offset-lost") == 0) return ZERO_OFFSET_MISMATCH;
+  if (strcmp(name, "position-odd") == 0) return ZERO_POSITION_MISMATCH;
+  if (strcmp(name, "resolution") == 0) return ZERO_ANGULAR_RESOLUTION;
+  fprintf(stderr, "unknown outcome '%s'\n", name);
+  exit(2);
+}
+
+// --zero-seq <servo-id> <before> <outcome> [<before> <outcome>...]
+//
+// Runs whole teach attempts through the model's three functions, in the order
+// handleZeroCommand() calls them, printing one ZERO line per attempt. Several
+// attempts in one run is how idempotence gets tested: a run that fails then
+// succeeds is the recovery path, and it can only be exercised if the state
+// carries across attempts.
+static int zeroSeq(int argc, char** argv) {
+  if (argc < 5 || (argc - 3) % 2 != 0) {
+    fprintf(stderr,
+            "usage: --zero-seq <servo-id> <before> <outcome> [<before> <outcome>...]\n");
+    return 2;
+  }
+
+  GondolaState state;
+  initGondolaState(state);
+
+  rocsar_v1_PicoCommand command = rocsar_v1_PicoCommand_init_zero;
+  command.which_payload = rocsar_v1_PicoCommand_zero_tag;
+  command.payload.zero.servo_id = (uint32_t)strtoul(argv[2], nullptr, 10);
+
+  int axisIndex = validateZeroCommand(state, command);
+  printf("VALIDATE axis=%d\n", axisIndex);
+  if (axisIndex < 0) {
+    return 0;
+  }
+
+  for (int i = 3; i + 1 < argc; i += 2) {
+    uint16_t before = (uint16_t)strtoul(argv[i], nullptr, 10);
+    ServoZeroOutcome simulated = outcomeFromName(argv[i + 1]);
+
+    ServoZeroOutcome outcome = ZERO_NO_SERVO_REPLY;
+    uint16_t verified = ST3215_SERVO_CENTRE_TICK;
+
+    if (simulated != ZERO_NO_SERVO_REPLY) {
+      uint16_t offset = servoZeroOffset(before, ST3215_SERVO_CENTRE_TICK);
+      // Read-back is the offset, except when the write was lost. Position is
+      // centre except when the offset stored without moving it.
+      uint16_t readBack = (simulated == ZERO_OFFSET_MISMATCH) ? (uint16_t)(offset + 1)
+                                                              : offset;
+      uint16_t after = (simulated == ZERO_POSITION_MISMATCH) ? before
+                      : ST3215_SERVO_CENTRE_TICK;
+      uint8_t resolution = (simulated == ZERO_ANGULAR_RESOLUTION) ? 2 : 1;
+
+      outcome = judgeServoZero(offset, readBack, resolution, before, after);
+      if (outcome == ZERO_OK) {
+        verified = after;
+      }
+    }
+
+    if (outcome == ZERO_OK) {
+      commitServoZero(state, axisIndex, verified);
+    }
+
+    printf("ZERO outcome=%s before=%u offset=%u committed=%d\n",
+           outcomeName(outcome), before,
+           servoZeroOffset(before, ST3215_SERVO_CENTRE_TICK),
+           outcome == ZERO_OK ? 1 : 0);
+    printState(state);
+  }
+
+  return 0;
+}
+
+// --judge-zero <wrote> <readback> <resolution> <before> <after>
+//
+// The verification decision on its own, so every branch is reachable without
+// having to construct a whole teach around it.
+static int judgeZero(int argc, char** argv) {
+  if (argc < 7) {
+    fprintf(stderr,
+            "usage: --judge-zero <wrote> <readback> <resolution> <before> <after>\n");
+    return 2;
+  }
+  ServoZeroOutcome outcome = judgeServoZero(
+      (uint16_t)strtoul(argv[2], nullptr, 10),
+      (uint16_t)strtoul(argv[3], nullptr, 10),
+      (uint8_t)strtoul(argv[4], nullptr, 10),
+      (uint16_t)strtoul(argv[5], nullptr, 10),
+      (uint16_t)strtoul(argv[6], nullptr, 10));
+  printf("JUDGE %s\n", outcomeName(outcome));
+  return 0;
+}
+
+// --servo-calib-scan <hex> <expected-id>
+//
+// The scanner for the four-byte calibration read-back, over whatever bytes the
+// test builds. The reason it needs its own scanner rather than a widened
+// scanServoStatus is the length: a 2-byte read would come back as an 8-byte
+// frame at LEN=0x04, indistinguishable from our own request echo.
+static int servoCalibScan(int argc, char** argv) {
+  if (argc < 4) {
+    fprintf(stderr, "usage: --servo-calib-scan <hex> <expected-id>\n");
+    return 2;
+  }
+  uint8_t buffer[256];
+  size_t len = 0;
+  if (hexToBytes(argv[2], buffer, sizeof(buffer), &len) != 0) {
+    return 2;
+  }
+
+  ServoCalibRead scan = scanServoCalibRead(
+      buffer, len, (uint8_t)strtoul(argv[3], nullptr, 10));
+  printf("CALIB matched=%d resolution=%u offset=%u mode=%u consumed=%zu of %zu\n",
+         scan.matched ? 1 : 0, scan.angularResolution, scan.positionOffset,
+         scan.mode, scan.consumed, len);
+  return 0;
+}
+
+// --calib <zeroed0> <zeroed1>
+//
+// Encode a record from the flags, then decode it straight back. Printed as
+// CALIB <result> <zeroed0> <zeroed1>, so a test can assert on a round trip and
+// on the rejection reasons without decoding the bytes itself.
+static int calibRoundTrip(int argc, char** argv) {
+  if (argc < 4) {
+    fprintf(stderr, "usage: --calib <zeroed0> <zeroed1>\n");
+    return 2;
+  }
+
+  CalibrationRecord record;
+  record.schemaVersion = CALIBRATION_SCHEMA_VERSION;
+  record.axisCount = NUM_ANTENNAS;
+  for (int i = 0; i < NUM_ANTENNAS; i++) {
+    record.axisZeroed[i] = strtoul(argv[2 + i], nullptr, 10) != 0;
+  }
+
+  uint8_t bytes[CALIBRATION_RECORD_SIZE];
+  if (!encodeCalibration(record, bytes, sizeof(bytes))) {
+    fprintf(stderr, "encode failed\n");
+    return 2;
+  }
+  printHex(bytes, sizeof(bytes));
+
+  // Pre-filled with a sentinel so "untouched" is visible in the output rather
+  // than merely asserted in a comment. decodeCalibration() promises to leave the
+  // record alone unless it succeeded, and that promise is what keeps a rejected
+  // record from being half-applied.
+  CalibrationRecord back;
+  memset(&back, 0xFF, sizeof(back));
+  CalibrationResult result = decodeCalibration(bytes, sizeof(bytes), back);
+  printf("CALIB %s %d %d\n", calibrationResultName(result),
+         result == CALIBRATION_OK ? (back.axisZeroed[0] ? 1 : 0) : -1,
+         result == CALIBRATION_OK ? (back.axisZeroed[1] ? 1 : 0) : -1);
+  return 0;
+}
+
+// --calib-decode <hex>
+//
+// Decode bytes the test has corrupted itself, so each rejection reason can be
+// provoked on purpose instead of hoping the encoder produces one.
+static int calibDecode(int argc, char** argv) {
+  if (argc < 3) {
+    fprintf(stderr, "usage: --calib-decode <hex>\n");
+    return 2;
+  }
+  uint8_t bytes[256];
+  size_t len = 0;
+  if (hexToBytes(argv[2], bytes, sizeof(bytes), &len) != 0) {
+    return 2;
+  }
+
+  CalibrationRecord back;
+  memset(&back, 0xFF, sizeof(back));
+  CalibrationResult result = decodeCalibration(bytes, len, back);
+  // -1 for the flags means the record was left untouched, which is the contract
+  // on every rejection path: a caller that carried on with a partially-filled
+  // record would be aiming an antenna using half a calibration.
+  printf("CALIB %s %d %d\n", calibrationResultName(result),
+         result == CALIBRATION_OK ? (back.axisZeroed[0] ? 1 : 0) : -1,
+         result == CALIBRATION_OK ? (back.axisZeroed[1] ? 1 : 0) : -1);
+  return 0;
+}
+
 int main(int argc, char** argv) {
   if (argc > 2 && strcmp(argv[1], "--apply") == 0) {
     return applyFrames(argc - 2, argv + 2);
@@ -740,6 +952,59 @@ int main(int argc, char** argv) {
 
   if (argc > 6 && strcmp(argv[1], "--telemetry-from-state") == 0) {
     return telemetryFromState(argc, argv);
+  }
+
+  if (argc > 4 && strcmp(argv[1], "--zero-seq") == 0) {
+    return zeroSeq(argc, argv);
+  }
+
+  if (argc > 6 && strcmp(argv[1], "--judge-zero") == 0) {
+    return judgeZero(argc, argv);
+  }
+
+  if (argc > 3 && strcmp(argv[1], "--servo-calib-scan") == 0) {
+    return servoCalibScan(argc, argv);
+  }
+
+  if (argc > 3 && strcmp(argv[1], "--calib") == 0) {
+    return calibRoundTrip(argc, argv);
+  }
+
+  if (argc > 2 && strcmp(argv[1], "--calib-decode") == 0) {
+    return calibDecode(argc, argv);
+  }
+
+  if (argc > 3 && strcmp(argv[1], "--servo-write8") == 0) {
+    uint8_t packet[16];
+    size_t len = buildServoWrite8((uint8_t)strtoul(argv[2], nullptr, 0),
+                                  (uint8_t)strtoul(argv[3], nullptr, 0),
+                                  (uint8_t)strtoul(argv[4], nullptr, 0),
+                                  packet, sizeof(packet));
+    if (len == 0) { fprintf(stderr, "write8 build failed\n"); return 2; }
+    printHex(packet, len);
+    return 0;
+  }
+
+  if (argc > 4 && strcmp(argv[1], "--servo-write16") == 0) {
+    uint8_t packet[16];
+    size_t len = buildServoWrite16((uint8_t)strtoul(argv[2], nullptr, 0),
+                                   (uint8_t)strtoul(argv[3], nullptr, 0),
+                                   (uint16_t)strtoul(argv[4], nullptr, 0),
+                                   packet, sizeof(packet));
+    if (len == 0) { fprintf(stderr, "write16 build failed\n"); return 2; }
+    printHex(packet, len);
+    return 0;
+  }
+
+  if (argc > 4 && strcmp(argv[1], "--servo-register-read") == 0) {
+    uint8_t packet[16];
+    size_t len = buildServoRegisterRead(
+        (uint8_t)strtoul(argv[2], nullptr, 0),
+        (uint8_t)strtoul(argv[3], nullptr, 0),
+        (uint8_t)strtoul(argv[4], nullptr, 0), packet, sizeof(packet));
+    if (len == 0) { fprintf(stderr, "read build failed\n"); return 2; }
+    printHex(packet, len);
+    return 0;
   }
 
   if (argc > 2 && strcmp(argv[1], "--response-for") == 0) {

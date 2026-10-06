@@ -247,6 +247,11 @@ func run() error {
 				Running: sdrPort.Running(),
 				PID:     sdrPort.PID(),
 				LastLog: sdrPort.LastLog(),
+				// The reason the last acquisition stopped, when it stopped badly.
+				// This was the one field the frame carried and no provider ever
+				// filled, so a crashed acquisition read as an idle SDR that
+				// happened to have a PID.
+				LastError: sdrPort.LastError(),
 			}
 		},
 		Camera:     cam.State,

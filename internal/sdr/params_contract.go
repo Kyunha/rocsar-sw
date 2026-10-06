@@ -45,6 +45,12 @@ type Key struct {
 	// Provenance.
 	Min, Max float64
 
+	// Unit is how the value is named in an error message. Empty means Hz, which
+	// is right for the six frequency and rate keys and wrong for the sweep
+	// window (microseconds) and the arming delay (seconds) -- so those entries
+	// say so rather than letting a message claim that a duration is a frequency.
+	Unit string
+
 	// Provenance says where Min and Max come from. Every bound has one. A bound
 	// with no stated source is a guess wearing the costume of a fact -- which is
 	// what the first version of this file was.
@@ -105,27 +111,36 @@ var Keys = []Key{
 	{
 		Name:       "T_MIN_US",
 		Required:   true,
-		Provenance: "Required by j.at() and NOT modelled in domain.SdrParams. A partial update must not drop it; test/RequiredKeysArePresent asserts it survives.",
+		Min:        0,
+		Max:        1e6,
+		Unit:       "us",
+		Provenance: "Typo guard, NOT a mission constraint. Lower edge of the sweep window in microseconds; the shipped file uses 0, meaning the burst opens at the leading edge of the PRI, which is intentional. Max is 1 s, far above any real PRI (364 us at the 2750 Hz operating point). The bound that actually matters is T_MIN_US < T_MAX_US, which config.hpp enforces at start and no per-key range can express, so SetParams checks the pair; see checkSweepWindow.",
 	},
 	{
 		Name:       "T_MAX_US",
 		Required:   true,
-		Provenance: "Required by j.at() and NOT modelled. The sweep window's upper edge, in microseconds. T_MIN_US = 0 is intentional.",
+		Min:        0,
+		Max:        1e6,
+		Unit:       "us",
+		Provenance: "Typo guard, NOT a mission constraint. Upper edge of the sweep window in microseconds; the shipped file uses 200. As with T_MIN_US the real constraint is the pair, not either value alone: a window wider than the PRI overlaps successive bursts, which config.hpp does not check because it cannot see the PRF.",
 	},
 	{
 		Name:       "START_OFFSET_S",
 		Required:   true,
-		Provenance: "Required by j.at() and NOT modelled. Seconds to wait before the first burst.",
+		Min:        1e-3,
+		Max:        3600,
+		Unit:       "s",
+		Provenance: "Min is the smallest value that is not a startup failure rather than a typo guard: config.hpp:52 throws on start_offset_s <= 0, before any radio is initialised, so a zero here is a bricked SDR and not a setting. Max is a typo guard -- an hour of arming delay is not a mission parameter. The shipped file uses 0.1.",
 	},
 	{
 		Name:       "TX_ANTENNA",
 		Required:   true,
-		Provenance: "Required by j.at() and NOT modelled. A string, not a number, so it has no bounds. 'TX/RX' in the shipped file.",
+		Provenance: "An RF path name, so it has no numeric bounds and ValidateValue is a no-op on it. The legal set is whatever UHD::set_tx_antenna accepts on this radio and firmware, which is a question for the device and not for this table, so the key is passed through and the C++ decides. 'TX/RX' in the shipped file, which is the monostatic path both antennas share.",
 	},
 	{
 		Name:       "RX_ANTENNA",
 		Required:   true,
-		Provenance: "Required by j.at() and NOT modelled. A string. connect.cpp compares TX and RX antennas and warns when they are the same port.",
+		Provenance: "As TX_ANTENNA. connect.cpp compares the two and warns when they are the same port, which is the normal monostatic case and not by itself an error.",
 	},
 }
 
@@ -194,13 +209,32 @@ type BoundsError struct {
 	Value float64
 }
 
+// Unwrap ties a bounds failure to ErrInvalidParams.
+//
+// The sentinel existed and nothing returned it: every out-of-range value came
+// back as a bare *BoundsError, so a caller wanting to tell "the operator typed a
+// number the radio cannot use" from "the radio is broken" had no way to do it
+// except by matching on the message text. That is the same string-matching the
+// rest of this repository treats as a defect, and it is why this is here rather
+// than left to each caller to reimplement.
+func (e *BoundsError) Unwrap() error { return ErrInvalidParams }
+
 // Error names the key, the value, and the range, plus where the range came
 // from. The provenance is included because "TX_FREQ = 50 MHz is outside
 // 70 MHz..6 GHz" is actionable and "TX_FREQ = 50 MHz is invalid" is not.
+//
+// The unit is the key's own rather than a literal Hz: half of this table is not
+// in hertz at all, and an error saying "START_OFFSET_S = 0 Hz" describes a
+// number the operator never typed.
 func (e *BoundsError) Error() string {
-	return fmt.Sprintf("sdr: %s = %s Hz is outside %g..%g (%s)",
+	unit := e.Key.Unit
+	if unit == "" {
+		unit = "Hz"
+	}
+	return fmt.Sprintf("sdr: %s = %s %s is outside %g..%g %s (%s)",
 		e.Key.Name,
 		strconv.FormatFloat(e.Value, 'g', -1, 64),
-		e.Key.Min, e.Key.Max,
+		unit,
+		e.Key.Min, e.Key.Max, unit,
 		e.Key.Provenance)
 }

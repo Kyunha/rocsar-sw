@@ -24,7 +24,21 @@ typedef enum _rocsar_v1_ErrorCode {
     rocsar_v1_ErrorCode_ERROR_NOT_CONNECTED = 5,
     rocsar_v1_ErrorCode_ERROR_UNSUPPORTED = 6,
     rocsar_v1_ErrorCode_ERROR_HARDWARE_FAULT = 7,
-    rocsar_v1_ErrorCode_ERROR_INTERNAL = 8
+    rocsar_v1_ErrorCode_ERROR_INTERNAL = 8,
+    /* Teaching a servo its centre is the one operation that writes to hardware we
+ do not own, and it can half-fail: the EEPROM write lands but the servo does
+ not report the position we asked for. That is a materially different fact
+ from a dead servo on the bus -- ERROR_HARDWARE_FAULT covers "nothing
+ answered", and no write was attempted -- because here the servo's internal
+ zero may now hold a partial change and the operator has to know before
+ flying. Re-running `zero` converges, so this is recoverable, not fatal.
+
+ This takes the reservation off deliberately, which is what the reservation
+ existed to require. The draft's 9 was ERROR_BUSY, a different fact that
+ nothing ever produced, so a stale generated host would render the wrong
+ *name* for this failure -- and no host acts on it: the decision keys off
+ CommandResponse.success, not off this enum. */
+    rocsar_v1_ErrorCode_ERROR_CALIBRATION_FAILED = 9
 } rocsar_v1_ErrorCode;
 
 /* Whether the three servo feedback fields above it are a measurement.
@@ -97,6 +111,20 @@ typedef struct _rocsar_v1_AntennaTelemetry {
  frame while reporting overheat or an overloaded regulator. This byte used
  to be parsed by nothing and discarded, so a servo in trouble read clean. */
     int32_t feedback_error;
+    /* Whether this servo's internal zero has been taught and verified.
+
+ The servo holds its own centre now: `zero` writes a position offset into
+ the ST3215's EEPROM so the encoder reports 2048 at the airframe boresight,
+ and the firmware verifies both the register and the resulting position
+ before saying so. This bit rides the wire because the servo cannot report
+ it itself -- a servo taught while sitting at exactly 2048 has a stored
+ offset of zero, which is indistinguishable from a servo never taught.
+
+ False on a freshly flashed servo, which is the normal state of a new axis.
+ The firmware still aims, using the 2048 default; this bit is what tells an
+ operator the centre is assumed rather than measured. Absence is not zero:
+ do not render an untaught axis as if it were centred. */
+    bool center_zeroed;
 } rocsar_v1_AntennaTelemetry;
 
 
@@ -106,8 +134,8 @@ extern "C" {
 
 /* Helper constants for enums */
 #define _rocsar_v1_ErrorCode_MIN rocsar_v1_ErrorCode_ERROR_NONE
-#define _rocsar_v1_ErrorCode_MAX rocsar_v1_ErrorCode_ERROR_INTERNAL
-#define _rocsar_v1_ErrorCode_ARRAYSIZE ((rocsar_v1_ErrorCode)(rocsar_v1_ErrorCode_ERROR_INTERNAL+1))
+#define _rocsar_v1_ErrorCode_MAX rocsar_v1_ErrorCode_ERROR_CALIBRATION_FAILED
+#define _rocsar_v1_ErrorCode_ARRAYSIZE ((rocsar_v1_ErrorCode)(rocsar_v1_ErrorCode_ERROR_CALIBRATION_FAILED+1))
 
 #define _rocsar_v1_FeedbackState_MIN rocsar_v1_FeedbackState_FEEDBACK_UNKNOWN
 #define _rocsar_v1_FeedbackState_MAX rocsar_v1_FeedbackState_FEEDBACK_HELD
@@ -120,8 +148,8 @@ extern "C" {
 
 
 /* Initializer values for message structs */
-#define rocsar_v1_AntennaTelemetry_init_default  {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
-#define rocsar_v1_AntennaTelemetry_init_zero     {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
+#define rocsar_v1_AntennaTelemetry_init_default  {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
+#define rocsar_v1_AntennaTelemetry_init_zero     {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
 
 /* Field tags (for use in manual encoding/decoding) */
 #define rocsar_v1_AntennaTelemetry_servo_id_tag  1
@@ -135,6 +163,7 @@ extern "C" {
 #define rocsar_v1_AntennaTelemetry_dir_multiplier_tag 9
 #define rocsar_v1_AntennaTelemetry_feedback_state_tag 10
 #define rocsar_v1_AntennaTelemetry_feedback_error_tag 11
+#define rocsar_v1_AntennaTelemetry_center_zeroed_tag 12
 
 /* Struct field encoding specification for nanopb */
 #define rocsar_v1_AntennaTelemetry_FIELDLIST(X, a) \
@@ -148,7 +177,8 @@ X(a, STATIC,   SINGULAR, UINT32,   center_tick,       7) \
 X(a, STATIC,   SINGULAR, FLOAT,    mount_offset_deg,   8) \
 X(a, STATIC,   SINGULAR, FLOAT,    dir_multiplier,    9) \
 X(a, STATIC,   SINGULAR, INT32,    feedback_state,   10) \
-X(a, STATIC,   SINGULAR, INT32,    feedback_error,   11)
+X(a, STATIC,   SINGULAR, INT32,    feedback_error,   11) \
+X(a, STATIC,   SINGULAR, BOOL,     center_zeroed,    12)
 #define rocsar_v1_AntennaTelemetry_CALLBACK NULL
 #define rocsar_v1_AntennaTelemetry_DEFAULT NULL
 
@@ -159,7 +189,7 @@ extern const pb_msgdesc_t rocsar_v1_AntennaTelemetry_msg;
 
 /* Maximum encoded size of messages (where known) */
 #define ROCSAR_V1_ROCSAR_V1_COMMON_PB_H_MAX_SIZE rocsar_v1_AntennaTelemetry_size
-#define rocsar_v1_AntennaTelemetry_size          79
+#define rocsar_v1_AntennaTelemetry_size          81
 
 #ifdef __cplusplus
 } /* extern "C" */

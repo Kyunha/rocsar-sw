@@ -390,13 +390,63 @@ sketch calls it at the right moments; the policy itself is host-testable, which
 is why every rule below has a test in `firmware/tests/` rather than a note in a
 commit (§12).
 
+**The servo holds its own centre, and `zero` writes it.** The centre tick used to
+be a firmware variable that `zero` overwrote with the axis's current reading. Two
+things were wrong with that. It was lost on every power cycle. And it could be
+set from a position that had never been measured: the old code read `currentTick`
+unconditionally, which is an encoder reading only when `feedbackState` is
+`MEASURED` and otherwise a command echo — so `zero` on an axis whose servo had
+never answered adopted the last commanded tick as the mechanical centre and
+reported success.
+
+Now the ST3215 holds it. `zero` writes a position offset into the servo’s EEPROM
+(register `0x1F`) so the encoder reports 2048 at the boresight. The sequence —
+unlock `0x37`, write, re-lock, 20 ms settle either side — is the vendor’s, taken
+from `docs/ST3215_Configure/ST3215_Configure.ino`. What is ours is the
+verification: the firmware reads the register back *and* reads the position back,
+and refuses with `ERROR_CALIBRATION_FAILED` unless both agree. That second check
+is not belt-and-braces. It is the thing that detects the documented-but-unverified
+assumption that `0x1F` shifts the reported position at all rather than only the
+commanded one, and it turns a servo pointing somewhere plausible into an
+acknowledgement that says the teach failed.
+
+Three consequences, each recorded where it is enforced:
+
+- **It is idempotent.** The offset is always recomputed from wherever the servo
+  actually is, so a run that half-failed — a write lost to bus contention, a
+  servo pulled mid-sequence — converges on a second run. There is no reset
+  command and no recovery procedure, because re-running `zero` *is* the recovery
+  procedure.
+- **The centre survives a reflash, so the firmware records only that it was
+  taught.** An axis taught while sitting at exactly 2048 stores an offset of
+  zero, which is indistinguishable from one never taught. That fact lives in the
+  Pico’s own EEPROM (`calibration.h`, 14 bytes, CRC’d) and rides the wire as
+  `AntennaTelemetry.center_zeroed`. Without it, a fresh servo and a centred one
+  report the same 2048 and the console cannot tell them apart.
+- **Register `0x28` (torque) is never written.** A third-party table claims
+  EEPROM writes require torque disabled; the vendor’s tool does not do that, and
+  torque-off on a 5:1 gear reduction means the antenna drops. The read-back
+  settles the question per write, so the firmware does not write it and find out.
+
+`zero` is consequently the one command that is not finished by
+`applyCommand()`, which cannot know whether a bus write landed. Its policy is
+three functions — `validateZeroCommand()`, `judgeServoZero()`, `commitServoZero()`
+— with the bus work between the second and the third, and there is deliberately no
+`zero` case left in `applyCommand()` that could set a centre without a verified
+read-back. It is also the slowest command on the aircraft, 100–250 ms during which
+the control loop does not tick, which is why `DefaultAckTimeout` is documented
+against it rather than against the single-digit-millisecond round trip everything
+else gets.
+
 **A board that boots, boots silent.** Power-up holds both axes in manual mode at
 centre with `awaitingCommand` set, and `shouldDriveServo()` — the interlock plus
 the deadband, one predicate so the sketch cannot apply one and forget the other —
 transmits nothing until `set_target` (releases both axes) or `jog` (releases that
 axis only). `stop`, `zero`, `mount` and `dir` deliberately do not release it:
 none of them asks a servo to go anywhere, so none of them may move an axis that
-has never been commanded. This replaced a boot that drove to the rail.
+has never been commanded. A teach is in that list even though it writes to
+hardware, because it relabels the position the axis is already holding rather
+than asking for a new one. This replaced a boot that drove to the rail.
 `target_heading_deg` boots at 0, and with the 270° mount offset and 5:1 gear that
 target is reachable only for gondola headings in a 72° window — four boots in
 five ran an axis to the clamp within one control tick of power-up, with a tick
@@ -475,12 +525,51 @@ because that is the device `fswebcam` reads.
 
 The shape `obc_rocsar/sdr_service.go` described, cleaned up:
 
-- `sdr_set_params` reads, validates and writes `parameters/params.json`
-  (PRF, sample rate, TX frequency, gains, bandwidth). Write is atomic:
-  temp file, then rename. A half-written `params.json` is a bricked SDR.
+- `sdr_set_params` reads, validates and writes `parameters/params.json`.
+  Write is atomic: temp file, then rename. A half-written `params.json` is a
+  bricked SDR.
+
+  **Every key `load_config()` reads is settable.** That is all twelve, and for a
+  long time it was seven. `T_MIN_US`, `T_MAX_US` and `START_OFFSET_S` were not
+  modelled at all and `TX_ANTENNA`/`RX_ANTENNA` were readable but absent from
+  the patch and the wire, so an operator could retune the radio and set its
+  gains but could not change the shape of the sweep it flies, the arming delay,
+  or which RF path it used — all four were a hands-on edit to `params.json` on
+  the aircraft. `internal/sdr/params_contract.go` is the one table of what is
+  required, what is bounded and where each bound comes from, and per-key bounds
+  are only part of it:
+
+  `config.hpp` also throws on **`T_MIN_US >= T_MAX_US`**, which no per-key range
+  can express, so `Service.SetParams` checks the pair on the merged result
+  rather than on the incoming patch (the usual edit moves one edge and reads the
+  other from the file). Writing a file that trips it is the worst outcome
+  available — the SDR will not start and the only recovery is editing the file
+  by hand — so it is refused host-side.
+
+  `PULSE_DURATION` is the deliberate exception in the other direction:
+  `config.hpp` has its read commented out, so it is carried through every
+  update untouched and offered as a control nowhere.
 - `sdr_connect` starts `connect` detached, with stdout and stderr to a
   timestamped log under the data directory. It refuses to start a second one
   while one is running, and the refusal names the running PID.
+
+  **The child is reaped.** `Wait` runs on a goroutine, and it is what makes the
+  refusal above transient. The first implementation called `Start` and returned
+  the PID with nothing ever calling `Wait`, so an exited child stayed a zombie
+  for the life of the OBC process — and `Running`/`Connect` decided liveness by
+  signalling the PID, which *succeeds* against a zombie. One crashed connect
+  therefore held the device permanently: every later `sdr_connect` was refused
+  with "an acquisition is already running: pid N since <the original start>",
+  naming a PID and a timestamp that were both true and both misleading.
+
+  One watcher per acquisition is the single writer of the death transition:
+  running flag, state and last error all come from it, and it guards on the PID
+  so a late reap cannot overwrite a newer acquisition. The three ways a run can
+  end are distinguished, because they are different facts: a session that
+  reached `SESSION_DURATION` returns 0 and is **READY** with no error (it is the
+  ordinary end of a capture, not an event), a non-zero exit or a fatal signal is
+  **ERROR** with the exit status and the log path in `last_error`, and a
+  `Stop` we asked for is **READY** with no error.
 
   The binary is found **on `PATH`**, falling back to `<sdr.program>/connect`
   when it is not installed. The deployed system installs it (`ln -s

@@ -228,7 +228,7 @@ func printCommands() {
 		"gnss-rotate":    "trust the next receiver instead of naming one",
 		"heading":        "<degrees>          point both antenna axes at a bearing",
 		"jog":            "<servo-id> <tick>   move one axis to an absolute tick",
-		"zero":           "[<servo-id>]        centre one axis, or both",
+		"zero":           "[<servo-id>]        teach one axis its centre, or both",
 		"mount":          "<servo-id> <deg>    set an axis's mount offset",
 		"dir":            "<servo-id> <+1|-1>  set an axis's direction",
 		"heater":         "<1|2> <on|off>     switch a heater",

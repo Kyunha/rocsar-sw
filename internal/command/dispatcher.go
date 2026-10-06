@@ -314,7 +314,9 @@ func (d *Dispatcher) sdrSetParams(ctx context.Context, requestID string, cmd *ro
 	// indistinguishable from a broken button.
 	if p.PrfHz == nil && p.SampleRateHz == nil && p.TxFreqHz == nil &&
 		p.NormalizedGainTx == nil && p.NormalizedGainRx == nil &&
-		p.BandwidthHz == nil && p.SessionDurationS == nil {
+		p.BandwidthHz == nil && p.SessionDurationS == nil &&
+		p.TMinUs == nil && p.TMaxUs == nil && p.StartOffsetS == nil &&
+		p.TxAntenna == nil && p.RxAntenna == nil {
 		return fail(requestID, rocsarv1.ErrorCode_ERROR_INVALID_PARAMETER,
 			"no parameters were set; a partial update must name at least one")
 	}
@@ -326,10 +328,26 @@ func (d *Dispatcher) sdrSetParams(ctx context.Context, requestID string, cmd *ro
 		NormalizedGainTx: p.NormalizedGainTx,
 		NormalizedGainRx: p.NormalizedGainRx,
 		BandwidthHz:      p.BandwidthHz,
+		SweepMinUs:       p.TMinUs,
+		SweepMaxUs:       p.TMaxUs,
+		StartOffsetS:     p.StartOffsetS,
 	}
 	if p.SessionDurationS != nil {
 		v := p.GetSessionDurationS()
 		patch.SessionDurationS = &v
+	}
+	// Strings, so they cannot be aliased from the message the way the *float64
+	// fields are: GetTxAntenna returns the receiver's own field, and taking its
+	// address would hand the patch a pointer into a message this frame does not
+	// own. A local copy per field is the same shape as the SessionDurationS case
+	// above and for the same reason.
+	if p.TxAntenna != nil {
+		v := p.GetTxAntenna()
+		patch.TxAntenna = &v
+	}
+	if p.RxAntenna != nil {
+		v := p.GetRxAntenna()
+		patch.RxAntenna = &v
 	}
 
 	if err := d.sdr.SetParams(ctx, patch); err != nil {

@@ -41,6 +41,34 @@ type SdrParamsPatch struct {
 	NormalizedGainRx *float64 `json:"normalized_gain_rx,omitempty"`
 	BandwidthHz      *float64 `json:"bandwidth_hz,omitempty"`
 	SessionDurationS *uint32  `json:"session_duration_s,omitempty"`
+	// SweepMinUs/SweepMaxUs are the burst window the acquisition sweeps inside
+	// each PRI, and StartOffsetS is the arming delay before the first burst.
+	// They are the three keys the OBC already validated but no console could
+	// set, which left the capture geometry a hand edit on the aircraft.
+	//
+	// The JSON names are the proto field names, which is what the frontend
+	// sends; the keys in params.json itself are T_MIN_US, T_MAX_US and
+	// START_OFFSET_S and are the OBC's business.
+	SweepMinUs   *float64 `json:"t_min_us,omitempty"`
+	SweepMaxUs   *float64 `json:"t_max_us,omitempty"`
+	StartOffsetS *float64 `json:"start_offset_s,omitempty"`
+	TxAntenna    *string  `json:"tx_antenna,omitempty"`
+	RxAntenna    *string  `json:"rx_antenna,omitempty"`
+}
+
+// empty reports whether a patch names nothing at all.
+//
+// One predicate rather than a repeated nil-chain, because this is the check that
+// decides whether a request is worth putting on the wire and it now spans
+// twelve fields. A patch with nothing set is refused: the operator pressed a
+// button and expects a change, and a silent success is indistinguishable from a
+// broken button.
+func (p SdrParamsPatch) empty() bool {
+	return p.PRFHz == nil && p.SampleRateHz == nil && p.TxFreqHz == nil &&
+		p.NormalizedGainTx == nil && p.NormalizedGainRx == nil &&
+		p.BandwidthHz == nil && p.SessionDurationS == nil &&
+		p.SweepMinUs == nil && p.SweepMaxUs == nil && p.StartOffsetS == nil &&
+		p.TxAntenna == nil && p.RxAntenna == nil
 }
 
 // BuildSetParamsRequest turns a typed patch into a CommandRequest. Typed,
@@ -48,9 +76,7 @@ type SdrParamsPatch struct {
 // fields -- parsing floats to strings to re-parse them would be validation
 // theatre twice over.
 func BuildSetParamsRequest(patch SdrParamsPatch) (*Request, error) {
-	if patch.PRFHz == nil && patch.SampleRateHz == nil && patch.TxFreqHz == nil &&
-		patch.NormalizedGainTx == nil && patch.NormalizedGainRx == nil &&
-		patch.BandwidthHz == nil && patch.SessionDurationS == nil {
+	if patch.empty() {
 		return nil, fmt.Errorf("no parameters were set; a partial update must name at least one")
 	}
 	params := &rocsarv1.SdrParams{}
@@ -81,6 +107,26 @@ func BuildSetParamsRequest(patch SdrParamsPatch) (*Request, error) {
 	if patch.SessionDurationS != nil {
 		v := *patch.SessionDurationS
 		params.SessionDurationS = &v
+	}
+	if patch.SweepMinUs != nil {
+		v := *patch.SweepMinUs
+		params.TMinUs = &v
+	}
+	if patch.SweepMaxUs != nil {
+		v := *patch.SweepMaxUs
+		params.TMaxUs = &v
+	}
+	if patch.StartOffsetS != nil {
+		v := *patch.StartOffsetS
+		params.StartOffsetS = &v
+	}
+	if patch.TxAntenna != nil {
+		v := *patch.TxAntenna
+		params.TxAntenna = &v
+	}
+	if patch.RxAntenna != nil {
+		v := *patch.RxAntenna
+		params.RxAntenna = &v
 	}
 	return &rocsarv1.CommandRequest{
 		RequestId: NewRequestID("sdr-set-params"),

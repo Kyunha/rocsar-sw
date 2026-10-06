@@ -12,8 +12,8 @@
  * layer -- bridge.ts is the hand-written client and models.ts the hand-written
  * types. See GUI_ARCHITECTURE.md sections 1.2-1.4.
  */
-import 'leaflet/dist/leaflet.css';
-import { initMap } from './map';
+import 'maplibre-gl/dist/maplibre-gl.css';
+import { initMap, setMapClickHandler } from './map';
 import './style.css';
 import { call, on, connect } from './bridge';
 import type { View, CommandResult, LinkState, Config, Entry, SdrParamsPatch, FrameEvent, DownloadProgress, DownloadDone } from './models';
@@ -197,7 +197,7 @@ function numOrUndef(id: string): number | undefined {
 }
 
 function clearParams(): void {
-    for (const id of ['in-prf', 'in-fs', 'in-tx', 'in-gtx', 'in-grx', 'in-bw', 'in-sess']) {
+    for (const [id] of PARAM_FIELDS) {
         (req(id) as HTMLInputElement).value = '';
     }
 }
@@ -205,7 +205,15 @@ function clearParams(): void {
 /* Input id to params.json key. One table, used for both directions: refresh
  * writes placeholders from it, apply reads values for it. A key renamed on
  * either side breaks visibly (placeholder shows "(unknown)") rather than
- * silently mapping to the wrong field. */
+ * silently mapping to the wrong field.
+ *
+ * The list is every key connect.cpp reads with j.at(), and nothing else. The
+ * sweep window, the arming delay and the two antenna ports were absent for the
+ * life of this console, which meant an operator could retune the radio but not
+ * change the shape of the sweep it flies -- that took a hands-on edit to
+ * params.json on the aircraft. PULSE_DURATION is deliberately still missing:
+ * config.hpp has its read commented out, so a control for it would save a value
+ * the program never looks at. */
 const PARAM_FIELDS: Array<[string, string]> = [
     ['in-prf', 'PRF'],
     ['in-fs', 'FS'],
@@ -214,7 +222,21 @@ const PARAM_FIELDS: Array<[string, string]> = [
     ['in-grx', 'NORMALIZED_GAIN_RX'],
     ['in-bw', 'BW'],
     ['in-sess', 'SESSION_DURATION'],
+    ['in-tmin', 'T_MIN_US'],
+    ['in-tmax', 'T_MAX_US'],
+    ['in-soffset', 'START_OFFSET_S'],
+    ['in-txant', 'TX_ANTENNA'],
+    ['in-rxant', 'RX_ANTENNA'],
 ];
+
+/* Antenna ports are strings, so they are read differently from the numbers.
+ * Blank means "leave alone" for both, and the distinction matters in the same
+ * way it does for the numeric fields: an empty box is not a request to set an
+ * antenna to nothing. */
+function strOrUndef(id: string): string | undefined {
+    const raw = (req(id) as HTMLInputElement).value.trim();
+    return raw === '' ? undefined : raw;
+}
 
 /* Current values arrive as placeholder hints; inputs stay empty so blank keeps
  * meaning "leave alone". A read failure leaves "(unavailable)" hints rather
@@ -230,7 +252,18 @@ async function refreshParams(): Promise<void> {
     for (const [id, key] of PARAM_FIELDS) {
         const el = req(id) as HTMLInputElement;
         const v = vals === null ? undefined : vals[key];
-        el.placeholder = typeof v === 'number' ? String(v) : '(unknown)';
+        /* Numbers and strings are both real values here -- the antenna ports are
+         * path names, not numbers -- so the hint accepts either. A key that is
+         * present but of neither type means the Go side and this table have
+         * genuinely diverged, and "(unknown)" is the honest way to say so rather
+         * than printing a number the operator would take as a setting. */
+        if (typeof v === 'number') {
+            el.placeholder = String(v);
+        } else if (typeof v === 'string') {
+            el.placeholder = v;
+        } else {
+            el.placeholder = vals === null ? '(unavailable)' : '(unknown)';
+        }
     }
     if (vals !== null) {
         logLine('params refreshed from OBC');
@@ -249,7 +282,11 @@ function wireServoButtons(): void {
         const zero = b.dataset.zeroServo;
         const stop = b.dataset.stopServo;
         if (zero !== undefined) {
-            void runMotion('zero', `Centre servo ${zero}?`, 'The axis returns to its centre tick.', () => call<Cmd>('ZeroServo', Number(zero)));
+            // Not "returns to its centre tick": `zero` teaches the servo the
+            // tick it is already sitting at, so the axis does not move. The axis
+            // does not move is worth saying out loud, because the old wording
+            // implied motion and an operator would reasonably brace for it.
+            void runMotion('zero', `Teach servo ${zero} its centre?`, 'Writes the centre into the servo. The axis does not move -- the tick it is at now becomes 0 degrees. Takes about a quarter second.', () => call<Cmd>('ZeroServo', Number(zero)));
         } else if (stop !== undefined) {
             void runMotion('stop', `Stop servo ${stop}?`, 'Motion halts on that axis.', () => call<Cmd>('StopServo', Number(stop)));
         }
@@ -298,7 +335,14 @@ function renderPico(v: View): string {
             ? 'load held'
             : `load ${a.load}% ${a.temperature_c ?? '?'}C`;
         const fault = a.feedback_error ? ` <span class="err">FAULT ${esc(a.feedback_error)}</span>` : '';
-        return `<div class="row sub"><span>servo ${a.servo_id}</span><b>tick ${a.current_tick} ${fmtDeg(a.current_angle_deg)} ${esc(load)} ${esc(a.feedback)}${fault}</b> <button data-motion data-zero-servo="${a.servo_id}">zero</button> <button data-motion data-stop-servo="${a.servo_id}">stop</button></div>`;
+        // The centre rides with the axis because center_tick alone cannot say
+        // whether it was measured. The servo holds its own zero now, so an axis
+        // that was never taught reports the same 2048 as one that was -- and
+        // rendering that as "centred" is a lie an operator would act on.
+        const centre = a.center_zeroed
+            ? `centre ${a.center_tick}`
+            : `<span class="err">centre UNTAUGHT (assumed ${a.center_tick})</span>`;
+        return `<div class="row sub"><span>servo ${a.servo_id}</span><b>tick ${a.current_tick} ${fmtDeg(a.current_angle_deg)} ${centre} ${esc(load)} ${esc(a.feedback)}${fault}</b> <button data-motion data-zero-servo="${a.servo_id}">zero</button> <button data-motion data-stop-servo="${a.servo_id}">stop</button></div>`;
     }).join('');
     const ack = v.pico_last_ack === null || v.pico_last_ack === undefined
         ? 'no ack'
@@ -318,10 +362,20 @@ function renderCameraSdrLink(v: View): string {
     const last = c.last_photo ? ` last ${esc(c.last_photo)}` : '';
     const s = v.sdr;
     const log = s.last_error ? ` last error: ${esc(s.last_error)}` : '';
+    /* The PID, not `running`. This rendered "running pid true" for as long as
+     * the field existed, because the boolean and the pid sit next to each other
+     * in the view and only one of them is a number. An operator checking whether
+     * an acquisition is theirs was reading the word "true". */
+    const pid = s.running ? ` running pid ${s.pid}` : '';
+    /* Where the child's output went. connect writes everything to this file and
+     * the OBC only ever holds its path, so without it on screen there is nowhere
+     * to look when an acquisition stops without an error -- which is the whole
+     * question an operator has at that moment. */
+    const logPath = s.last_log ? ` log ${esc(s.last_log)}` : '';
     const l = v.link;
     const shaping = l.shaping_active ? 'shaping on' : `shaping off${l.inactive_reason ? `: ${esc(l.inactive_reason)}` : ''}`;
     return `<div class="row"><span>camera</span><b>${esc(c.state)} ${photos}${last}</b></div>
-        <div class="row"><span>sdr</span><b>${esc(s.state)}${s.running ? ` running pid ${s.running}` : ''}${log}</b></div>
+        <div class="row"><span>sdr</span><b>${esc(s.state)}${pid}${log}${logPath}</b></div>
         <div class="row"><span>link</span><b>${esc(l.state)} ${esc(l.device)} ${l.rate_kbps} kbit/s ${shaping}</b></div>`;
 }
 
@@ -534,7 +588,7 @@ function wireCommands(): void {
     on('b-gnss-rot', () => void call<Cmd>('RotateReceiver').then((r) => cmdLine('gnss-rotate', r)));
     on('b-heading', () => void runMotion('heading', `Point both axes at ${strArg('in-heading')}°?`, 'The target bearing changes on acknowledge. Check the number — there is no undo.', () => call<Cmd>('SetHeading', numArg('in-heading'))));
     on('b-jog', () => void runMotion('jog', `Jog servo ${strArg('in-jog-id')} to tick ${strArg('in-jog-tick')}?`, 'Absolute tick move in manual mode. Out-of-range ticks are refused before sending.', () => call<Cmd>('Jog', numArg('in-jog-id'), numArg('in-jog-tick'))));
-    on('b-zero', () => void runMotion('zero', 'Centre both axes?', 'Each axis returns to its centre tick.', () => call<Cmd>('ZeroAll')));
+    on('b-zero', () => void runMotion('zero', 'Teach both axes their centres?', 'Writes each centre into its servo. Neither axis moves -- the tick each is at now becomes 0 degrees.', () => call<Cmd>('ZeroAll')));
     on('b-mount', () => void runMotion('mount', `Set mount offset of servo ${strArg('in-mount-id')} to ${strArg('in-mount-deg')}°?`, 'Stored on the flight controller; affects subsequent pointing.', () => call<Cmd>('MountOffset', numArg('in-mount-id'), numArg('in-mount-deg'))));
     on('b-dir', () => void runMotion('dir', `Set direction of servo ${strArg('in-dir-id')} to ${strArg('in-dir-m')}?`, 'Reverses the axis sense. Check the sign — there is no undo.', () => call<Cmd>('SetDirection', numArg('in-dir-id'), numArg('in-dir-m'))));
     on('b-heater', () => void runMotion('heater', `Switch heater ${strArg('in-heater-id')} ${strArg('in-heater-state')}?`, 'Thermal control; takes effect on acknowledge.', () => call<Cmd>('SetHeater', numArg('in-heater-id'), strArg('in-heater-state') === 'on')));
@@ -554,6 +608,11 @@ function wireCommands(): void {
                 normalized_gain_rx: numOrUndef('in-grx'),
                 bandwidth_hz: numOrUndef('in-bw'),
                 session_duration_s: numOrUndef('in-sess'),
+                t_min_us: numOrUndef('in-tmin'),
+                t_max_us: numOrUndef('in-tmax'),
+                start_offset_s: numOrUndef('in-soffset'),
+                tx_antenna: strOrUndef('in-txant'),
+                rx_antenna: strOrUndef('in-rxant'),
             } as SdrParamsPatch);
             cmdLine('sdr-set-params', r);
             if (r.success) {
@@ -648,6 +707,8 @@ function layout(): void {
       <div class="row"><span>prf</span><input id="in-prf" size="8"><span>fs</span><input id="in-fs" size="10"><span>tx</span><input id="in-tx" size="10"></div>
       <div class="row"><span>gain tx</span><input id="in-gtx" size="6"><span>gain rx</span><input id="in-grx" size="6"><span>bw</span><input id="in-bw" size="10"></div>
       <div class="row"><span>session s</span><input id="in-sess" size="6"><button id="b-params">apply</button> <button id="b-params-clear">clear</button> <button id="b-params-refresh">refresh</button></div>
+      <div class="row"><span>t min us</span><input id="in-tmin" size="6"><span>t max us</span><input id="in-tmax" size="6"><span>start offset s</span><input id="in-soffset" size="6"></div>
+      <div class="row"><span>tx antenna</span><input id="in-txant" size="10"><span>rx antenna</span><input id="in-rxant" size="10"></div>
     </section>
     <section class="p-art"><h2>artefacts <span id="pathline">/</span></h2><div id="files"></div>
       <div class="row"><button id="b-ls">refresh</button> <button id="b-dlcancel">cancel download</button></div>
@@ -684,6 +745,9 @@ async function boot(): Promise<void> {
     await connect();
     layout();
     initMap();
+    setMapClickHandler((lat, lon) => {
+        void runMotion('map-click', `Point both antennas at ${lat.toFixed(4)}°, ${lon.toFixed(4)}°?`, 'The target bearing is set from the map click. Check the location — there is no undo.', () => call('SetHeading', lat));
+    });
     // Viewport and version go to the log first: layout complaints ("single
     // column") are undecidable without the CSS pixel width, and binary
     // provenance questions end at the stamped version, not in a thread.

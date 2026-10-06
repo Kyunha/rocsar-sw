@@ -90,9 +90,7 @@ func run() error {
 	fmt.Printf("Ground station: %s\n", baseURL)
 	fmt.Println("Open that URL in your browser. Ctrl-C to stop.")
 
-	if err := app.Connect(app.initial); err != nil {
-		fmt.Fprintf(os.Stderr, "connect: %v\n", err)
-	}
+	app.startup(ctx)
 
 	<-ctx.Done()
 	return app.Disconnect()

@@ -3,6 +3,7 @@
 pkgs.mkShell {
   packages = with pkgs; [
     python3
+    python3Packages.pytest
     buf
     go
     git

@@ -251,7 +251,6 @@ class TestBootHold:
         "command",
         [
             ("stop", "1"),
-            ("zero", "1"),
             ("mount", "1", "90"),
             ("dir", "1", "-1"),
             ("heater", "1", "1"),
@@ -260,16 +259,38 @@ class TestBootHold:
     def test_a_command_that_moves_nothing_does_not_release_the_interlock(
         self, probe, command
     ):
-        """stop, zero, mount, dir and heater are postures and configuration.
+        """stop, mount, dir and heater are postures and configuration.
 
         None of them asks a servo to go anywhere, so none of them may be able to
         start motion on an axis that has never been commanded -- which is what
         releasing the interlock would do, because lastSentTick=0xFFFF differs
         from every possible target by more than the deadband.
+
+        `zero` used to be in this list and no longer is: it is now hardware, and
+        applyCommand() refuses it rather than half-applying it. See
+        TestZeroCommand in test_firmware_calibration.py, which drives the same
+        command through the three functions that replaced it and asserts the
+        interlock still holds after a successful teach.
         """
         result = _apply_synthetic(probe, *command)
         assert result["name"] == "ERROR_NONE"
         assert result["state"]["axes"]["0"]["await"] == 1
+        assert result["drive"] == {"0": 0, "1": 0}
+
+    def test_zero_is_refused_by_applycommand_rather_than_half_applied(self, probe):
+        """applyCommand() cannot finish a `zero`, so it must not pretend to.
+
+        Teaching a servo its centre writes the ST3215's EEPROM and reads the
+        result back; only the sketch has the bus to do that. An error code
+        returned from here would reach the operator as an acknowledgement, and a
+        centre set from a position that had never been measured is exactly the
+        defect this replaced. Refusing is the honest answer.
+        """
+        result = _apply_synthetic(probe, "zero", "1")
+        assert result["name"] == "ERROR_INVALID_COMMAND"
+        # And it changed nothing on the way to being refused.
+        assert result["state"]["axes"]["0"]["await"] == 1
+        assert result["state"]["axes"]["0"]["zeroed"] == 0
         assert result["drive"] == {"0": 0, "1": 0}
 
     def test_the_first_target_is_sent_even_when_it_computes_to_centre(self, probe):

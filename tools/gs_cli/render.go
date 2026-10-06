@@ -85,6 +85,17 @@ func printTelemetry(f *rocsarv1.TelemetryFrame) {
 			fmt.Printf("                servo %d  tick %4d  %7.2f deg  %-12s  %s\n",
 				a.GetServoId(), a.GetCurrentTick(), a.GetCurrentAngleDeg(),
 				load, feedbackName(a.GetFeedbackState()))
+			// The centre, and whether it is real. The servo holds its own zero
+			// now, so an axis that was never taught reports the same 2048 as one
+			// that was; printing the tick alone would present an assumption as a
+			// measurement.
+			if a.GetCenterZeroed() {
+				fmt.Printf("                servo %d  centre %d (taught)\n",
+					a.GetServoId(), a.GetCenterTick())
+			} else {
+				fmt.Printf("                servo %d  centre UNTAUGHT (assumed %d)\n",
+					a.GetServoId(), a.GetCenterTick())
+			}
 			if e := a.GetFeedbackError(); e != 0 {
 				// The ST3215 reports overheat and overload here while answering
 				// perfectly well-formed frames, so a servo in trouble reads clean

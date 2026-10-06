@@ -10,6 +10,12 @@
 #include "cobs.h"
 #include "pico_wire.h"
 
+// The alignment record's format and its EEPROM home. calibration.h is pure
+// arithmetic and is compiled and driven on the host by firmware/tests; the store
+// is the only Arduino-aware part of it.
+#include "calibration.h"
+#include "calibration_store.h"
+
 // Kinematics, command handling and the ST3215 status parser live in
 // gondola_model.h, which touches no hardware and can therefore be compiled and
 // driven on a host. This sketch keeps only what needs pins, timers and the UART.
@@ -172,7 +178,80 @@ void syncHeaterPins() {
 // ============================================================================
 // COMMAND PARSER & EXECUTION
 // ============================================================================
+// Defined in the ST3215 section below. Forward-declared rather than relied upon
+// to be reordered, because a sketch whose compilation depends on definition
+// order is one edit away from not compiling.
+ServoZeroOutcome zeroServoHardware(uint8_t id, uint16_t& verifiedCentreTick);
+bool readServoRegisterHardware(uint8_t id, ServoCalibRead& out);
+
+// Handles a `zero`, which is the one command applyCommand() does not finish.
+//
+// The command itself has not changed -- ZeroCommand still carries a servo_id and
+// nothing else -- but what it now does has: instead of overwriting a firmware
+// variable with the current reading, it writes a position offset into the
+// ST3215's own EEPROM so the servo reports its centre tick at the boresight.
+// That needs the bus, so it happens here and not in the model.
+//
+// The three model functions are the whole policy and each is named for what it
+// settles: which axis, did it take, record it. The ordering is load-bearing --
+// the ack below is built from the hardware's answer, so a teach that failed
+// cannot report success, which is the one thing the old three-line version got
+// wrong.
+void handleZeroCommand(const rocsar_v1_PicoCommand &cmd) {
+  int axisIndex = validateZeroCommand(gondola, cmd);
+  if (axisIndex < 0) {
+    sendCommandResponse(cmd.sequence,
+                        rocsar_v1_ErrorCode_ERROR_INVALID_SERVO);
+    return;
+  }
+
+  uint16_t verifiedCentre = ST3215_SERVO_CENTRE_TICK;
+  ServoZeroOutcome outcome =
+      zeroServoHardware(gondola.antennas[axisIndex].id, verifiedCentre);
+
+  if (outcome == ZERO_OK) {
+    commitServoZero(gondola, axisIndex, verifiedCentre);
+
+    // Persist the fact that a teach took. This is the only place the record
+    // changes, and it is on the far side of the bus work so the EEPROM erase --
+    // which takes interrupts off for tens of milliseconds -- cannot delay the
+    // acknowledgement or stall the control tick.
+    CalibrationRecord record;
+    snapshotCalibration(gondola, record);
+    calibrationSave(record);
+  }
+
+  // A dead servo is a different fact from a teach that did not take, and they
+  // want different responses: nothing was written in the first case, while in the
+  // second the servo may be holding a partial change to its own centre. Hence two
+  // codes rather than one generic hardware fault.
+  rocsar_v1_ErrorCode error;
+  switch (outcome) {
+    case ZERO_OK:
+      error = rocsar_v1_ErrorCode_ERROR_NONE;
+      break;
+    case ZERO_NO_SERVO_REPLY:
+      error = rocsar_v1_ErrorCode_ERROR_HARDWARE_FAULT;
+      break;
+    default:
+      // The offset did not store, the encoder did not reach the centre, or the
+      // tick scale changed under us. Re-running `zero` converges, because the
+      // offset is always recomputed from wherever the servo actually is.
+      error = rocsar_v1_ErrorCode_ERROR_CALIBRATION_FAILED;
+      break;
+  }
+  sendCommandResponse(cmd.sequence, error);
+}
+
 void handleCommand(const rocsar_v1_PicoCommand &cmd) {
+  // `zero` needs the servo bus and a verified result, so it is dispatched before
+  // the model sees it. Everything else is the model alone, which is what keeps
+  // policy testable on a host.
+  if (cmd.which_payload == rocsar_v1_PicoCommand_zero_tag) {
+    handleZeroCommand(cmd);
+    return;
+  }
+
   // millis() is passed because an "on" starts the heater dead-man clock; see
   // applyCommand() for why the clock is command data rather than a sketch
   // concern.
@@ -275,6 +354,183 @@ bool readServoTelemetryHardware(uint8_t id, ServoStatus &out) {
 }
 
 // ============================================================================
+// ST3215 EEPROM: TEACHING A SERVO ITS CENTRE
+// ============================================================================
+// Everything in this section is bus work. The rules -- which offset to write,
+// whether the write took, what that means for the model -- are in
+// gondola_model.h, and the only reason they are not on one line here is that
+// they are the part that has to be provable without a servo attached.
+
+// Drops whatever is in the UART's receive path.
+//
+// The bus is half-duplex, so every request we send comes back as an echo, and a
+// write is answered as well. The official configure sketch drains before each
+// read for the same reason. Doing it here as a separate step -- rather than
+// letting each scanner cope -- means the scanners only ever see frames that
+// arrived after the request they are answering.
+void drainServoBus() {
+  while (Serial1.available() > 0) {
+    Serial1.read();
+  }
+}
+
+// Writes one register. Fire-and-forget by design, matching the vendor's own
+// writeReg8/writeReg16: neither reads an acknowledgement, and every write here
+// is proved by the read-back that follows rather than by its own reply.
+void writeServoRegister(uint8_t id, uint8_t reg, uint8_t value) {
+  uint8_t pkt[9];
+  size_t len = buildServoWrite8(id, reg, value, pkt, sizeof(pkt));
+  if (len == 0) {
+    return;
+  }
+  Serial1.write(pkt, len);
+  Serial1.flush();
+}
+
+void writeServoRegister16(uint8_t id, uint8_t reg, uint16_t value) {
+  uint8_t pkt[9];
+  size_t len = buildServoWrite16(id, reg, value, pkt, sizeof(pkt));
+  if (len == 0) {
+    return;
+  }
+  Serial1.write(pkt, len);
+  Serial1.flush();
+}
+
+// Reads the four calibration registers and waits for the answer.
+//
+// The mirror of readServoTelemetryHardware(), including the bounded wait and the
+// yielding poll loop: the teach sequence is blocking by design, but it should not
+// busy-wait the wire while it does. The difference is the scanner -- a 10-byte
+// frame at LEN=0x06, which collides with neither the 8-byte request echo nor the
+// 14-byte status reply, so this cannot mistake our own echo for an answer.
+bool readServoRegisterHardware(uint8_t id, ServoCalibRead &out) {
+  uint8_t request[SERVO_STATUS_REQUEST_LEN];
+  size_t requestLen =
+      buildServoRegisterRead(id, REG_ST3215_ANGULAR_RESOLUTION,
+                             ST3215_CALIB_READ_LEN, request, sizeof(request));
+  if (requestLen == 0) {
+    return false;
+  }
+
+  drainServoBus();
+  Serial1.write(request, requestLen);
+  Serial1.flush();
+
+  uint8_t buffer[SERVO_STATUS_BUFFER_LEN];
+  size_t filled = 0;
+  unsigned long deadline = millis() + SERVO_STATUS_WAIT_MS;
+
+  while (true) {
+    while (Serial1.available() > 0 && filled < sizeof(buffer)) {
+      buffer[filled++] = (uint8_t)Serial1.read();
+    }
+
+    ServoCalibRead scan = scanServoCalibRead(buffer, filled, id);
+    if (scan.matched) {
+      out = scan;
+      return true;
+    }
+
+    // Consume what the scanner rejected even though nothing matched, for the
+    // same reason readServoTelemetryHardware() does: a byte it has already
+    // refused must not be re-examined forever, or a corrupt LEN wedges the read.
+    if (scan.consumed > 0) {
+      size_t remaining = filled - scan.consumed;
+      for (size_t i = 0; i < remaining; i++) {
+        buffer[i] = buffer[i + scan.consumed];
+      }
+      filled = remaining;
+    }
+
+    if ((int32_t)(millis() - deadline) >= 0) {
+      break;
+    }
+    delay(1);
+  }
+
+  return false;
+}
+
+// Teaches one servo its centre and reports whether it took.
+//
+// The sequence is the vendor's, from changeServoID() in the official configure
+// sketch: unlock the EEPROM, write the register, re-lock, with a settle delay
+// either side. What is ours is what comes after -- reading the register back and
+// then reading the position back, because "the write was sent" is not a claim
+// this firmware is willing to acknowledge.
+//
+// Blocking, and on purpose. This runs on an explicit operator command and takes
+// 100-250 ms, during which the control loop does not tick and no telemetry goes
+// out. That is an acceptable cost for an action that should happen a handful of
+// times per session, and it buys an acknowledgement that means something: an
+// asynchronous version would have to answer "accepted" before knowing whether the
+// EEPROM write landed, which is the failure this is most careful about.
+//
+// Idempotent, and that is the safety net. The offset is always recomputed from
+// wherever the servo actually is, so a run that half-failed -- a write lost to
+// bus contention, a servo pulled mid-sequence -- is fixed by running it again.
+// No recovery path, no reset command and no reflash is needed to get back to a
+// known state.
+//
+// Note what is absent: register 0x28, torque. A third-party register table claims
+// EEPROM writes require torque disabled; the vendor's own tool does not do that,
+// and torque-off on a 5:1 gear train carrying an antenna means the axis goes
+// limp. The read-back below settles the question per write either way -- if the
+// offset does not store, the teach is refused rather than assumed -- so the safe
+// choice is not to write it and find out.
+ServoZeroOutcome zeroServoHardware(uint8_t id, uint16_t &verifiedCentreTick) {
+  verifiedCentreTick = ST3215_SERVO_CENTRE_TICK;
+
+  // Take our own reading rather than trusting whatever the alternating poll last
+  // left in the model. It costs one bus round trip and it removes a race: a
+  // `zero` issued in the first 40 ms after boot would otherwise have nothing to
+  // measure from.
+  ServoStatus before;
+  if (!readServoTelemetryHardware(id, before)) {
+    return ZERO_NO_SERVO_REPLY;
+  }
+
+  uint16_t offset = servoZeroOffset(before.positionTicks, ST3215_SERVO_CENTRE_TICK);
+
+  writeServoRegister(id, REG_ST3215_EEPROM_LOCK, ST3215_EEPROM_UNLOCKED);
+  delay(ST3215_EEPROM_SETTLE_MS);
+
+  writeServoRegister16(id, REG_ST3215_POSITION_OFFSET, offset);
+  delay(ST3215_EEPROM_SETTLE_MS);
+
+  // Re-lock even if the writes were lost. Leaving a servo's EEPROM unlocked is a
+  // thing a later, unrelated write could then land in, and there is no way to
+  // know from here whether the register write took.
+  writeServoRegister(id, REG_ST3215_EEPROM_LOCK, ST3215_EEPROM_LOCKED);
+  delay(ST3215_EEPROM_SETTLE_MS);
+
+  ServoCalibRead regs;
+  if (!readServoRegisterHardware(id, regs)) {
+    return ZERO_OFFSET_MISMATCH;
+  }
+
+  ServoStatus after;
+  if (!readServoTelemetryHardware(id, after)) {
+    return ZERO_POSITION_MISMATCH;
+  }
+
+  ServoZeroOutcome outcome = judgeServoZero(offset, regs.positionOffset,
+                                            regs.angularResolution,
+                                            before.positionTicks,
+                                            after.positionTicks);
+  if (outcome != ZERO_OK) {
+    return outcome;
+  }
+
+  // Report what the encoder says, not what we asked for. The two can differ by
+  // up to the tolerance, and the measured value is the one the servo will keep
+  // reporting from now on.
+  verifiedCentreTick = after.positionTicks;
+  return ZERO_OK;
+}
+
+// ============================================================================
 // SETUP & MAIN LOOP
 // ============================================================================
 void setup() {
@@ -294,6 +550,29 @@ void setup() {
   Wire.begin();
 
   initGondolaState(gondola);
+
+  // Restore the alignment record. The centre itself lives in each servo's own
+  // EEPROM -- that is what `zero` writes -- so all that comes back from here is
+  // the fact that a teach took, which the servo cannot report for itself.
+  //
+  // Not fatal on failure, and deliberately so. A missing or unreadable record
+  // leaves every axis untaught, which rides the wire as center_zeroed = false
+  // and is therefore visible, rather than being a silent return to something
+  // that looks like a calibration. The one line below is on the CDC at boot
+  // because this is the only moment an operator is guaranteed to see it.
+  if (calibrationBegin()) {
+    CalibrationRecord record;
+    CalibrationResult loaded = calibrationLoad(record);
+    if (loaded == CALIBRATION_OK) {
+      applyCalibration(gondola, record);
+    }
+    if (loaded != CALIBRATION_OK) {
+      Serial.printf("[calib] %s -- axes report an assumed centre\n",
+                    calibrationResultName(loaded));
+    }
+  } else {
+    Serial.println("[calib] EEPROM unavailable -- axes report an assumed centre");
+  }
 
   // Both heaters off, written through the one function that ever touches their
   // pins -- so "the pins mirror the model" is true from the first line of setup

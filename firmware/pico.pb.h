@@ -21,7 +21,25 @@ typedef struct _rocsar_v1_JogCommand {
     uint32_t tick;
 } rocsar_v1_JogCommand;
 
-/* Return an axis to its mechanical centre (center_tick). */
+/* Teach a servo its mechanical centre.
+
+ This writes a position offset into the ST3215's own EEPROM (register 0x1F) so
+ that the encoder reports 2048 at whatever angle the axis is currently at. The
+ firmware verifies both the register read-back and the resulting reported
+ position, and refuses with ERROR_CALIBRATION_FAILED if they disagree.
+
+ It relabels the current position; it does NOT drive the axis anywhere. The
+ distinction is not pedantic: Waveshare's own tool describes teaching the
+ middle and then *commanding* the middle as two separate operations, and only
+ the second one moves the servo. So after a successful `zero` the axis has not
+ moved, and `current_angle_deg` reads 0 because the position it was already
+ in has been redefined as the centre.
+
+ This requires the servo to answer: the offset is computed from a real
+ position read, so `zero` on a servo that is not talking is a hardware fault
+ rather than a silent no-op. It is a deliberate, comparatively slow operation
+ (an EEPROM write, and a read-back to prove it took) and it must not be issued
+ automatically on a schedule. */
 typedef struct _rocsar_v1_ZeroCommand {
     uint32_t servo_id;
 } rocsar_v1_ZeroCommand;
@@ -301,8 +319,8 @@ extern const pb_msgdesc_t rocsar_v1_PicoMessage_msg;
 #define rocsar_v1_MountCommand_size              11
 #define rocsar_v1_PicoAck_size                   10
 #define rocsar_v1_PicoCommand_size               20
-#define rocsar_v1_PicoMessage_size               203
-#define rocsar_v1_PicoTelemetry_size             183
+#define rocsar_v1_PicoMessage_size               207
+#define rocsar_v1_PicoTelemetry_size             187
 #define rocsar_v1_SetTargetCommand_size          5
 #define rocsar_v1_StatusRequestCommand_size      0
 #define rocsar_v1_StopCommand_size               6

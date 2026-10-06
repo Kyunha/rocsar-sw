@@ -195,9 +195,9 @@ func TestConnectRefusesAMisnamedDirectoryWithoutStarting(t *testing.T) {
 
 	started := false
 	s := NewService(prog, logRoot, discardLogger())
-	s.start = func(context.Context, string, string, []string, *os.File) (int, error) {
+	s.start = func(context.Context, string, string, []string, *os.File) (int, <-chan exitInfo, error) {
 		started = true
-		return 0, nil
+		return 0, nil, nil
 	}
 
 	if err := s.Connect(context.Background()); err == nil {

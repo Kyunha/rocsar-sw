@@ -132,6 +132,17 @@ var ErrAckTimeout = errors.New("pico: command was not acknowledged")
 // round trip is single-digit milliseconds. Half a second is generous enough to
 // absorb a scheduling delay on a busy Pi and short enough that a wedged device
 // is noticed while the operator is still watching.
+//
+// `zero` is the exception that sets the floor, and it is worth knowing about
+// before raising or lowering this. Teaching a servo its centre is the only
+// command that writes to hardware: it reads the position, writes the ST3215's
+// EEPROM with the vendor's 20 ms settle delay either side of each write, then
+// reads the register and the position back to prove the write took. That is
+// 100-250 ms of firmware time during which the control loop does not tick, and
+// the acknowledgement arrives at the end of it. The margin here is therefore
+// only about 2-5x, not the 50x every other command enjoys -- if a teach ever
+// grows (a second read-back, a retry), this is the constant that will start
+// firing, and the symptom will be a zero that succeeded and reported a timeout.
 const DefaultAckTimeout = 500 * time.Millisecond
 
 // frameTooLarge reports whether a frame exceeded the budget, for a clearer

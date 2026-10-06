@@ -34,6 +34,29 @@ message SdrParams {
   optional double bandwidth_hz = 6;
   optional uint32 session_duration_s = 7;
 
+  // The sweep window, the pre-burst delay and the antenna ports. These five
+  // keys were absent from the settable surface while config.hpp has always
+  // read all of them with j.at(), which made the file's own contract
+  // unreachable from an operator and left the capture geometry -- how wide the
+  // sweep is, how long after arm the first burst fires, which RF path is wired
+  // -- a hand edit on the aircraft.
+  //
+  // They are not decorative. config.hpp throws on start_offset_s <= 0 and on
+  // t_min_us >= t_max_us, so a value pair it refuses is a bricked SDR with no
+  // recovery except editing the file by hand. Per-key bounds cannot express the
+  // second of those, so internal/sdr checks the pair as well; see
+  // params_contract.go.
+  optional double t_min_us = 8;
+  optional double t_max_us = 9;
+  optional double start_offset_s = 10;
+
+  // Antenna ports are strings, not an enum: the legal set is whatever
+  // UHD::set_tx_antenna accepts on this radio and firmware, which is a question
+  // for the device and not for this schema. "TX/RX" is the monostatic default
+  // in the shipped file.
+  optional string tx_antenna = 11;
+  optional string rx_antenna = 12;
+
   // There is deliberately no pulse_duration field, and field numbers are packed
   // rather than leaving a hole at the number it would have taken.
   //

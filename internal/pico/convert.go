@@ -46,6 +46,7 @@ func telemetryToDomain(m *rocsarv1.PicoTelemetry, now time.Time) domain.PicoTele
 				Load:            a.GetLoad(),
 				TemperatureC:    a.GetTemperatureC(),
 				CenterTick:      a.GetCenterTick(),
+				CenterZeroed:    a.GetCenterZeroed(),
 				MountOffsetDeg:  float64(a.GetMountOffsetDeg()),
 				DirMultiplier:   float64(a.GetDirMultiplier()),
 				FeedbackState:   feedbackState(a.GetFeedbackState()),

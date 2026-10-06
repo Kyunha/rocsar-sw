@@ -22,7 +22,8 @@ func worstCaseSnapshot() telemetry.Snapshot {
 		axes = append(axes, domain.Axis{
 			ServoID: uint32(i), ManualMode: true, CurrentTick: 4095,
 			CurrentAngleDeg: -359.999, Load: -32768, TemperatureC: 32767,
-			CenterTick: 2048, MountOffsetDeg: -12.5, DirMultiplier: -1,
+			CenterTick: 2048, CenterZeroed: true,
+			MountOffsetDeg: -12.5, DirMultiplier: -1,
 			FeedbackState: domain.FeedbackHeld, FeedbackError: -32768,
 		})
 	}
@@ -53,7 +54,7 @@ func worstCaseSnapshot() telemetry.Snapshot {
 			GondolaHeadingDeg: 359.9999, TargetHeadingDeg: 180.0001,
 			Heater1State: true, Heater2State: true, IMUPresent: true,
 			ImuTemperatureC: 85.5,
-			Axes: axes, ObservedAt: now,
+			Axes:            axes, ObservedAt: now,
 		},
 		PicoAck: &domain.Ack{CommandSequence: 4294967295, Success: false, Error: domain.ErrHardwareFault},
 		SDR: telemetry.SDRSnapshot{
@@ -214,6 +215,13 @@ func TestSnapshotRoundTrip(t *testing.T) {
 	}
 	if back.Pico.Axes[0].FeedbackState != s.Pico.Axes[0].FeedbackState {
 		t.Errorf("feedback state changed: %v -> %v", s.Pico.Axes[0].FeedbackState, back.Pico.Axes[0].FeedbackState)
+	}
+	// True, not false. proto3 omits a false bool from the wire entirely, so a
+	// false value round-trips whether or not anyone wired the field up -- and this
+	// is the field that distinguishes a centred axis from an untaught one that
+	// reports the same 2048. Only the true case can fail.
+	if !back.Pico.Axes[0].CenterZeroed {
+		t.Error("center_zeroed lost across the round trip; a taught axis reads as untaught")
 	}
 	if back.Pico.ImuTemperatureC != s.Pico.ImuTemperatureC {
 		t.Errorf("imu temperature changed: %v -> %v", s.Pico.ImuTemperatureC, back.Pico.ImuTemperatureC)

@@ -81,6 +81,16 @@ type Sdr interface {
 	LastLog() string
 	LastOutput() string
 
+	// LastError is why the last acquisition is not running, or "" if it is
+	// running or completed cleanly.
+	//
+	// Added because the field existed everywhere else and was populated
+	// nowhere: SDRSnapshot and the wire both had a last_error, the encoder
+	// copied it, and no provider ever filled it in, so an acquisition that had
+	// crashed read as an idle SDR with a PID. A death the operator caused and a
+	// death nobody caused are different facts and both are worth reporting.
+	LastError() string
+
 	// Probe returns uhd_usrp_probe output verbatim.
 	Probe(ctx context.Context) (string, error)
 	// ResetUSB power-cycles the SDR's USB port.
@@ -94,6 +104,12 @@ type Sdr interface {
 // This is a frozen contract with the vendored C++ program. A value it cannot
 // use is a bricked SDR, not a runtime error, which is why SetParams validates
 // before it writes.
+//
+// Every key load_config() reads with j.at() is modelled here. That includes
+// PulseDurationS, which the program does NOT read: config.hpp has that line
+// commented out, so it is carried as data and never offered as a control. The
+// three keys below the antenna pair are the sweep window and the arming delay,
+// and they were read by the program while being unreachable from any operator.
 type SdrParams struct {
 	PRFHz            float64 `json:"PRF"`
 	SampleRateHz     float64 `json:"FS"`
@@ -105,6 +121,12 @@ type SdrParams struct {
 	SessionDurationS uint32  `json:"SESSION_DURATION"`
 	TxAntenna        string  `json:"TX_ANTENNA"`
 	RxAntenna        string  `json:"RX_ANTENNA"`
+	// SweepWindowUs is [T_MIN_US, T_MAX_US]: the burst window the program
+	// sweeps inside each PRI, in microseconds. T_MIN_US is 0 in the shipped
+	// file, meaning the burst starts at the leading edge.
+	SweepMinUs   float64 `json:"T_MIN_US"`
+	SweepMaxUs   float64 `json:"T_MAX_US"`
+	StartOffsetS float64 `json:"START_OFFSET_S"`
 }
 
 // SdrParamsPatch is a partial update. A nil pointer means "leave it alone".
@@ -119,6 +141,11 @@ type SdrParamsPatch struct {
 	NormalizedGainRx *float64
 	BandwidthHz      *float64
 	SessionDurationS *uint32
+	TxAntenna        *string
+	RxAntenna        *string
+	SweepMinUs       *float64
+	SweepMaxUs       *float64
+	StartOffsetS     *float64
 }
 
 // LinkShaper is the kernel traffic control interface.

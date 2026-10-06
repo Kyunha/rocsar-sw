@@ -70,12 +70,11 @@ Consequences that follow, and are not revisited:
 surface, and three requirements come with it. They are stated here because
 they constrain the toolkit more than anything else in this document.
 
-1. **Offline, always.** No network at runtime. The operating area's tiles are
-   bundled into the binary as a single `pmtiles` archive
-   (`frontend/pmtiles/porto.pmtiles` exists as a placeholder). A tile server, a
-   CDN, and a `fetch()` to the open internet are all equally wrong: the console
-   runs on a laptop that may be in a field, on a plane, or on a ship. The
-   archive is embedded, not fetched.
+1. **Offline, always.** No network at runtime. The basemap is bundled into the
+   binary as GeoJSON assets (`cmd/gs/frontend/public/geojson/`, committed). A
+   tile server, a CDN, and a `fetch()` to the open internet are all equally
+   wrong: the console runs on a laptop that may be in a field, on a plane, or
+   on a ship. The assets are embedded, not fetched.
 2. **Interactive.** The operator clicks a point on the map to command the
    antennas to point at it. This is not a future nicety — it is the primary
    input method for the console's most common action. The map must report
@@ -86,13 +85,46 @@ they constrain the toolkit more than anything else in this document.
    CSS-heavy. An engine that mis-renders it is not a console. This is the
    requirement the current WebKitGTK shell fails.
 
-**`pmtiles` is a JavaScript-first format.** Its reference implementation and
-its ecosystem are JavaScript: MapLibre GL JS and Leaflet both load it directly
-from a local file or an embedded asset, with no server. There is no maintained
-Go renderer — `protomaps/go-pmtiles` is a server, not a renderer. **The map
-must be drawn by a browser engine.** This is the constraint that decides the
-toolkit question, and it is why every Go-native option below is rejected
-regardless of its other merits.
+**The map must be drawn by a browser engine.** MapLibre GL JS renders vector
+data through WebGL and Web Workers, and no Go-native toolkit reproduces it.
+This is the constraint that decides the toolkit question, and it is why every
+Go-native option below is rejected regardless of its other merits.
+
+#### 1.2.1 The basemap: Natural Earth 50m GeoJSON
+
+The requirement is *low-detail geographic context* — rivers, lakes, coastlines
+and mountains at a regional scale — not a street basemap. Two datasets were
+measured against that requirement:
+
+| Dataset | Size (gzip) | Rivers | Lakes | Mountains | Verdict |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **Natural Earth 10m** | 21.4 MB | 1 in Portugal | **0 in Portugal** | **0 in Portugal** | **Rejected.** Bigger than anything else and delivers no Portuguese hydrography or peaks. |
+| **Natural Earth 50m** | **1.5 MB** | 462 | 405 | 127 ranges, 76 summits | **Chosen.** |
+| Natural Earth 110m | 0.29 MB | 13 | 25 | 10 ranges, 12 summits | Fallback if 50m proves too detailed a look. |
+| OpenMapTiles pmtiles | 2.5 MB (Porto only) | street-scale | yes | terrain | Replaced: a real operating-area extract is far larger, and the requirement is context, not streets. |
+
+50m was chosen because 10m — the scale that *sounds* most detailed — has no
+lakes and no mountains anywhere in Portugal, while costing 14× more. The
+detail that matters is coverage of the operating area, not the nominal scale.
+
+The assets are produced by `scripts/fetch-basemap.py`, which downloads the
+upstream GeoJSON, rounds coordinates to 6 dp (the linework is generalised;
+14-digit precision is noise), and filters `geography_regions_polys` to
+`featurecla == "Range/mtn"` — 127 of its 514 features are mountains, and
+shipping island groups and deserts to draw mountains would be paying 3 MB for
+map never rendered. That filter turns a 10.4 MB file into 78 KB gzipped. The
+script writes pre-compressed `.json.gz`; `cmd/gs/bridge.go` serves them with
+`Content-Encoding: gzip`, so the bytes embedded in the binary are the
+compressed ones and the frontend still reads plain JSON URLs.
+
+Natural Earth is **public domain** (`naturalearthdata.com/about/terms-of-use`),
+which removes the attribution obligation a tile basemap would carry.
+
+**Recorded limitation.** Natural Earth has no terrain, no hillshade, no
+contours, and no dedicated mountain file. Mountains exist only as range
+*outlines* (coarse polygons) and named summit *points* with metre elevations.
+If visual relief is ever required, it is a raster hillshade layer, which is a
+new asset and a new decision — not a change to this one.
 
 ### 1.3 Toolkit options
 
@@ -530,6 +562,16 @@ before the first event.
 
 **SDR** — `SdrProbe()`, `SdrGetParams()`, `SdrConnect()`, `SdrResetUSB()`, `SetSdrParams(patch)`
 
+`SetSdrParams` names every key `connect.cpp` reads with `j.at()`, which is the
+whole point of it: the sweep window (`t_min_us`, `t_max_us`), the arming delay
+(`start_offset_s`) and the two RF paths (`tx_antenna`, `rx_antenna`) were read
+by the program while being unreachable from the window, so the geometry of a
+capture was a hand edit to `params.json` on the aircraft. They are inputs here
+like the rest, blank still meaning "leave alone". `PULSE_DURATION` is
+deliberately absent and must stay so: `config.hpp` has its read commented out,
+so a control for it would save a value the program never looks at. See
+`ARCHITECTURE.md` §6.4 for the bounds and the one cross-field check.
+
 **Link** — `SetLinkLimit(kbit)`
 
 **Artefacts** — `ListArtefacts(path)`, `DownloadArtefact(name, destPath)`,
@@ -617,8 +659,19 @@ their age is displayed alongside them.
 ## 10. Command safety
 
 Motion commands — `Jog`, `SetHeading`, `Mount`, `SetDirection`, `Stop`,
-`SetHeater` — require an explicit confirmation step. Non-motion commands
-(`QueryStatus`, `TakePhoto`, `Probe`, `SelectReceiver`, `SetLinkLimit`) do not.
+`SetHeater`, `ZeroServo`, `ZeroAll` — require an explicit confirmation step.
+Non-motion commands (`QueryStatus`, `TakePhoto`, `Probe`, `SelectReceiver`,
+`SetLinkLimit`) do not.
+
+`ZeroServo` and `ZeroAll` were missing from this list while the code already
+gated both, and they are listed now on their own merits rather than as a
+correction: `zero` writes a position offset into the servo's own EEPROM, which is
+a write to hardware that outlives the board's power and outlives a reflash. It
+does not *move* the axis — a teach relabels the tick the axis is already sitting
+at — so it is not motion in the sense the rest of this list is about, but it is
+durable and it is deliberate, and the confirmation is where an operator should be
+told so. The prompt says exactly that, rather than implying the axis will return
+somewhere.
 
 **This is a decision against precedent in this repository, and the precedent is
 recorded.** `tools/gs_cli/main.go:190`:

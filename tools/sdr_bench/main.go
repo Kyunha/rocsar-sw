@@ -106,6 +106,7 @@ set accepts: PRF FS TX_FREQ BW NORMALIZED_GAIN_TX NORMALIZED_GAIN_RX SESSION_DUR
 
   sdr_bench set PRF=3000
   sdr_bench set TX_FREQ=5.7e9 BW=40e6
+  sdr_bench set T_MAX_US=400 START_OFFSET_S=0.25 TX_ANTENNA=TX/RX
 
 Anything not named is left alone. PULSE_DURATION is not accepted: config.hpp
 does not read it, so setting it would do nothing and appear to work.
@@ -271,6 +272,24 @@ func set(ctx context.Context, svc *sdr.Service, args []string) error {
 		}
 		seen[k] = true
 
+		// Antenna ports are RF path names, so they are handled before the
+		// numeric path and its ParseFloat would reject "TX/RX" as a typo.
+		// There is nothing to validate against: the legal set belongs to
+		// UHD::set_tx_antenna on this radio and firmware, and the C++ is what
+		// will refuse an invalid one.
+		if k == "TX_ANTENNA" || k == "RX_ANTENNA" {
+			s := strings.TrimSpace(v)
+			if s == "" {
+				return fmt.Errorf("%s cannot be set to an empty string; UHD would reject it", k)
+			}
+			if k == "TX_ANTENNA" {
+				patch.TxAntenna = &s
+			} else {
+				patch.RxAntenna = &s
+			}
+			continue
+		}
+
 		if key.Min == 0 && key.Max == 0 {
 			return fmt.Errorf("%s is not a settable numeric parameter", k)
 		}
@@ -303,6 +322,12 @@ func set(ctx context.Context, svc *sdr.Service, args []string) error {
 				return fmt.Errorf("SESSION_DURATION must be a whole number of seconds, got %g", f)
 			}
 			patch.SessionDurationS = &n
+		case "T_MIN_US":
+			patch.SweepMinUs = &f
+		case "T_MAX_US":
+			patch.SweepMaxUs = &f
+		case "START_OFFSET_S":
+			patch.StartOffsetS = &f
 		default:
 			return fmt.Errorf("%s is bounded but not settable in this build", k)
 		}

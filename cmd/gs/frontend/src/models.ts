@@ -34,6 +34,18 @@ export interface SdrParamsPatch {
     normalized_gain_rx?: number;
     bandwidth_hz?: number;
     session_duration_s?: number;
+    /* The burst window and the arming delay. Together with the antenna ports
+     * these complete the set of params.json keys connect.cpp actually reads:
+     * before they existed the console could change the radio's tuning and gain
+     * but not the shape of the sweep it flies. */
+    t_min_us?: number;
+    t_max_us?: number;
+    start_offset_s?: number;
+    /* RF path names, not enums. UHD decides what is legal on this radio and
+     * firmware, so these are passed through as written and the operator sees
+     * whatever the program says if it refuses. */
+    tx_antenna?: string;
+    rx_antenna?: string;
 }
 
 export interface SystemView {
@@ -69,6 +81,10 @@ export interface AxisView {
     load: number | null;
     temperature_c: number | null;
     center_tick: number;
+    // Whether this servo has been taught its centre. False means center_tick is
+    // the built-in assumption (2048) rather than a measurement -- and the two are
+    // otherwise indistinguishable on screen, which is the reason the bit exists.
+    center_zeroed: boolean;
     mount_offset_deg: number;
     dir_multiplier: number;
     feedback: string;

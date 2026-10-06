@@ -58,11 +58,15 @@ type Service struct {
 
 	// runner is injected so the whole service is testable without a USB device.
 	runner func(ctx context.Context, dir, name string, args []string) (stdout string, err error)
-	start  func(ctx context.Context, dir, name string, args []string, out *os.File) (pid int, err error)
+	// start is injected for the same reason, and it also has to report when the
+	// child is reaped: see exitInfo and watchExit for why the PID alone is not
+	// enough to know whether an acquisition is still alive.
+	start func(ctx context.Context, dir, name string, args []string, out *os.File) (pid int, exited <-chan exitInfo, err error)
 
 	mu        sync.Mutex
 	pid       int
 	running   bool
+	stopping  bool
 	startedAt time.Time
 	lastLog   string
 	lastErr   string
@@ -263,6 +267,27 @@ func checkRequired(raw map[string]any) error {
 	return fmt.Errorf("%w: %s", ErrMissingKeys, strings.Join(missing, ", "))
 }
 
+// checkSweepWindow enforces the constraint that no per-key range can express.
+//
+// config.hpp throws "T_MIN_US must be less than T_MAX_US" from inside main(),
+// before any radio is initialised. Writing a file that trips it is the worst
+// outcome available: the SDR is not merely wrong, it will not start, and the
+// only recovery is editing params.json by hand on the aircraft.
+//
+// The check runs on the merged result rather than on the incoming patch,
+// because the usual edit moves one edge and reads the other from the file --
+// setting T_MAX_US to 50 with a shipped T_MIN_US of 0 is a valid request, and
+// setting it to 0 is not. Checking the patch alone would catch neither reliably
+// and would miss the second entirely.
+func checkSweepWindow(p domain.SdrParams) error {
+	if p.SweepMinUs < p.SweepMaxUs {
+		return nil
+	}
+	return fmt.Errorf("%w: T_MIN_US (%g us) must be less than T_MAX_US (%g us); "+
+		"connect.cpp throws on this at startup, before any radio is initialised",
+		ErrInvalidParams, p.SweepMinUs, p.SweepMaxUs)
+}
+
 // ErrMissingKeys is returned when params.json lacks a key the C++ requires.
 var ErrMissingKeys = errors.New("sdr: params.json is missing keys that connect.cpp requires")
 
@@ -290,6 +315,9 @@ func (s *Service) SetParams(ctx context.Context, patch domain.SdrParamsPatch) er
 		{"NORMALIZED_GAIN_TX", patch.NormalizedGainTx, func(f float64) { current.NormalizedGainTx = f }},
 		{"NORMALIZED_GAIN_RX", patch.NormalizedGainRx, func(f float64) { current.NormalizedGainRx = f }},
 		{"BW", patch.BandwidthHz, func(f float64) { current.BandwidthHz = f }},
+		{"T_MIN_US", patch.SweepMinUs, func(f float64) { current.SweepMinUs = f }},
+		{"T_MAX_US", patch.SweepMaxUs, func(f float64) { current.SweepMaxUs = f }},
+		{"START_OFFSET_S", patch.StartOffsetS, func(f float64) { current.StartOffsetS = f }},
 	} {
 		if v.ptr == nil {
 			continue
@@ -306,6 +334,22 @@ func (s *Service) SetParams(ctx context.Context, patch domain.SdrParamsPatch) er
 		current.SessionDurationS = *patch.SessionDurationS
 	}
 
+	// Antenna ports are strings, so ValidateValue has nothing to say about them:
+	// it takes a float64 and the legal set belongs to UHD, not to this package.
+	// They are carried through as written.
+	if patch.TxAntenna != nil {
+		current.TxAntenna = *patch.TxAntenna
+	}
+	if patch.RxAntenna != nil {
+		current.RxAntenna = *patch.RxAntenna
+	}
+
+	// The pair check has to run on the RESULT, not on the patch, because only one
+	// half is usually being changed and the other half comes from the file.
+	if err := checkSweepWindow(current); err != nil {
+		return err
+	}
+
 	// Overlay onto the file as it stands. Absent from the overlay means absent
 	// from the patch means "leave alone", and every key we do not name is
 	// carried through untouched.
@@ -316,6 +360,11 @@ func (s *Service) SetParams(ctx context.Context, patch domain.SdrParamsPatch) er
 	raw["NORMALIZED_GAIN_RX"] = current.NormalizedGainRx
 	raw["BW"] = current.BandwidthHz
 	raw["SESSION_DURATION"] = current.SessionDurationS
+	raw["T_MIN_US"] = current.SweepMinUs
+	raw["T_MAX_US"] = current.SweepMaxUs
+	raw["START_OFFSET_S"] = current.StartOffsetS
+	raw["TX_ANTENNA"] = current.TxAntenna
+	raw["RX_ANTENNA"] = current.RxAntenna
 
 	// The whole file is rewritten, so the diff is the whole file.
 	//
@@ -357,12 +406,17 @@ func (s *Service) SetParams(ctx context.Context, patch domain.SdrParamsPatch) er
 // half-written files and an unusable device, so the refusal names the process
 // rather than just declining.
 func (s *Service) Connect(ctx context.Context) error {
+	// The refusal tests the flag, not the PID. Both used to be tested, and the
+	// PID half was what made this permanent: signal 0 succeeds against an
+	// unreaped child, so a crashed acquisition held the device for the rest of
+	// the OBC's life. watchExit owns the flag and clears it when the child is
+	// reaped, so this is now released by the child's death and nothing else.
 	s.mu.Lock()
-	if s.running && s.pid > 0 && processAlive(s.pid) {
-		held := s.pid
+	if s.running {
+		held, since := s.pid, s.startedAt
 		s.mu.Unlock()
 		return fmt.Errorf("%w: pid %d since %s", ErrAlreadyRunning, held,
-			s.startedAt.Format(time.RFC3339))
+			since.Format(time.RFC3339))
 	}
 	s.mu.Unlock()
 
@@ -393,7 +447,7 @@ func (s *Service) Connect(ctx context.Context) error {
 	// (Data/rx_data_<time>.bin), so the directory is load-bearing even though
 	// the binary itself now comes from PATH. Inheriting the OBC's own directory
 	// would put every capture somewhere the HTTP listing does not serve.
-	pid, err := s.start(ctx, s.programDir, program, nil, f)
+	pid, exited, err := s.start(ctx, s.programDir, program, nil, f)
 	if err != nil {
 		_ = f.Close()
 		return fmt.Errorf("sdr: start %s: %w", program, err)
@@ -403,12 +457,18 @@ func (s *Service) Connect(ctx context.Context) error {
 	s.mu.Lock()
 	s.pid = pid
 	s.running = true
+	s.stopping = false
 	s.startedAt = time.Now()
 	s.lastLog = logPath
 	s.lastErr = ""
 	s.lastOut = ""
 	s.state = domain.SubsystemBusy
 	s.mu.Unlock()
+
+	// One watcher per acquisition, and it is the only thing that turns the child
+	// dying into a state change. Started after the state above is published, so
+	// the goroutine cannot observe the new PID as unset.
+	go s.watchExit(pid, exited)
 
 	// program and cwd are both logged, and they are different facts. The binary
 	// may have come from /usr/local/bin while its configuration came from a
@@ -421,22 +481,16 @@ func (s *Service) Connect(ctx context.Context) error {
 
 // Running reports whether an acquisition started by this service is alive.
 //
-// Checked with a signal-0 probe rather than trusting the recorded PID: the
-// process may have finished, crashed, or been killed, and a stale `running`
-// flag means every subsequent Connect is refused with "already running".
+// A plain read of the flag watchExit maintains, and deliberately NOT a
+// signal-0 probe. The probe used to be the only thing that could notice a dead
+// child, which meant the answer depended on the child having been reaped, and
+// nothing reaped it -- see startDetached. Making the watcher the single writer
+// removes the dependency entirely: the flag is true exactly while the child is
+// alive, whether or not anyone has got round to collecting it.
 func (s *Service) Running() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
-	if !s.running {
-		return false
-	}
-	alive := s.pid > 0 && processAlive(s.pid)
-	if !alive && s.state == domain.SubsystemBusy {
-		s.state = domain.SubsystemReady
-	}
-	s.running = alive
-	return alive
+	return s.running
 }
 
 func (s *Service) PID() int64 {
@@ -455,6 +509,16 @@ func (s *Service) LastOutput() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.lastOut
+}
+
+// LastError is the reason the last acquisition is not running, or "" if none.
+//
+// Cleared at the start of every Connect and written only by watchExit, so it
+// always describes the run the PID names rather than some older one.
+func (s *Service) LastError() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lastErr
 }
 
 // Probe returns uhd_usrp_probe output verbatim.
@@ -492,6 +556,12 @@ func (s *Service) State() domain.SubsystemState {
 func (s *Service) Stop(ctx context.Context) error {
 	s.mu.Lock()
 	pid := s.pid
+	// Marked before the signal so watchExit can tell a stop we asked for from a
+	// death nobody caused. Without it, every deliberate stop reports
+	// "killed by terminated" as a failure.
+	if s.running {
+		s.stopping = true
+	}
 	s.mu.Unlock()
 
 	if pid <= 0 || !processAlive(pid) {
@@ -547,12 +617,33 @@ func runCommand(ctx context.Context, dir, name string, args []string) (string, e
 }
 
 // startDetached starts a long-running process and returns its PID without
-// waiting.
+// waiting, plus a channel that receives once the process has been reaped.
 //
 // The child is put in its own process group so a Ctrl-C on the OBC's console
 // does not take the acquisition down mid-capture, and its stdio is redirected to
 // the log file rather than inherited.
-func startDetached(ctx context.Context, dir, name string, args []string, out *os.File) (int, error) {
+//
+// # Why this reaps, which the first version did not
+//
+// The first version called Start and returned the PID, and nothing ever called
+// Wait. On Linux that leaves the child a ZOMBIE the moment it exits, and
+// processAlive cannot tell a zombie from a running acquisition: signal 0
+// succeeds against a zombie because the PID is still in the process table, so
+// the existence check that is supposed to release Connect never released it.
+//
+// The observed failure was that one crashed connect -- a UHD error, or a
+// session that ended -- made every subsequent sdr-connect refuse with "an
+// acquisition is already running: pid N since <the original start time>", for
+// the remaining life of the OBC process. The refusal names the right PID and
+// the right time and both of them were true, which is what made it read as a
+// real acquisition rather than a bug.
+//
+// Wait() in a goroutine is the whole fix: it reaps the child at the instant it
+// exits, so the PID disappears from the table and processAlive is honest again.
+// The channel is buffered so the goroutine can finish and release its resources
+// even if nobody is reading by then, which is the case whenever the OBC is
+// shutting down.
+func startDetached(ctx context.Context, dir, name string, args []string, out *os.File) (int, <-chan exitInfo, error) {
 	cmd := exec.Command(name, args...)
 	cmd.Dir = dir
 	cmd.Stdout = out
@@ -561,7 +652,93 @@ func startDetached(ctx context.Context, dir, name string, args []string, out *os
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	if err := cmd.Start(); err != nil {
-		return 0, err
+		return 0, nil, err
 	}
-	return cmd.Process.Pid, nil
+
+	pid := cmd.Process.Pid
+	exited := make(chan exitInfo, 1)
+	go func() {
+		exited <- exitInfo{pid: pid, err: cmd.Wait()}
+	}()
+	return pid, exited, nil
+}
+
+// exitInfo is the result of reaping one acquisition.
+//
+// Err is nil for a clean exit, which is the NORMAL case and not a failure:
+// connect computes total_pulses as session_duration * PRF and returns when the
+// session is over. Reading a non-nil Err as "the run went wrong" and a nil Err
+// as "it never started" are both wrong, so both are distinguished here rather
+// than inferred from a PID.
+type exitInfo struct {
+	pid int
+	err error
+}
+
+// watchExit is the single writer of the death transition.
+//
+// Everything about a dead acquisition flows from here: the running flag, the
+// state, and the last error. That is deliberate. The previous design inferred
+// all of it from a signal-0 probe inside Running(), which is why a dead child
+// stayed BUSY forever -- the probe had a zombie to look at.
+//
+// The pid guard is load-bearing. Two acquisitions cannot overlap, but a reap
+// that lands after the operator has already started a new one must not
+// overwrite the new one's state with the old one's exit; without it, a connect
+// refused for one slow reap would show the previous run's error and report the
+// new one as not running.
+func (s *Service) watchExit(pid int, exited <-chan exitInfo) {
+	info := <-exited
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.pid != pid {
+		return // a newer acquisition owns the state now
+	}
+
+	s.running = false
+	switch {
+	case s.stopping:
+		// We asked for this. A deliberate Stop is not a failure and must not
+		// leave the operator looking at an error they caused on purpose.
+		s.lastErr = ""
+		s.state = domain.SubsystemReady
+		s.log.Info("SDR acquisition stopped", "pid", pid, "log", s.lastLog)
+	case info.err == nil:
+		// A session that ran to completion. Ready, and no error: the operator
+		// asked for session_duration seconds and got them. connect computes
+		// total_pulses as session_duration * PRF and returns when it is done,
+		// so this is the ordinary end of a capture rather than an event.
+		s.lastErr = ""
+		s.state = domain.SubsystemReady
+		s.log.Info("SDR acquisition finished", "pid", pid,
+			"ran_for", time.Since(s.startedAt).Round(time.Millisecond).String(),
+			"log", s.lastLog)
+	default:
+		s.lastErr = fmt.Sprintf("connect (pid %d) exited: %s; see %s",
+			pid, exitReason(info.err), s.lastLog)
+		s.state = domain.SubsystemError
+		s.log.Error("SDR acquisition failed", "pid", pid, "err", info.err, "log", s.lastLog)
+	}
+}
+
+// exitReason renders a Wait error as one clause.
+//
+// exec.ExitError's own string is "exit status 1" or "signal: killed", which
+// reads as a fragment when it lands mid-sentence in the last_error field. A
+// non-zero exit code and a signal are also different facts to an operator: the
+// first is the program giving up, the second is something killing it.
+func exitReason(err error) string {
+	var ee *exec.ExitError
+	if errors.As(err, &ee) {
+		if status, ok := ee.Sys().(syscall.WaitStatus); ok {
+			if status.Signaled() {
+				return fmt.Sprintf("killed by %s", status.Signal())
+			}
+			return fmt.Sprintf("exit status %d", status.ExitStatus())
+		}
+		return ee.Error()
+	}
+	return err.Error()
 }

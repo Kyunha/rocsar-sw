@@ -17,14 +17,12 @@ __pycache__/
 .ruff_cache/
 .mypy_cache/
 
-# Wails generates these at build time (wails build / wails dev), like the Go
-# protobuf bindings above. A bare `npm run build` does not regenerate them, so
-# the frontend builds only through wails -- which is the only supported path.
-cmd/gs/build/bin/
+# Frontend build output. `npm run build` (tsc + vite) regenerates dist/ from
+# src/ and public/; the committed public/geojson basemap is copied in, not
+# generated here.
 cmd/gs/frontend/dist/*
 !cmd/gs/frontend/dist/.gitkeep
 cmd/gs/frontend/node_modules/
-cmd/gs/frontend/wailsjs/
 
 # Per-machine config overrides rocsar.toml
 rocsar.local.toml
@@ -32,8 +30,9 @@ rocsar.local.toml
 # Runtime data
 /data/
 
-# Map tile data: large binary blob, not code. The frontend copy is embedded by
-# Wails at build time; the root copy is a duplicate for offline use.
+# Legacy pmtiles basemap, replaced by the committed Natural Earth GeoJSON in
+# cmd/gs/frontend/public/geojson (see scripts/fetch-basemap.py). Ignored so any
+# local copy left behind never lands in a commit.
 /pmtiles/
 cmd/gs/frontend/pmtiles/
 

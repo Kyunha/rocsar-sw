@@ -23,12 +23,27 @@ enum ErrorCode {
   ERROR_HARDWARE_FAULT = 7;
   ERROR_INTERNAL = 8;
 
-  // ERROR_BUSY / NOT_READY were defined at 9..13 in an earlier draft and are
+  // Teaching a servo its centre is the one operation that writes to hardware we
+  // do not own, and it can half-fail: the EEPROM write lands but the servo does
+  // not report the position we asked for. That is a materially different fact
+  // from a dead servo on the bus -- ERROR_HARDWARE_FAULT covers "nothing
+  // answered", and no write was attempted -- because here the servo's internal
+  // zero may now hold a partial change and the operator has to know before
+  // flying. Re-running `zero` converges, so this is recoverable, not fatal.
+  //
+  // This takes the reservation off deliberately, which is what the reservation
+  // existed to require. The draft's 9 was ERROR_BUSY, a different fact that
+  // nothing ever produced, so a stale generated host would render the wrong
+  // *name* for this failure -- and no host acts on it: the decision keys off
+  // CommandResponse.success, not off this enum.
+  ERROR_CALIBRATION_FAILED = 9;
+
+  // ERROR_BUSY / NOT_READY were defined at 10..13 in an earlier draft and are
   // reserved rather than deleted. Nothing ever produced or read them -- there
   // is no code path that reports "busy" -- and reserving the numbers means a
   // future author who wants one must take the reservation off deliberately
   // instead of silently reusing a value a deployed host may already parse.
-  reserved 9 to 13;
+  reserved 10 to 13;
 }
 
 // Whether the three servo feedback fields above it are a measurement.
@@ -105,4 +120,19 @@ message AntennaTelemetry {
   // frame while reporting overheat or an overloaded regulator. This byte used
   // to be parsed by nothing and discarded, so a servo in trouble read clean.
   int32 feedback_error = 11;
+
+  // Whether this servo's internal zero has been taught and verified.
+  //
+  // The servo holds its own centre now: `zero` writes a position offset into
+  // the ST3215's EEPROM so the encoder reports 2048 at the airframe boresight,
+  // and the firmware verifies both the register and the resulting position
+  // before saying so. This bit rides the wire because the servo cannot report
+  // it itself -- a servo taught while sitting at exactly 2048 has a stored
+  // offset of zero, which is indistinguishable from a servo never taught.
+  //
+  // False on a freshly flashed servo, which is the normal state of a new axis.
+  // The firmware still aims, using the 2048 default; this bit is what tells an
+  // operator the centre is assumed rather than measured. Absence is not zero:
+  // do not render an untaught axis as if it were centred.
+  bool center_zeroed = 12;
 }

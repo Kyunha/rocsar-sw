@@ -112,11 +112,11 @@ type PositionView struct {
 // not "all zero": populating a zeroed block on a silent link is precisely how
 // a console shows a healthy-looking 0 for a motor that has not moved.
 type PicoView struct {
-	GondolaHeadingDeg float64    `json:"gondola_heading_deg"`
-	TargetHeadingDeg  float64    `json:"target_heading_deg"`
-	Heater1On         bool       `json:"heater1_on"`
-	Heater2On         bool       `json:"heater2_on"`
-	IMU               string     `json:"imu"`
+	GondolaHeadingDeg float64 `json:"gondola_heading_deg"`
+	TargetHeadingDeg  float64 `json:"target_heading_deg"`
+	Heater1On         bool    `json:"heater1_on"`
+	Heater2On         bool    `json:"heater2_on"`
+	IMU               string  `json:"imu"`
 	// ImuTemperatureC is the BNO055 die temperature in degrees Celsius. Nil
 	// unless the IMU is present (measured): a held value is the last reading,
 	// and showing it as a measurement repeats the held-bearing trap this
@@ -137,9 +137,14 @@ type AxisView struct {
 	Load            *int32  `json:"load"`
 	TemperatureC    *int32  `json:"temperature_c"`
 	CenterTick      uint32  `json:"center_tick"`
-	MountOffsetDeg  float64 `json:"mount_offset_deg"`
-	DirMultiplier   float64 `json:"dir_multiplier"`
-	Feedback        string  `json:"feedback"`
+	// Whether this servo has been taught its centre. False means CenterTick is an
+	// assumption -- the default 2048 -- and not something anyone measured. The
+	// console has to say which, because an untaught axis and a centred one report
+	// the same number and differ only here.
+	CenterZeroed   bool    `json:"center_zeroed"`
+	MountOffsetDeg float64 `json:"mount_offset_deg"`
+	DirMultiplier  float64 `json:"dir_multiplier"`
+	Feedback       string  `json:"feedback"`
 	// FeedbackError names the ST3215 fault (overheat, overload) when the servo
 	// reports one while answering perfectly well-formed frames. Nil when the
 	// servo reports no fault: a servo in trouble otherwise reads clean.
@@ -272,6 +277,7 @@ func buildPico(p domain.PicoTelemetry) *PicoView {
 			CurrentTick:     a.CurrentTick,
 			CurrentAngleDeg: a.CurrentAngleDeg,
 			CenterTick:      a.CenterTick,
+			CenterZeroed:    a.CenterZeroed,
 			MountOffsetDeg:  a.MountOffsetDeg,
 			DirMultiplier:   a.DirMultiplier,
 			Feedback:        feedbackName(a.FeedbackState),

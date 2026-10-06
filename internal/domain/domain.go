@@ -215,10 +215,19 @@ type Axis struct {
 	Load            int32
 	TemperatureC    int32
 	CenterTick      uint32
-	MountOffsetDeg  float64
-	DirMultiplier   float64
-	FeedbackState   FeedbackState
-	FeedbackError   int32
+	// Whether the flight controller has taught this servo its own centre.
+	//
+	// The centre tick lives in the ST3215's EEPROM, so the firmware cannot read
+	// it back out on demand -- and an axis taught while sitting at exactly 2048
+	// stores a zero offset, which is indistinguishable from an axis never taught.
+	// This bit is therefore the only record that a centre was ever established,
+	// and CenterTick is an assumption rather than a measurement while it is
+	// false.
+	CenterZeroed   bool
+	MountOffsetDeg float64
+	DirMultiplier  float64
+	FeedbackState  FeedbackState
+	FeedbackError  int32
 }
 
 // PicoTelemetry is the flight controller's 50 Hz report.
@@ -240,7 +249,7 @@ type PicoTelemetry struct {
 	// must be read as "no measurement" via IMUPresent -- the same absence
 	// discipline as GondolaHeadingDeg.
 	ImuTemperatureC float64
-	ObservedAt time.Time
+	ObservedAt      time.Time
 }
 
 // Photo is a captured image on disk, not in memory.
