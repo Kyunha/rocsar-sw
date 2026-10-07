@@ -167,6 +167,35 @@ func TestReceiverWithoutAFixCarriesNoAge(t *testing.T) {
 	}
 }
 
+// Measured throughput is optional, and absent must survive the codec as absent.
+//
+// Collapsing a nil to 0 would tell the console the link is idle in exactly the
+// cases where no measurement was taken -- the first tick, an unreadable counter,
+// or an interface reset -- which is the §7.1 distinction the console draws as
+// "no reading" rather than a bar of length zero.
+func TestMeasuredThroughputIsOptionalOnTheWire(t *testing.T) {
+	s := worstCaseSnapshot()
+	s.Link.MeasuredTxKbps = nil
+	s.Link.MeasuredRxKbps = nil
+
+	f := transport.EncodeTelemetry(s)
+	if f.GetLink().MeasuredTxKbps != nil || f.GetLink().MeasuredRxKbps != nil {
+		t.Fatalf("an absent measurement became present on the wire: %v/%v",
+			f.GetLink().MeasuredTxKbps, f.GetLink().MeasuredRxKbps)
+	}
+
+	tx, rx := uint32(46), uint32(0)
+	s.Link.MeasuredTxKbps, s.Link.MeasuredRxKbps = &tx, &rx
+	f = transport.EncodeTelemetry(s)
+	if f.GetLink().GetMeasuredTxKbps() != 46 {
+		t.Fatalf("measured tx lost on the wire: %v", f.GetLink().MeasuredTxKbps)
+	}
+	// A measured zero is a reading -- an idle link -- and must stay present.
+	if f.GetLink().MeasuredRxKbps == nil || f.GetLink().GetMeasuredRxKbps() != 0 {
+		t.Fatalf("a measured 0 kbit/s must stay present on the wire: %v", f.GetLink().MeasuredRxKbps)
+	}
+}
+
 // Mocked subsystems must be visible on the wire, not only in a log. A system
 // that fabricated telemetry because a device was not found is the worst failure
 // mode this project has.

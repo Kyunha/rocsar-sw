@@ -125,14 +125,16 @@ rocsar/
 ├── third_party/
 │   ├── Read_uB/             ← vendored, unmodified. §10.
 │   └── sdr-ettus-b200mini/  ← vendored, unmodified. §10.
-├── gs/                      ← Python: generated protobuf stubs only (§14)
 ├── tools/                   ← gs_cli (the GS console), camera_bench, gs_probe
 └── test/                    ← architecture boundary tests
 ```
 
-Generated Python code is committed (`gs/rocsar/v1/*_pb2.py`) so that a Python
-subscriber can be installed on an operator laptop without a toolchain. The Ground
-Station itself is Go and needs no generated code at runtime.
+The Python Ground Station is **gone**. `gs/` (generated `*_pb2.py` stubs) and
+`tools/gs_probe.py` were deleted with it, and the `buf` Python target was removed
+from `buf.gen.yaml`. That target was the only build step that needed the network,
+and nothing read its output once the Python console was deleted; the generation
+pipeline is now fully offline (§4.3). The Ground Station is Go and needs no
+generated code at runtime.
 
 `NOTES.md` and `README.md` are listed in earlier revisions of this document and do
 not exist. The binary contracts they were meant to hold are in `firmware/` (§4.4)
@@ -223,12 +225,16 @@ already uses, deliberately: `sequence` + `timestamp_us` + a `oneof` of
 
 ```
 buf generate
-  ├── go       → api/rocsar/v1/*.pb.go            (OBC)
-  └── python   → gs/rocsar/v1/*_pb2.py            (Python subscribers, committed)
+  └── go       → api/rocsar/v1/*.pb.go            (OBC)
 
 scripts/generate.sh, firmware target only (RP2040):
   └── nanopb   → firmware/common.pb.{c,h}, firmware/pico.pb.{c,h}
 ```
+
+There was a second `buf generate` target, `python → gs/rocsar/v1/*_pb2.py`, for a
+Python subscriber. It is removed with the Python Ground Station (§2), which also
+removes the pipeline's only network dependency: it was the single plugin fetched
+from the BSR rather than run locally.
 
 The nanopb plugin is the **vendored binary** at
 `third_party/nanopb/generator-bin/protoc-gen-nanopb`, referenced by path in
@@ -744,6 +750,37 @@ read that *fails* is not evidence the qdisc is gone and must not flap the
 operator's view, and a qdisc we did not install is reported as such rather than
 claimed.
 
+#### Measured throughput, which is not the cap
+
+`qos.LinkCounters` samples `/sys/class/net/<device>/statistics/{tx,rx}_bytes`
+once per telemetry interval and differences consecutive reads against the wall
+clock, reporting kbit/s on `LinkStatus.measured_tx_kbps` / `measured_rx_kbps`.
+`tx` is what leaves the OBC toward the Ground Station; this is the same interface
+the HTB cap sits on, so the cap and the measurement are one quantity seen two
+ways.
+
+It is a property of the **interface**, not of the shaper, and both `Shaper` and
+`NullShaper` carry one. That is deliberate: with shaping off nothing bounds the
+device, which is exactly when the operator most needs to see what it is doing, so
+the measurement must not be conditional on a cap being installed.
+
+Four cases report **absent** rather than a number, because a wrong number is worse
+than none: the first sample (nothing to difference against), an unreadable
+counter, a counter that went **backwards** (an interface reset — a negative rate
+is not a rate), and no device configured. A genuine zero *is* reported as zero: an
+idle link is a real reading, and §7.1's absence rule is about not confusing the
+two. The console draws absent as "no reading" and never as a bar of length zero.
+
+`Status()` is called from four places — the 1 Hz telemetry tick, the command
+dispatcher (`dispatcher.go` reads it for the device name), and `Verify` twice — so
+the sampler is **time-gated** at 500 ms: below that it returns the previous rate
+unchanged. Without the gate, a dispatcher call 10 ms after a tick would
+difference one packet over 10 ms and report a spike on an idle link.
+
+This measures what the cap bounds; it is **not** a verification of the cap.
+`Verify`'s qdisc read-back remains the only thing that establishes the tree is
+installed, and throughput below the cap does not prove the cap is there.
+
 #### No write deadline on the artefact server
 
 `http.Server.WriteTimeout` was 5 minutes and is **removed**. A write deadline is a
@@ -956,9 +993,10 @@ pattern:
 **The payload is the last frame, and the frames before it are envelope.** Both
 arrival forms are legal ZMTP and both must work: a DEALER sending one part
 produces the first, a REQ produces the second. Requiring the empty delimiter
-rejects every peer that follows this table — found by `tools/gs_probe.py`,
-because the Go test client had been sending `NewMsgFrom([]byte(""), body)`,
-hand-rolling the REQ envelope, so the tests passed and the Python Ground Station
+rejects every peer that follows this table — found by the probe
+(`tools/gs_probe`, then a Python one), because the Go test client had been sending
+`NewMsgFrom([]byte(""), body)`, hand-rolling the REQ envelope, so the tests passed
+and the Python Ground Station
 was silently dropped.
 
 The first frame of a `Send` is consumed as routing and is **not** put on the
@@ -1095,7 +1133,7 @@ becomes a second home for a fact, and two homes drift.
 | `[http]` | `root` | `/mnt/rocsar/data` |
 | `[link]` | `device` | `eth0` |
 | `[link]` | `rate_kbps` | `115` |
-| `[link]` | `shaping` | `false` |
+| `[link]` | `shaping` | `true` |
 | `[pico]` | `port` | `/dev/ttyACM0` |
 | `[pico]` | `baudrate` | `115200` |
 | `[gnss]` | `ports` | `[2001, 2002, 2003]` |
@@ -1108,8 +1146,16 @@ becomes a second home for a fact, and two homes drift.
 
 `gnss.stale_after` and `require_hardware` were missing from
 this table in earlier revisions although all three are parsed. `[link] shaping`
-defaulted to `true` here; the code default is `false` (§6.6 — an unshaped link is
-the safe default, and `rocsar.toml` ships `false` with the reasoning inline).
+is **`true`** in `rocsar.toml` and **`true`** as the code default
+(`config.go`), and earlier revisions of this document said the opposite in both
+places. The flip is deliberate and is the safe direction: the in-process limiter
+was deleted (§6.6), so `shaping = false` now means the link is **unbounded**
+rather than merely unshaped. Shaping fails *open* — a missing device, no
+`CAP_NET_ADMIN` or a kernel without HTB leaves the link unlimited and reports
+`shaping_active = false` with the reason — so enabling it cannot brick the link,
+while leaving it off can let one consumer starve telemetry. The floor is enforced
+inside `Shaper.Apply`, so neither the config nor `set_link_limit` can install a
+cap too low for a telemetry frame.
 
 `[sdr] program` is the one key whose value is **not** the thing its name
 suggests. It is a directory, not a program, and it is not where `connect` is
@@ -1216,9 +1262,11 @@ Toolchain: Go 1.26, buf 1.72, `arduino-cli` with the `rp2040:rp2040` core, gcc
 for the firmware host tests.
 
 An earlier revision listed `python -m pytest gs/`. There is no Python application
-under `gs/` — only generated protobuf stubs (§2) — so there is nothing there to
-test. Python 3.11 is still needed to *generate* the stubs, and `tools/gs_probe.py`
-runs on it, but the Ground Station is Go.
+under `gs/`, and now no `gs/` at all: the directory and `tools/gs_probe.py` were
+deleted with the Python Ground Station (§2), and the `buf` Python target with
+them. The Ground Station is Go. Python 3.11 is still needed for one thing only:
+the firmware host tests under `firmware/tests/`, which `scripts/test.sh` runs
+with pytest.
 
 There is **no CI.** This is stated plainly because it is a real gap: every check
 above currently depends on a human remembering to run it. Adding CI is the
@@ -1231,6 +1279,13 @@ highest-value non-functional change available.
 Known limits, stated so nobody mistakes silence for coverage:
 
 - No CI.
+- **No second implementation of the ZeroMQ wire.** `tools/gs_probe.py` was the
+  only non-Go peer, and the only thing that could show pyzmq and go-zeromq agree
+  about the framing — a mismatch that no amount of Go-to-Go testing finds, and
+  which the tests once masked by hand-rolling the REQ envelope. It was deleted
+  with the Python Ground Station (§2). `tools/gs_probe` remains, but it is Go, so
+  it agrees with the OBC by construction. This is a real reduction in coverage,
+  not a tidy-up.
 - No hardware in the loop. The Pico, the servos, the SDR, the camera and the
   real GNSS receivers are untested by the suite. Tests use doubles and injected
   fakes; the integration is assumed correct until proven otherwise in flight.
@@ -1246,9 +1301,13 @@ Known limits, stated so nobody mistakes silence for coverage:
   real network namespace and asserts the rates the kernel reports back, and
   `test/qos_test.go` asserts the intended shape against a fake `KernelOps`. The
   115 kbit/s figure in §6.6 comes from `tc qdisc show` output on a development
-  interface. What is **not** established is achieved throughput on the real radio
-  link with a real receiver attached. Both the measurement and the classifier
-  remain open.
+  interface. The console now **measures** throughput (§6.6, `qos.LinkCounters`),
+  but that measures what crosses the interface, not whether the cap is installed
+  — the qdisc read-back is still what establishes the latter. What remains
+  unestablished is achieved throughput on the real radio link with a real
+  receiver attached; the sampler's arithmetic is unit-tested against a fake
+  counter and clock, and its sysfs read is not exercised anywhere but the
+  target. The classifier also remains open.
 - **The cap has never been verified against the flight it protects.** The floor is
   derived from `telemetry.FrameBudgetBytes` and the 1 Hz design point, which is
   arithmetic, not measurement: nobody has observed that telemetry survives at

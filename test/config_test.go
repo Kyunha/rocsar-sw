@@ -166,6 +166,7 @@ func TestEveryKeyHasAWorkingEnvironmentForm(t *testing.T) {
 		{"server.telemetry_endpoint", "tcp://*:6002"},
 		{"client.control_endpoint", "tcp://10.0.0.9:6001"},
 		{"client.telemetry_endpoint", "tcp://10.0.0.9:6002"},
+		{"client.http_endpoint", "http://10.0.0.9:6003"},
 		{"http.addr", ":6003"},
 		{"http.root", "/tmp/rocsar-env-root"},
 		{"link.device", "eth9"},
@@ -229,6 +230,10 @@ func assertEnvApplied(t *testing.T, cfg config.Config, key, value string) {
 	case "client.telemetry_endpoint":
 		if cfg.Client.TelemetryEndpoint != value {
 			t.Errorf("got %q, want %q", cfg.Client.TelemetryEndpoint, value)
+		}
+	case "client.http_endpoint":
+		if cfg.Client.HTTPEndpoint != value {
+			t.Errorf("got %q, want %q", cfg.Client.HTTPEndpoint, value)
 		}
 	case "http.addr":
 		if cfg.HTTP.Addr != value {
@@ -354,5 +359,78 @@ func TestEnvironmentBeatsTheFile(t *testing.T) {
 	}
 	if cfg.Link.RateKbps != 222 {
 		t.Errorf("environment layer: got %d, want 222", cfg.Link.RateKbps)
+	}
+}
+
+// The Ground Station must READ [client], not merely parse it.
+//
+// This section was written for the console and for a long time nothing consumed
+// it: cmd/gs took all three endpoints from flags whose defaults were the aircraft
+// address, so rocsar.toml was decorative and an operator who changed the Pi's
+// address had to retyping it into a flag on every session. The keys were in
+// KnownKeys the whole time, which is what made it invisible -- a key that parses
+// cleanly and is never read is indistinguishable from one that works.
+//
+// The test cannot see cmd/gs's behaviour directly, so it asserts the thing that
+// made it possible: every [client] key has a code default, which is what the
+// console falls through to when no flag is given. A flag with a real default
+// cannot be told from a typed one, so the flag always wins and the file is never
+// reached; the defaults here are what make the file win instead.
+func TestTheClientSectionHasDefaultsForTheConsoleToFallThroughTo(t *testing.T) {
+	for _, k := range []string{
+		"client.control_endpoint", "client.telemetry_endpoint", "client.http_endpoint",
+	} {
+		if !config.KnownKeys[k] {
+			t.Errorf("%s is not in KnownKeys, so rocsar.toml would refuse it and the "+
+				"console would fall back to a flag default", k)
+		}
+	}
+
+	c := config.Defaults()
+	for name, got := range map[string]string{
+		"control":   c.Client.ControlEndpoint,
+		"telemetry": c.Client.TelemetryEndpoint,
+		"http":      c.Client.HTTPEndpoint,
+	} {
+		if got == "" {
+			t.Errorf("the %s client endpoint has no code default", name)
+		}
+	}
+
+	// And the artefact endpoint specifically. It was absent while the other two
+	// were present, so the third link -- the one whose address moves with the
+	// deployment -- was the one with no file home.
+	if c.Client.HTTPEndpoint == "" || !strings.HasPrefix(c.Client.HTTPEndpoint, "http") {
+		t.Errorf("client.http_endpoint default = %q, want an http:// URL", c.Client.HTTPEndpoint)
+	}
+}
+
+// The shipped rocsar.toml must carry all three [client] keys.
+//
+// Defaults exist so the console starts with no file at all; the file exists so an
+// operator changes the aircraft's address once. A shipped file missing one of them
+// leaves that endpoint on the localhost default while its two siblings point at
+// the aircraft, which is the confusing half-configured state.
+func TestTheShippedTomlCarriesEveryClientEndpoint(t *testing.T) {
+	// config.Load resolves against the working directory, which is test/, so the
+	// shipped file is named explicitly -- the same way TestShippedConfigFileIsWellFormed
+	// reads it. Pointed at the file rather than at its directory, because the
+	// loader would otherwise merge a developer's own rocsar.local.toml into the
+	// assertion about what ships.
+	t.Setenv(config.PathEnv, filepath.Join("..", "rocsar.toml"))
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("load the shipped rocsar.toml: %v", err)
+	}
+	// Defaults are localhost; the shipped file aims at the aircraft.
+	for name, got := range map[string]string{
+		"control":   cfg.Client.ControlEndpoint,
+		"telemetry": cfg.Client.TelemetryEndpoint,
+		"http":      cfg.Client.HTTPEndpoint,
+	} {
+		if strings.Contains(got, "127.0.0.1") {
+			t.Errorf("the shipped rocsar.toml leaves [client] %s on its localhost default (%q); "+
+				"the console will dial nothing", name, got)
+		}
 	}
 }

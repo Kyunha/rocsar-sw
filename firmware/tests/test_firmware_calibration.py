@@ -252,13 +252,39 @@ class TestJudgeServoZero:
         # encoder would keep reporting where it always did.
         assert judge(probe, expect=0, wrote=0, stored=1952, resolution=1, after=4000) == "position-mismatch"
 
-    def test_a_centred_axis_with_nothing_stored_is_not_persistent(self, probe):
-        # The outcome that could not exist before there were two paths. The encoder
-        # reads centre, so the teach worked this boot -- but 0x1F reads zero, so it
-        # landed somewhere volatile and will be gone at the next power cycle. A
-        # centre that silently evaporates is worse than no centre, because the axis
-        # looks centred until the reboot.
-        assert judge(probe, expect=0, wrote=0, stored=0, resolution=1, after=CENTRE_TICK) == "not-persistent"
+    def test_teaching_an_axis_already_at_centre_is_a_success(self, probe):
+        # 0x28 means "current position correction is 2048" and the servo does the
+        # arithmetic. An axis already sitting at 2048 has a correction of zero to
+        # store, so nothing is written, 0x1F reads zero -- and the encoder still
+        # reads centre, which is the entire claim being made.
+        #
+        # Judged by the register alone this looks like a volatile centre, and that
+        # is what it reported on the bench: a teach that worked, refused. The
+        # console invites exactly this case by promising the axis will not move.
+        assert judge(probe, expect=0, wrote=0, stored=0, resolution=1,
+                     after=CENTRE_TICK, required=0) == "ok"
+
+    def test_a_correction_that_should_have_been_stored_and_was_not(self, probe):
+        # The other half, and the reason required=0 above is not simply "accept
+        # everything". The axis was off centre before the teach, so 0x28 had a
+        # non-zero correction to store and stored nothing: the encoder reads centre
+        # in RAM and will forget at the next power cycle. A centre that silently
+        # evaporates is worse than no centre, because the axis looks centred until
+        # the reboot.
+        assert judge(probe, expect=0, wrote=0, stored=0, resolution=1,
+                     after=CENTRE_TICK, required=1) == "not-persistent"
+
+    def test_the_fallback_rule_is_about_what_it_wrote(self, probe):
+        # The rule keys on what ought to be stored, not on which path ran. The
+        # fallback wrote zero and zero reads back, so that is agreement. It wrote
+        # 1952 and got zero, and that is reported as a mismatch rather than as a
+        # bare "not persistent" -- more specific, and checked first, because a
+        # register that disagrees with a value we know we wrote is a different
+        # fault from one that never held anything.
+        assert judge(probe, expect=1, wrote=0, stored=0, resolution=1,
+                     after=CENTRE_TICK, required=0) == "ok"
+        assert judge(probe, expect=1, wrote=1952, stored=0, resolution=1,
+                     after=CENTRE_TICK, required=1) == "correction-mismatch"
 
     def test_a_changed_tick_scale_is_refused_before_anything_else(self, probe):
         # Checked first, and deliberately: a changed resolution makes every other
@@ -281,8 +307,10 @@ class TestJudgeServoZero:
         assert judge(probe, expect=0, wrote=0, stored=1, resolution=2, after=999) == "angular-resolution"
 
 
-def judge(probe, expect: int, wrote: int, stored: int, resolution: int, after: int) -> str:
-    out = run(probe, "--judge-zero", str(expect), str(wrote), str(stored), str(resolution), str(after))
+def judge(probe, expect: int, wrote: int, stored: int, resolution: int,
+          after: int, required: int = 1) -> str:
+    out = run(probe, "--judge-zero", str(expect), str(wrote), str(stored),
+              str(resolution), str(after), str(required))
     assert out.startswith("JUDGE "), out
     return out.split()[1]
 

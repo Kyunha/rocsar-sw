@@ -60,7 +60,7 @@ are wrong.
 | :--- | :--- | :--- |
 | Go 1.26+ | everything | `go.mod` pins the language version. |
 | `libzmq` + headers | building OBC and GS | `go-zeromq/zmq4` is cgo. Debian/Ubuntu: `libzmq3-dev`. |
-| Python 3 + `pytest` | firmware tests | `pyzmq`, `protobuf` for `gs_probe.py`. |
+| Python 3 + `pytest` | firmware tests | Only the firmware host tests need it. |
 | `gcc` / `g++` | firmware tests | They compile `gondola_model.h` and link it against the real nanopb sources. Without a compiler those tests skip rather than fail. |
 | `buf` + `protoc-gen-go` | regenerating protobuf | Only needed when a `.proto` changes. |
 | `arduino-cli` | flashing firmware | Not needed to build or test the Go side. |
@@ -179,14 +179,14 @@ One schema, three generators. Regenerate after changing any `.proto`:
 ./scripts/generate.sh
 ```
 
-That runs `buf lint`, `buf build`, `buf generate` (Go + Python) and a separate
+That runs `buf lint`, `buf build`, `buf generate` (Go) and a separate
 vendored-`protoc` invocation for the C target, then asserts four things that
 otherwise fail silently. Equivalent raw commands:
 
 ```sh
 buf lint
 buf build -o /dev/null
-buf generate                                     # Go -> api/, Python -> gs/
+buf generate                                     # Go -> api/
 
 # C, firmware only, and it must run from api/ -- see below
 cd api && ../third_party/nanopb/generator-bin/protoc -I . \
@@ -205,9 +205,12 @@ Three things about this that are not obvious:
   next to the `.ino` by proximity — so a GS message compiled in would land in the
   flight controller's flash. The script uses an explicit file list and fails if an
   unexpected `.c` appears in `firmware/`.
-- **Go output is gitignored; Python and C output are committed.** The GS must
-  install on a laptop with no toolchain, and the Arduino build compiles by folder
-  proximity, so `firmware/*.c` has to exist on disk.
+- **Go output is gitignored; C output is committed.** The Arduino build compiles
+  by folder proximity, so `firmware/*.c` has to exist on disk. The Go output needs
+  no such treatment: the Ground Station is Go and builds its own protobuf code.
+  There was a third target, `python → gs/`, committed for a Python Ground Station
+  that no longer exists; it and `gs/` are deleted, which also removes the build's
+  only network dependency (the BSR Python plugin).
 
 `./scripts/proto-check.sh` regenerates everything and then `git diff --exit-code`s
 the result, which is the form that works in a pre-commit hook.
@@ -318,23 +321,35 @@ npm run dev                 # frontend dev server (hot reload)
 go run ./cmd/gs             # Go server + bridge
 ```
 
-Flags: `-control`, `-telemetry`, `-http`. The defaults point at the aircraft.
-Configuration from `rocsar.toml` is not yet wired in — see `GUI_ARCHITECTURE.md`
-§11 — so these flags are the whole story for now.
-
-### Cross-language probe
-
-Everything else in `tools/` is Go. These two are the only code that can prove
-pyzmq and go-zeromq agree about the wire, which no amount of Go testing finds. The
-Python one is the one that settles it.
+Endpoints come from `[client]` in `rocsar.toml`, which ships pointing at the
+aircraft, so an unflagged run reaches the vehicle. Flags `-control`, `-telemetry`
+and `-http` override it, and default to the **empty string** rather than to an
+address — a flag with a real default cannot be told from a typed one, so it would
+always win and the file would never be read. Full order in
+`GUI_ARCHITECTURE.md` §11.1:
 
 ```sh
-python tools/gs_probe.py --listen                    # telemetry only
-python tools/gs_probe.py                            # telemetry + one command
-python tools/gs_probe.py --take-photo               # fetch the JPEG, verify SOF/EOI + Range
+go run ./cmd/gs                                    # rocsar.toml
+go run ./cmd/gs --control tcp://127.0.0.1:5555     # a mock OBC
+```
 
+Put per-machine endpoints in `rocsar.local.toml` (gitignored, merges over the
+shipped file) rather than passing flags every session.
+
+### Probe
+
+`tools/gs_probe` is a Go client that connects to the OBC the way the Ground
+Station does, so the wire can be exercised without the window.
+
+```sh
 go run ./tools/gs_probe -frames 5 -seconds 10 -take-photo
 ```
+
+There was a **Python** probe (`tools/gs_probe.py`) beside it, and it was the only
+second implementation of the ZeroMQ wire in the repository: the only thing that
+could prove pyzmq and go-zeromq agree, which no amount of Go testing can find. It
+was deleted with the Python Ground Station. That cross-language check is now a
+recorded gap, not a covered one — `ARCHITECTURE.md` §14 lists it.
 
 Against a mock OBC: `./bin/obc --mock-pico --mock-camera --mock-sdr` in one
 terminal, probe in another.
@@ -548,13 +563,14 @@ explicit flag  >  ROCSAR_* environment  >  rocsar.toml  >  code default
 | :--- | :--- | :--- |
 | `server.control_endpoint` | `tcp://*:5555` | ZMQ ROUTER bind. |
 | `server.telemetry_endpoint` | `tcp://*:5556` | ZMQ PUB bind. |
-| `client.control_endpoint` | `tcp://127.0.0.1:5555` | GS → OBC commands. |
-| `client.telemetry_endpoint` | `tcp://127.0.0.1:5556` | GS → OBC telemetry. |
+| `client.control_endpoint` | `tcp://127.0.0.1:5555` | GS → OBC commands. Read by `cmd/gs`. |
+| `client.telemetry_endpoint` | `tcp://127.0.0.1:5556` | GS → OBC telemetry. Read by `cmd/gs`. |
+| `client.http_endpoint` | `http://127.0.0.1:5557` | GS → OBC artefact server. Read by `cmd/gs`. |
 | `http.addr` | `:5557` | Artefact server. |
 | `http.root` | `/mnt/ssd` | Data directory. Must exist. |
 | `link.device` | `eth0` | Interface for HTB shaping. |
 | `link.rate_kbps` | `115` | Link cap. A property of the radio, not a knob. |
-| `link.shaping` | `false` | Install the HTB hierarchy. Needs `CAP_NET_ADMIN`. |
+| `link.shaping` | `true` | Install the HTB hierarchy. Needs `CAP_NET_ADMIN`. Off means the link is **unbounded**, not merely unshaped. |
 | `pico.port` | `/dev/ttyACM0` | Flight controller serial port. |
 | `pico.baudrate` | `115200` | USB CDC rate. Not the servo bus. |
 | `gnss.ports` | `[2001, 2002, 2003]` | One per `Read_uB` instance. |

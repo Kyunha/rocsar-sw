@@ -173,6 +173,8 @@ func (c *Config) assign(key string, raw any) error {
 		c.Client.ControlEndpoint, err = str()
 	case "client.telemetry_endpoint":
 		c.Client.TelemetryEndpoint, err = str()
+	case "client.http_endpoint":
+		c.Client.HTTPEndpoint, err = str()
 
 	case "http.addr":
 		c.HTTP.Addr, err = str()

@@ -7,10 +7,10 @@
 // disagree about the wire.
 //
 // This file is the composition root and nothing else, like cmd/obc/main.go:
-// flags become a client.Config, the App wires Stream + Queue + view, and a
-// plain HTTP server serves the frontend and the WebSocket bridge. The console
-// is a pure web app: the operator opens the printed URL in their own browser.
-// There is no embedded browser, no window management and no CGO. Read
+// configuration becomes a client.Config, the App wires Stream + Queue + view,
+// and a plain HTTP server serves the frontend and the WebSocket bridge. The
+// console is a pure web app: the operator opens the printed URL in their own
+// browser. There is no embedded browser, no window management and no CGO. Read
 // GUI_ARCHITECTURE.md before changing anything here.
 package main
 
@@ -24,6 +24,7 @@ import (
 	"syscall"
 
 	"github.com/rocsar/obc/internal/client"
+	"github.com/rocsar/obc/internal/config"
 )
 
 //go:embed all:frontend/dist
@@ -46,21 +47,29 @@ func main() {
 }
 
 func run() error {
+	// Flag defaults are the EMPTY STRING, not the aircraft address.
+	//
+	// This is the whole of GUI_ARCHITECTURE.md 11's requirement and the reason it
+	// is easy to get wrong: a flag with a real default cannot be told apart from
+	// one the operator typed, so the flag always wins and rocsar.toml is never
+	// read. An empty default means "not given", and an unflagged run falls
+	// through to the file, then the environment, then the code default -- the
+	// same four-level order the OBC uses.
 	var (
-		control   = flag.String("control", "tcp://192.168.1.50:5555", "OBC control socket (ROUTER)")
-		telemetry = flag.String("telemetry", "tcp://192.168.1.50:5556", "OBC telemetry socket (PUB)")
-		httpAddr  = flag.String("http", "http://192.168.1.50:5557", "OBC artefact server")
+		control   = flag.String("control", "", "OBC control socket (ROUTER); overrides [client] in rocsar.toml")
+		telemetry = flag.String("telemetry", "", "OBC telemetry socket (PUB); overrides [client] in rocsar.toml")
+		httpAddr  = flag.String("http", "", "OBC artefact server; overrides [client] in rocsar.toml")
 		showVer   = flag.Bool("version", false, "print the build version and exit")
 	)
 	flag.Usage = func() {
 		fmt.Fprintf(flag.CommandLine.Output(),
 			"ROCSAR Ground Station.\n\n"+
-				"The defaults point at the aircraft. A local mock OBC takes explicit\n"+
-				"endpoints instead:\n\n"+
+				"Endpoints come from the [client] section of rocsar.toml, which ships\n"+
+				"pointing at the aircraft. A local mock OBC takes explicit endpoints:\n\n"+
 				"  gs --control tcp://127.0.0.1:5555 --telemetry tcp://127.0.0.1:5556 \\\n"+
 				"     --http http://127.0.0.1:5557\n\n"+
-				"Configuration from rocsar.toml arrives in step 7; until then these\n"+
-				"flags are the whole story. See GUI_ARCHITECTURE.md section 11.\n\n"+
+				"Precedence, highest first: flag > ROCSAR_* environment > rocsar.local.toml\n"+
+				"> rocsar.toml > built-in default. See ARCHITECTURE.md section 11.\n\n"+
 				"Flags:\n")
 		flag.PrintDefaults()
 	}
@@ -73,10 +82,30 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+	if err := cfg.Apply(); err != nil {
+		return err
+	}
+
+	// Flags beat the file and the environment, so they are applied last and only
+	// when actually given.
+	if *control != "" {
+		cfg.Client.ControlEndpoint = *control
+	}
+	if *telemetry != "" {
+		cfg.Client.TelemetryEndpoint = *telemetry
+	}
+	if *httpAddr != "" {
+		cfg.Client.HTTPEndpoint = *httpAddr
+	}
+
 	app := NewApp(client.Config{
-		Control:   *control,
-		Telemetry: *telemetry,
-		HTTP:      *httpAddr,
+		Control:   cfg.Client.ControlEndpoint,
+		Telemetry: cfg.Client.TelemetryEndpoint,
+		HTTP:      cfg.Client.HTTPEndpoint,
 		Topic:     "telemetry",
 	})
 

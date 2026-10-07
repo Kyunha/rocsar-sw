@@ -24,6 +24,7 @@ import {
     esc,
     fmtBytes,
     renderAttention,
+    renderBudgetTiles,
     renderCameraSdrLink,
     renderDownload,
     renderGnss,
@@ -32,7 +33,7 @@ import {
     renderSystem,
     telemetryAgeRing,
 } from './panels';
-import { knob, knobGeometry, knobValueFromPointer } from './widgets';
+import { Ring, knob, knobGeometry, knobValueFromPointer } from './widgets';
 import type { View, CommandResult, LinkState, Config, Entry, SdrParamsPatch, FrameEvent, DownloadProgress, DownloadDone } from './models';
 
 /* Stale after three telemetry intervals. A constant, not configuration --
@@ -78,6 +79,12 @@ let lastLink: LinkState | null = null;
 /* Frame-age history for the link sparkline: two minutes at 1 Hz. Bounded,
  * because a window left open overnight is not. */
 const ageHistory = telemetryAgeRing();
+
+/* Measured tx history for the link-budget sparkline, same bound and the same
+ * reason. Only real measurements are pushed: an absent reading must not put a
+ * 0 into the history, or the sparkline would draw an idle link where the truth
+ * is "unknown". */
+const txHistory = new Ring(120);
 
 function req(id: string): HTMLElement {
     const el = document.getElementById(id);
@@ -150,8 +157,8 @@ function numOrUndef(id: string): number | undefined {
 }
 
 function clearParams(): void {
-    for (const [id] of PARAM_FIELDS) {
-        (req(id) as HTMLInputElement).value = '';
+    for (const f of PARAM_FIELDS) {
+        (req(f.id) as HTMLInputElement).value = '';
     }
     // Forgetting the arming-delay suggestion matters: it is the one field whose
     // value this console can arrive at on its own, and clearing the panel is the
@@ -160,32 +167,112 @@ function clearParams(): void {
     renderOffsetSuggestion();
 }
 
-/* Input id to params.json key. One table, used for both directions: refresh
- * writes placeholders from it, apply reads values for it. A key renamed on
- * either side breaks visibly (placeholder shows "(unknown)") rather than
- * silently mapping to the wrong field.
+/* One SDR parameter: the input, the params.json key it maps to, the unit of the
+ * value the operator types, and any legal-value hint.
  *
- * The list is every key connect.cpp reads with j.at(), and nothing else. The
- * sweep window, the arming delay and the two antenna ports were absent for the
- * life of this console, which meant an operator could retune the radio but not
- * change the shape of the sweep it flies -- that took a hands-on edit to
- * params.json on the aircraft. PULSE_DURATION is deliberately still missing:
- * config.hpp has its read commented out, so a control for it would save a value
- * the program never looks at. */
-const PARAM_FIELDS: Array<[string, string]> = [
-    ['in-prf', 'PRF'],
-    ['in-fs', 'FS'],
-    ['in-tx', 'TX_FREQ'],
-    ['in-gtx', 'NORMALIZED_GAIN_TX'],
-    ['in-grx', 'NORMALIZED_GAIN_RX'],
-    ['in-bw', 'BW'],
-    ['in-sess', 'SESSION_DURATION'],
-    ['in-tmin', 'T_MIN_US'],
-    ['in-tmax', 'T_MAX_US'],
-    ['in-soffset', 'START_OFFSET_S'],
-    ['in-txant', 'TX_ANTENNA'],
-    ['in-rxant', 'RX_ANTENNA'],
+ * Single source of truth for four things that must not drift apart -- the input
+ * id, the JSON key, the visible label and the unit -- because the rows below are
+ * GENERATED from this table rather than written into the markup. They were
+ * hand-written once and the units went missing when the markup was reorganised,
+ * which is the drift this table exists to make impossible: there is now one place
+ * to add a parameter and one place a key can be spelled wrong.
+ *
+ * Units are the unit of the value the operator TYPES, never a converted display
+ * (GUI_ARCHITECTURE.md 9.4). For FS that is load-bearing rather than pedantry:
+ * the contract bounds it at 1e5..61.44e6 Hz, so an operator who reads "MSPS" and
+ * types 31.251 is refused by a bounds error about a number they believe they
+ * entered correctly.
+ *
+ * `hint` is for fields whose legal values are enumerable. The antenna ports are
+ * the only such fields, and the list is deliberately "known" rather than
+ * exhaustive: UHD decides what this radio and firmware accept, and this table
+ * has no business claiming to enumerate it. */
+interface ParamField {
+    id: string;
+    key: string;
+    label: string;
+    unit: string;
+    hint?: string;
+    size: number;
+}
+
+/* Every key connect.cpp reads with j.at(), and nothing else. The sweep window,
+ * the arming delay and the two antenna ports were absent for the life of this
+ * console, which meant an operator could retune the radio but not change the
+ * shape of the sweep it flies -- that took a hands-on edit to params.json on the
+ * aircraft. PULSE_DURATION is deliberately still missing: config.hpp has its
+ * read commented out, so a control for it would save a value the program never
+ * looks at.
+ *
+ * Ordered as they appear in config.hpp's load_config, which is the order a reader
+ * of that file meets them in. */
+const PARAM_FIELDS: ParamField[] = [
+    {id: 'in-prf', key: 'PRF', label: 'pulse rate', unit: 'Hz', size: 8},
+    {id: 'in-fs', key: 'FS', label: 'sample rate', unit: 'Hz', size: 10},
+    {id: 'in-sess', key: 'SESSION_DURATION', label: 'session', unit: 's', size: 6},
+    {id: 'in-tx', key: 'TX_FREQ', label: 'tx freq', unit: 'Hz', size: 10},
+    {id: 'in-gtx', key: 'NORMALIZED_GAIN_TX', label: 'gain tx', unit: '0–1', size: 6},
+    {id: 'in-grx', key: 'NORMALIZED_GAIN_RX', label: 'gain rx', unit: '0–1', size: 6},
+    {id: 'in-tmin', key: 'T_MIN_US', label: 'sweep from', unit: 'µs', size: 6},
+    {id: 'in-tmax', key: 'T_MAX_US', label: 'sweep to', unit: 'µs', size: 6},
+    {id: 'in-soffset', key: 'START_OFFSET_S', label: 'start offset', unit: 's', size: 6},
+    {id: 'in-bw', key: 'BW', label: 'bandwidth', unit: 'Hz', size: 10},
+    {
+        id: 'in-txant', key: 'TX_ANTENNA', label: 'tx antenna', unit: '', size: 10,
+        hint: 'known: TX/RX, RX2 — UHD decides',
+    },
+    {
+        id: 'in-rxant', key: 'RX_ANTENNA', label: 'rx antenna', unit: '', size: 10,
+        hint: 'known: TX/RX, RX2 — same port warns',
+    },
 ];
+
+/* paramRows builds the labelled rows for PARAM_FIELDS into host.
+ *
+ * One row per field, with the unit in the label, because several of these are
+ * near neighbours numerically: FS and BW are both hertz, T_MIN_US and T_MAX_US
+ * are both microseconds and must keep T_MIN < T_MAX, and a two-per-row layout
+ * invites reading the wrong column. */
+function paramRows(host: HTMLElement): void {
+    for (const f of PARAM_FIELDS) {
+        const row = document.createElement('div');
+        row.className = 'row';
+
+        const label = document.createElement('span');
+        label.textContent = f.unit === '' ? f.label : `${f.label} (${f.unit})`;
+        // The params.json key is in the title, because the operator may be
+        // reading that file alongside the window.
+        label.title = f.key;
+        row.appendChild(label);
+
+        const input = document.createElement('input');
+        input.id = f.id;
+        input.size = f.size;
+        if (f.hint !== undefined) {
+            input.title = f.hint;
+        }
+        row.appendChild(input);
+
+        if (f.id === 'in-soffset') {
+            // Filled by renderOffsetSuggestion. A span and not a button, because
+            // it is only actionable while a suggestion is pending.
+            const slot = document.createElement('span');
+            slot.id = 'offset-suggestion';
+            slot.className = 'hint';
+            row.appendChild(slot);
+        }
+        host.appendChild(row);
+
+        // Antenna hints also appear as text on the row, not only in a title
+        // attribute: a hover hint is invisible to an operator in a hurry.
+        if (f.hint !== undefined) {
+            const note = document.createElement('div');
+            note.className = 'row sub hint';
+            note.textContent = `${f.key}: ${f.hint}`;
+            host.appendChild(note);
+        }
+    }
+}
 
 /* Antenna ports are strings, so they are read differently from the numbers.
  * Blank means "leave alone" for both, and the distinction matters in the same
@@ -207,20 +294,30 @@ async function refreshParams(): Promise<void> {
     } catch (err) {
         logLine(`params read unavailable: ${err}`);
     }
-    for (const [id, key] of PARAM_FIELDS) {
-        const el = req(id) as HTMLInputElement;
-        const v = vals === null ? undefined : vals[key];
+    for (const f of PARAM_FIELDS) {
+        const el = req(f.id) as HTMLInputElement;
+        const v = vals === null ? undefined : vals[f.key];
         /* Numbers and strings are both real values here -- the antenna ports are
          * path names, not numbers -- so the hint accepts either. A key that is
          * present but of neither type means the Go side and this table have
          * genuinely diverged, and "(unknown)" is the honest way to say so rather
          * than printing a number the operator would take as a setting. */
         if (typeof v === 'number') {
-            el.placeholder = String(v);
+            // A field with its own hint keeps it on screen and shows the file's
+            // current value in the title, so the legal-value list stays where
+            // the operator is about to type. Overwriting the hint with a number
+            // would leave a control for an RF path showing "0.5".
+            el.placeholder = f.hint === undefined ? String(v) : f.hint;
+            el.title = f.hint === undefined ? f.key : `${f.key}: ${v}`;
         } else if (typeof v === 'string') {
-            el.placeholder = v;
+            el.placeholder = f.hint === undefined ? v : `${v} (current)`;
+            el.title = f.hint === undefined ? f.key : `${f.key}: ${v}`;
+        } else if (f.hint !== undefined) {
+            el.placeholder = f.hint;
+            el.title = f.hint;
         } else {
             el.placeholder = vals === null ? '(unavailable)' : '(unknown)';
+            el.title = f.key;
         }
     }
     if (vals !== null) {
@@ -377,10 +474,16 @@ function strArg(id: string): string {
 function renderFrame(ev: FrameEvent): void {
     const v = ev.view;
     currentView = v;
+    // Only a real measurement goes into the history. Pushing an absent reading
+    // as 0 would draw an idle link where the truth is "not measured".
+    if (v.link.measured_tx_kbps !== null) {
+        txHistory.push(v.link.measured_tx_kbps);
+    }
     req('sys').innerHTML = renderSystem(v);
     req('gnss').innerHTML = renderGnss(v);
     req('pico').innerHTML = renderPico(v);
-    req('csl').innerHTML = renderCameraSdrLink(v);
+    req('csl').innerHTML = renderCameraSdrLink(v, txHistory.values());
+    req('budget').innerHTML = renderBudgetTiles(v.link);
     req('attention').innerHTML = renderAttention(v, lastLink);
     const meta: string[] = [`seq ${v.sequence}`, `uptime ${Math.floor(v.uptime_s / 60)}m`];
     if (ev.gaps > 0) {
@@ -796,6 +899,7 @@ function layout(): void {
     </header>
     <div id="statusbar">
       <div id="linkline" class="status-link">…</div>
+      <div id="budget" class="status-budget"></div>
       <div id="meta" class="status-meta"></div>
     </div>
     <div id="stale" class="banner err" style="display:none">LINK STALE — showing last known values; motion stands down</div>
@@ -858,11 +962,8 @@ function layout(): void {
           <div class="row"><input id="in-link" size="6" value="115"><button id="b-link">set limit kbit</button> <button id="b-query">query</button></div>
           <div class="row" id="cmd-result"></div>
           <div class="row"><span>sdr params (blank = leave alone)</span></div>
-          <div class="row"><span>prf</span><input id="in-prf" size="8"><span>fs</span><input id="in-fs" size="10"><span>tx</span><input id="in-tx" size="10"></div>
-          <div class="row"><span>gain tx</span><input id="in-gtx" size="6"><span>gain rx</span><input id="in-grx" size="6"><span>bw</span><input id="in-bw" size="10"></div>
-          <div class="row"><span>session s</span><input id="in-sess" size="6"><button id="b-params">apply</button> <button id="b-params-clear">clear</button> <button id="b-params-refresh">refresh</button></div>
-          <div class="row"><span>t min us</span><input id="in-tmin" size="6"><span>t max us</span><input id="in-tmax" size="6"><span>start offset s</span><input id="in-soffset" size="6"><span id="offset-suggestion" class="hint"></span></div>
-          <div class="row"><span>tx antenna</span><input id="in-txant" size="10"><span>rx antenna</span><input id="in-rxant" size="10"></div>
+          <div id="param-rows"></div>
+          <div class="row"><button id="b-params">apply</button> <button id="b-params-clear">clear</button> <button id="b-params-refresh">refresh</button></div>
         </section>
       </div>
       <div class="zone-bottom">
@@ -881,6 +982,11 @@ function layout(): void {
         </details>
       </div>
     </div>`;
+
+    // After the markup exists and before anything can call req() on a parameter
+    // input: the rows are generated from PARAM_FIELDS, so the inputs do not
+    // exist until this line runs.
+    paramRows(req('param-rows'));
 }
 
 async function firstPaint(): Promise<void> {

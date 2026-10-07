@@ -659,6 +659,28 @@ enum ServoZeroOutcome {
 //            the register to read back exactly that, and a mismatch means the
 //            write was lost even if the position happened to land right.
 //
+// `correctionRequired` asks the one question this function cannot answer for
+// itself: *ought* a non-zero correction exist for this teach? It cannot be
+// derived from a post-teach reading, because a correction of zero is
+// indistinguishable from a correction that was lost -- the register reads zero
+// either way. Only the caller knows, because only the caller kept the
+// pre-teach position.
+//
+// The distinction is not academic. 0x28 is documented as "current position
+// correction is 2048": the servo derives the correction from its own encoder, so
+// teaching an axis that is *already* at tick 2048 has a correction of zero to
+// store, stores nothing, and leaves 0x1F reading zero. Judged by the register
+// alone that looks exactly like a volatile centre -- a teach that worked, in the
+// only way that matters, reported as a failure. It is not hypothetical: teaching
+// at the nominal centre is the obvious thing to do, and the UI invites it by
+// saying the axis will not move.
+//
+// So: a correction is required when the axis was NOT already at centre before
+// the teach (there was something to compensate for, and its absence is a real
+// lost write), or on the fallback path whenever a non-zero value was written.
+// When it is not required, a centred encoder is the whole claim and the register
+// is beside the point.
+//
 // The order is deliberate: scale first, because a changed resolution makes every
 // other reading meaningless. Then position, because that is the claim being
 // verified. Then persistence, which is only meaningful once the position has
@@ -668,7 +690,8 @@ inline ServoZeroOutcome judgeServoZero(bool expectCorrection,
                                        uint16_t wroteCorrection,
                                        uint16_t readBackCorrection,
                                        uint8_t angularResolution,
-                                       uint16_t afterPosition) {
+                                       uint16_t afterPosition,
+                                       bool correctionRequired) {
   if (angularResolution != 1) {
     return ZERO_ANGULAR_RESOLUTION;
   }
@@ -679,10 +702,10 @@ inline ServoZeroOutcome judgeServoZero(bool expectCorrection,
   if (expectCorrection && readBackCorrection != wroteCorrection) {
     return ZERO_CORRECTION_MISMATCH;
   }
-  // Centred, but nothing stored. On the 0x28 path this is the servo computing a
-  // zero correction -- possible when the axis happened to be sitting at centre
-  // already, and harmless -- so only the fallback can conclude persistence here.
-  if (readBackCorrection == 0) {
+  // Centred, but nothing stored, when something ought to have been stored. See
+  // `correctionRequired` above: this is now reachable only when the absence is
+  // informative.
+  if (correctionRequired && readBackCorrection == 0) {
     return ZERO_NOT_PERSISTENT;
   }
   return ZERO_OK;

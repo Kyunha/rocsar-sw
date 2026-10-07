@@ -148,6 +148,12 @@ export interface LinkView {
     priority_kbps: number;
     shaping_active: boolean;
     inactive_reason: string | null;
+    /* Measured throughput on the link device, kbit/s, sampled by the OBC. Null
+     * is "no measurement" (first tick, unreadable counters, or a reset
+     * interface); 0 is a real reading -- an idle link. The distinction is the
+     * whole point, so these are `| null` like every other optional field. */
+    measured_tx_kbps: number | null;
+    measured_rx_kbps: number | null;
 }
 
 export interface View {

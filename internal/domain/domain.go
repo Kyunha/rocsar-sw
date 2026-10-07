@@ -398,6 +398,12 @@ type LinkStatus struct {
 	PriorityKbps   uint32
 	ShapingActive  bool
 	InactiveReason string
+	// MeasuredTxKbps and MeasuredRxKbps are the throughput the interface
+	// counters actually show, in kbit/s. Pointers, so absence is distinct from
+	// zero: a genuine 0 is an idle link, nil is "no measurement" (the first
+	// sample, an unreadable counter, or a counter reset). See LinkCounters.
+	MeasuredTxKbps *uint32
+	MeasuredRxKbps *uint32
 }
 
 // Result is the outcome of a command.

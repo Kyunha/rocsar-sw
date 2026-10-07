@@ -16,6 +16,7 @@ import { join } from 'node:path';
 
 import {
     renderAttention,
+    renderBudgetTiles,
     renderCameraSdrLink,
     renderDownload,
     renderGnss,
@@ -116,6 +117,8 @@ const view: View = {
         priority_kbps: 96,
         shaping_active: false,
         inactive_reason: 'bulk queue empty',
+        measured_tx_kbps: 12,
+        measured_rx_kbps: 3,
     },
     healthy: false,
     not_healthy_reasons: ['bulk link shaping inactive'],
@@ -133,6 +136,7 @@ const link: LinkState = {
 };
 
 const ages = Array.from({ length: 60 }, (_, i) => 0.2 + Math.abs(Math.sin(i / 7)) * 1.6);
+const txHist = Array.from({ length: 60 }, (_, i) => 4 + Math.abs(Math.sin(i / 5)) * 46);
 
 const knobs = {
     heading: knob({ forId: 'in-heading', label: 'target heading', min: 0, max: 359, step: 1, value: 130, unit: '°' }),
@@ -152,6 +156,7 @@ const html = `<!doctype html>
   </header>
   <div id="statusbar">
     <div id="linkline" class="status-link">${renderLinkLine(link, ages)}</div>
+    <div id="budget" class="status-budget">${renderBudgetTiles(view.link)}</div>
     <div id="meta" class="status-meta">seq 4421 · uptime 128m</div>
   </div>
   <div id="attention" class="attention">${renderAttention(view, link)}</div>
@@ -183,7 +188,7 @@ const html = `<!doctype html>
     <div class="zone-rail">
       <section class="p-sys"><h2>system</h2><div id="sys">${renderSystem(view)}</div></section>
       <section class="p-gnss"><h2>gnss</h2><div id="gnss">${renderGnss(view)}</div></section>
-      <section class="p-csl"><h2>camera · sdr · link</h2><div id="csl">${renderCameraSdrLink(view)}</div></section>
+      <section class="p-csl"><h2>camera · sdr · link</h2><div id="csl">${renderCameraSdrLink(view, txHist)}</div></section>
     </div>
     <div class="zone-bottom">
       <details class="panel-fold" open><summary>artefacts /</summary><section class="p-art">

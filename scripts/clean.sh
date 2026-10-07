@@ -10,7 +10,6 @@ rm -f obc gs gs_cli gs_probe *.test
 
 echo "[clean] removing generated protobuf"
 rm -f api/rocsar/v1/*.pb.go
-rm -f gs/rocsar/v1/*_pb2.py
 rm -f firmware/*.pb.[ch]
 
 echo "[clean] removing caches"

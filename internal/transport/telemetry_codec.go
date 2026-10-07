@@ -70,6 +70,11 @@ func EncodeTelemetry(s telemetry.Snapshot) *rocsarv1.TelemetryFrame {
 	if s.Link.InactiveReason != "" {
 		f.Link.InactiveReason = proto.String(s.Link.InactiveReason)
 	}
+	// Measured throughput: pointers pass straight through, so absence stays
+	// absence. Collapsing a nil to 0 here would tell the console the link is
+	// idle in exactly the cases where no measurement was taken.
+	f.Link.MeasuredTxKbps = s.Link.MeasuredTxKbps
+	f.Link.MeasuredRxKbps = s.Link.MeasuredRxKbps
 	if s.SDR.LastLog != "" {
 		f.Sdr.LastLog = proto.String(s.SDR.LastLog)
 	}

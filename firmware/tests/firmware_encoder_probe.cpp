@@ -34,7 +34,7 @@
 //   firmware_encoder_probe --zero-seq <servo-id> <before> <outcome> [...]
 //                                                   -> whole teach attempts through
 //                                                      validate/judge/commitServoZero
-//   firmware_encoder_probe --judge-zero <expect> <wrote> <stored> <res> <after>
+//   firmware_encoder_probe --judge-zero <expect> <wrote> <stored> <res> <after> <req>
 //                                                   -> judgeServoZero() alone
 //   firmware_encoder_probe --servo-calib-scan <hex> <id>
 //                                                   -> scanServoCalibRead() over bytes
@@ -744,15 +744,21 @@ static int zeroSeq(int argc, char** argv) {
         bool commandMoved = (simulated != ZERO_POSITION_MISMATCH &&
                              simulated != ZERO_CORRECTION_MISMATCH);
 
+        // Same discriminator the sketch uses: a correction was only ever going to
+        // exist if the axis was not already at centre before the command.
+        const bool required =
+            servoTickDelta(before, ST3215_SERVO_CENTRE_TICK) >
+            ST3215_ZERO_TOLERANCE_TICKS;
+
         outcome = judgeServoZero(false, 0, stored, resolution,
-                                 commandMoved ? after : before);
+                                 commandMoved ? after : before, required);
         if (outcome == ZERO_POSITION_MISMATCH) {
           usedFallback = true;
           outcome = judgeServoZero(true, stored,
                                    (simulated == ZERO_CORRECTION_MISMATCH)
                                        ? (uint16_t)(stored + 1)
                                        : stored,
-                                   resolution, after);
+                                   resolution, after, stored != 0);
         }
         (void)usedFallback;
       }
@@ -779,11 +785,13 @@ static int zeroSeq(int argc, char** argv) {
 // The verification decision on its own, so every branch is reachable without
 // having to construct a whole teach around it. <expect> is 1 for the 0x1F
 // fallback, where the firmware chose the correction and can check it, and 0 for
-// the 0x28 command, where the servo chose it.
+// the 0x28 command, where the servo chose it. <req> is 1 when a non-zero
+// correction ought to exist for this teach -- see judgeServoZero().
 static int judgeZero(int argc, char** argv) {
-  if (argc < 7) {
+  if (argc < 8) {
     fprintf(stderr,
-            "usage: --judge-zero <expect> <wrote> <readback> <resolution> <after>\n");
+            "usage: --judge-zero <expect> <wrote> <readback> <resolution> <after> "
+            "<required>\n");
     return 2;
   }
   ServoZeroOutcome outcome = judgeServoZero(
@@ -791,7 +799,8 @@ static int judgeZero(int argc, char** argv) {
       (uint16_t)strtoul(argv[3], nullptr, 0),
       (uint16_t)strtoul(argv[4], nullptr, 0),
       (uint8_t)strtoul(argv[5], nullptr, 0),
-      (uint16_t)strtoul(argv[6], nullptr, 0));
+      (uint16_t)strtoul(argv[6], nullptr, 0),
+      strtoul(argv[7], nullptr, 0) != 0);
   printf("JUDGE %s\n", outcomeName(outcome));
   return 0;
 }

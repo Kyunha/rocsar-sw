@@ -600,6 +600,46 @@ section.stale-dim {
     background-image: repeating-linear-gradient(45deg, #2a2e37 0 4px, transparent 4px 8px);
 }
 
+/* ---- link budget --------------------------------------------------- */
+
+.status-budget {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+}
+
+.budget {
+    margin-top: 6px;
+}
+
+.w-budget {
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 6px 8px;
+    margin-top: 6px;
+}
+
+.w-budget-head {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    flex-wrap: wrap;
+    margin-bottom: 4px;
+}
+
+.w-budget-foot {
+    display: flex;
+    gap: 8px;
+    justify-content: space-between;
+    font-size: 11px;
+    margin-top: 3px;
+}
+
+.budget-history {
+    margin-top: 6px;
+}
+
 .w-spark {
     display: block;
 }

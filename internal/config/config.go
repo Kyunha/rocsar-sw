@@ -69,6 +69,13 @@ type Config struct {
 	Client struct {
 		ControlEndpoint   string
 		TelemetryEndpoint string
+		// HTTPEndpoint is the OBC's artefact server, the third of the three links.
+		//
+		// It was missing while the other two were present, so the console had to
+		// take the artefact address from a flag alone -- the one endpoint that
+		// changed with the deployment and had no file home. GUI_ARCHITECTURE.md
+		// 11.1 named this key as the fix and it was never added.
+		HTTPEndpoint string
 	}
 	HTTP struct {
 		Addr string
@@ -124,6 +131,7 @@ var KnownKeys = map[string]bool{
 	"server.telemetry_endpoint": true,
 	"client.control_endpoint":   true,
 	"client.telemetry_endpoint": true,
+	"client.http_endpoint":      true,
 	"http.addr":                 true,
 	"http.root":                 true,
 	"link.device":               true,
@@ -149,6 +157,9 @@ func Defaults() Config {
 	c.Server.TelemetryEndpoint = "tcp://*:5556"
 	c.Client.ControlEndpoint = "tcp://127.0.0.1:5555"
 	c.Client.TelemetryEndpoint = "tcp://127.0.0.1:5556"
+	// 127.0.0.1 rather than the aircraft: a laptop pointed at nothing should say so
+	// quickly, and the aircraft address is what rocsar.toml carries.
+	c.Client.HTTPEndpoint = "http://127.0.0.1:5557"
 	c.HTTP.Addr = ":5557"
 	c.HTTP.Root = "/mnt/rocsar/data"
 	c.Link.Device = "eth0"

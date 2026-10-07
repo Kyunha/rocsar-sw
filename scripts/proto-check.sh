@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-echo "[proto-check] generating Go + Python"
+echo "[proto-check] generating Go"
 buf generate
 
 echo "[proto-check] generating C (firmware)"
@@ -35,7 +35,6 @@ cp third_party/nanopb-extra/cobs.h third_party/nanopb-extra/cobs.c firmware/
 echo "[proto-check] verifying generated files match git"
 git diff --exit-code -- \
     api/rocsar/v1/*.pb.go \
-    gs/rocsar/v1/*_pb2.py \
     firmware/*.pb.[ch] \
     firmware/pb.[ch] firmware/pb_common.[ch] firmware/pb_decode.[ch] firmware/pb_encode.[ch] \
     firmware/cobs.[ch]

@@ -641,6 +641,15 @@ for every gauge added later:
   shortest.** Its needle colours match the map's bearing lines (`#22d3ee`
   current, `#ffb454` target) so the rose and the map read as one instrument, and
   the antipodal case is stated as ambiguous rather than resolved silently.
+- **The link budget shows the cap and the measured throughput, and says which is
+  which.** "Measured" means the link device — the same interface the cap is
+  installed on — so the two numbers describe one quantity, not two. A bar that
+  exceeds the cap is drawn full and coloured as a warning with the true number
+  beside it, because HTB is a scheduler and not a policer and silently clamping
+  the bar would hide the event worth seeing. When shaping is inactive the bar is
+  labelled "cap not enforced": "40 of 115" must not imply a limit that is not
+  installed. No measurement draws a hatched track and the words "no reading",
+  never a zero-length bar (7.1).
 
 The instruments live in `widgets.ts` as pure string builders, which is what lets
 `test/widgets.test.ts` hold these rules without a browser. `test/fixture.ts`
@@ -839,15 +848,28 @@ and the operator is not in a loop with a map.
 console uses the same `rocsar.toml`. One file, one resolution order, no second
 parser.
 
-### 11.1 `[client]` becomes live
+### 11.1 `[client]` is live
 
-`[client]` exists today and is consumed by **nothing** — `internal/config/config.go:68`
-parses it and no code reads it. `tools/gs_cli` hardcodes
-`tcp://192.168.1.50:5555` in its flags instead, which is the gap this closes.
-`cmd/gs` reads it, and it is the first consumer the section was written for.
+`[client]` is read by `cmd/gs`, which is the consumer the section was written for.
+`tools/gs_cli` still hardcodes `tcp://192.168.1.50:5555` in its flags and is
+unchanged; a terminal console with no configuration is a defensible thing to want,
+and one caller is enough to keep the section honest.
 
-`client.http_endpoint` is **new**: the console needs the third address and there
-is no key for it. Default `http://127.0.0.1:5557`.
+`client.http_endpoint` **exists** now. It was absent while the other two were
+present, so the artefact server — the one address that moves with the deployment —
+was the only one with no file home and a flag as its sole source. Default
+`http://127.0.0.1:5557`.
+
+**The console's flags default to the empty string, not to the aircraft.** That is
+the whole of this section working, and it is easy to undo by accident: a flag with
+a real default cannot be distinguished from one the operator typed, so the flag
+always wins and `rocsar.toml` is never read. Precedence is the standard four —
+flag > `ROCSAR_*` > `rocsar.local.toml` > `rocsar.toml` > code default
+(`ARCHITECTURE.md` §11) — with the flag applied last and only when given.
+`TestTheClientSectionHasDefaultsForTheConsoleToFallThroughTo` and
+`TestTheShippedTomlCarriesEveryClientEndpoint` in `test/config_test.go` exist
+because the bug this closed was invisible: the keys parsed cleanly and were never
+read, which looks identical to working.
 
 ### 11.2 `[gui]` is new
 
@@ -978,15 +1000,18 @@ already open:
 
 ### 14.2 Deletion of the Python ground station
 
-`gs/`, the `buf.gen.yaml` python plugin, `tools/gs_probe.py`, the python
-packages in `shell.nix`, the `.gitignore` python entries, and the
-`python -m pytest gs/` line in `ARCHITECTURE.md` §13.
+**Done.** `gs/` (generated `*_pb2.py` stubs), the `buf.gen.yaml` python plugin and
+`tools/gs_probe.py` are deleted. `shell.nix` already carried only `python3` and
+`pytest` — no `pyzmq`/`protobuf` — and `.gitignore` had no `gs/` entries, so
+neither needed changing. The `python -m pytest gs/` line is out of
+`ARCHITECTURE.md` §13. The generation pipeline is now fully offline: the python
+target was its only network dependency, and removing it is why `buf generate`
+runs with no network.
 
-Only stubs and a probe exist — there is no Python client, no view model and no
-Qt application. `tools/gs_probe.py` was written to answer a real question
-(`ARCHITECTURE.md` §7.2): could pyzmq, a completely different binding, speak to
-this ZeroMQ implementation? It found the frame-envelope bug, and it earned its
-place.
+`tools/gs_probe.py` was written to answer a real question (`ARCHITECTURE.md`
+§7.2): could pyzmq, a completely different binding, speak to this ZeroMQ
+implementation? It found the frame-envelope bug, and it earned its place — which
+is why §14.3 records what its removal costs.
 
 ### 14.3 What deleting it costs
 
@@ -1038,13 +1063,13 @@ Stated so nobody mistakes silence for coverage.
   Wails. That containment is the reason for §4's split, and it is a design
   intention, not a tested claim.
 - **Operator ergonomics are partly addressed.** The instruments (compass, per-
-  servo cards, link tiles, sparkline, download bar) and the map-dominant layout
-  exist, and §7.6 states the rules they hold. What is still open: colour-blind
-  safety beyond "never colour alone", light mode, font scaling, and the fact that
-  no operator has used any of it. The layout has been rendered from fixtures
-  (§13) and looked at; it has not been used. The one property that is treated as
-  non-negotiable is §7's absence discipline: "no data" must not be
-  indistinguishable from a zero, by colour or by anything else.
+  servo cards, link tiles, sparklines, download bar, link budget) and the
+  map-dominant layout exist, and §7.6 states the rules they hold. What is still
+  open: colour-blind safety beyond "never colour alone", light mode, font
+  scaling, and the fact that no operator has used any of it. The layout has been
+  rendered from fixtures (§13) and looked at; it has not been used. The one
+  property that is treated as non-negotiable is §7's absence discipline: "no
+  data" must not be indistinguishable from a zero, by colour or by anything else.
 - **Artefact integrity is still unverified.** No catalogue, no checksums — the
   same gap `ARCHITECTURE.md` §6.7 records for the OBC. A resumed download is
   checked for a plausible length and nothing more.

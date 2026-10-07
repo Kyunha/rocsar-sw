@@ -44,9 +44,21 @@ control_endpoint = "tcp://*:5555"
 telemetry_endpoint = "tcp://*:5556"
 
 [client]
-# The value that has to change when DHCP moves the Pi.
+# What the GROUND STATION dials. These are the values that have to change when
+# DHCP moves the Pi, and they are the reason this section exists: the OBC half
+# above binds a wildcard, which is correct on the Pi and undialable from a
+# laptop.
+#
+# The console reads all three, so an operator who changes the Pi's address does it
+# here once instead of retyping it into a flag every session. Anything more
+# specific -- a mock OBC on loopback, a one-off bench box -- still goes in
+# rocsar.local.toml, which is gitignored and merges over this file.
+#
+# Flags beat this file, which beats ROCSAR_* environment variables' file half,
+# which beats the code default. See ARCHITECTURE.md 11.
 control_endpoint = "tcp://192.168.1.50:5555"
 telemetry_endpoint = "tcp://192.168.1.50:5556"
+http_endpoint = "http://192.168.1.50:5557"
 
 [http]
 addr = ":5557"
@@ -130,7 +142,7 @@ device = "/dev/video0"
 # above if the directory is called sdr-ettus-b200mini. The OBC refuses to start
 # an acquisition when it does not, rather than writing parameters the program
 # would never read. On the Pi, override with ROCSAR_SDR_PROGRAM instead.
-program = "third_party/sdr-ettus-b200mini"
+program = "/root/rocsar-rpi/sdr-ettus-b200mini"
 
 [telemetry]
 interval = "1s"

@@ -15,6 +15,7 @@ import assert from 'node:assert/strict';
 import {
     Ring,
     barGauge,
+    budgetBar,
     clamp,
     clockText,
     compass,
@@ -127,6 +128,36 @@ test('barGauge colours an over-threshold reading by class, not by value alone', 
     const html = barGauge({ label: 'temp', value: 80, max: 100, unit: 'C', badAt: 75 });
     assert.match(html, /w-bad/);
     assert.match(html, />80C</);
+});
+
+test('budgetBar draws measured throughput against the cap', () => {
+    const html = budgetBar({ capKbps: 115, measuredKbps: 46, enforced: true });
+    assert.match(html, /cap 115 kbit\/s/);
+    assert.match(html, /width:40\.0%/);
+    assert.match(html, /measured <b>46<\/b> kbit\/s/);
+    assert.doesNotMatch(html, /w-bad/);
+    assert.doesNotMatch(html, /not enforced/);
+});
+
+test('budgetBar reports no reading rather than an idle link', () => {
+    const html = budgetBar({ capKbps: 115, measuredKbps: null, enforced: true });
+    assert.match(html, /no reading/);
+    assert.match(html, /w-bar-held/);
+    assert.doesNotMatch(html, /w-bar-fill/);
+});
+
+test('budgetBar marks an over-cap reading instead of clamping it silently', () => {
+    // HTB is a scheduler, not a policer: measured can exceed the cap. The bar
+    // fills and warns, and the number stays truthful.
+    const html = budgetBar({ capKbps: 115, measuredKbps: 200, enforced: true });
+    assert.match(html, /w-bad/);
+    assert.match(html, /width:100\.0%/);
+    assert.match(html, /measured <b>200<\/b> kbit\/s — over cap/);
+});
+
+test('budgetBar says when the cap is not being enforced', () => {
+    const html = budgetBar({ capKbps: 115, measuredKbps: 46, enforced: false });
+    assert.match(html, /cap not enforced/);
 });
 
 test('sparkline states the absence of history instead of drawing a flat line', () => {

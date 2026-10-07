@@ -220,6 +220,10 @@ type LinkView struct {
 	PriorityKbps   uint32  `json:"priority_kbps"`
 	ShapingActive  bool    `json:"shaping_active"`
 	InactiveReason *string `json:"inactive_reason"`
+	// Measured throughput on the link device, kbit/s. Pointers, because absence
+	// is not zero (7.1): nil means no measurement, 0 means an idle link.
+	MeasuredTxKbps *uint32 `json:"measured_tx_kbps"`
+	MeasuredRxKbps *uint32 `json:"measured_rx_kbps"`
 }
 
 // Build renders one snapshot.
@@ -376,11 +380,13 @@ func buildCamera(snap telemetry.Snapshot) CameraView {
 
 func buildLink(l domain.LinkStatus) LinkView {
 	out := LinkView{
-		State:         l.State.String(),
-		Device:        l.Device,
-		RateKbps:      l.RateKbps,
-		PriorityKbps:  l.PriorityKbps,
-		ShapingActive: l.ShapingActive,
+		State:          l.State.String(),
+		Device:         l.Device,
+		RateKbps:       l.RateKbps,
+		PriorityKbps:   l.PriorityKbps,
+		ShapingActive:  l.ShapingActive,
+		MeasuredTxKbps: l.MeasuredTxKbps,
+		MeasuredRxKbps: l.MeasuredRxKbps,
 	}
 	if l.InactiveReason != "" {
 		out.InactiveReason = &l.InactiveReason

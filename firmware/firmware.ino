@@ -524,7 +524,8 @@ bool applyServoCorrection(uint8_t id, uint8_t correctionByte,
 // Reads 0x1E..0x1F and the position, and judges a teach that has already been
 // attempted. Shared by both paths so the two cannot disagree about how to verify.
 ServoZeroOutcome verifyServoTeach(uint8_t id, bool expectCorrection,
-                                  uint16_t wroteCorrection) {
+                                  uint16_t wroteCorrection,
+                                  bool correctionRequired) {
   ServoCalibRead regs;
   if (!readServoRegisterHardware(id, regs)) {
     return ZERO_CORRECTION_MISMATCH;
@@ -536,7 +537,8 @@ ServoZeroOutcome verifyServoTeach(uint8_t id, bool expectCorrection,
   }
 
   return judgeServoZero(expectCorrection, wroteCorrection, regs.positionOffset,
-                        regs.angularResolution, after.positionTicks);
+                        regs.angularResolution, after.positionTicks,
+                        correctionRequired);
 }
 
 // Teaches one servo its centre and reports whether it took.
@@ -584,12 +586,28 @@ ServoZeroOutcome zeroServoHardware(uint8_t id, uint16_t &verifiedCentreTick) {
     return ZERO_NO_SERVO_REPLY;
   }
 
+  // Whether the 0x28 command has anything to store. It writes "current position
+  // correction is 2048" and the servo does the arithmetic, so an axis already
+  // sitting at centre yields a correction of zero and the EEPROM is never
+  // touched. That teach succeeded -- the encoder reads centre, which is the whole
+  // claim -- and verifying it by demanding a stored correction is what turned it
+  // into ERROR_CALIBRATION_FAILED on the bench.
+  const bool correctionRequired =
+      servoTickDelta(before.positionTicks, ST3215_SERVO_CENTRE_TICK) >
+      ST3215_ZERO_TOLERANCE_TICKS;
+
   applyServoCorrection(id, REG_ST3215_TORQUE_SWITCH,
                        ST3215_CORRECT_POSITION_COMMAND);
-  ServoZeroOutcome outcome =
-      verifyServoTeach(id, false, 0);
+  ServoZeroOutcome outcome = verifyServoTeach(id, false, 0, correctionRequired);
 
-  if (outcome != ZERO_POSITION_MISMATCH && outcome != ZERO_CORRECTION_MISMATCH) {
+  // ZERO_NOT_PERSISTENT is in this set deliberately. It is reachable only when a
+  // correction was required and none survived, which means the 0x28 command
+  // centred the encoder but did not store -- and the fallback writes an explicit
+  // value, so it can finish the job the primary path started. Falling back is
+  // exactly the right move here, and refusing to is how a half-finished teach
+  // stays half-finished.
+  if (outcome != ZERO_POSITION_MISMATCH && outcome != ZERO_CORRECTION_MISMATCH &&
+      outcome != ZERO_NOT_PERSISTENT) {
     // Either it took, or it failed for a reason the fallback cannot fix (the
     // tick scale changed, or the servo stopped answering). Falling back on those
     // would be guessing.
@@ -618,7 +636,7 @@ ServoZeroOutcome zeroServoHardware(uint8_t id, uint16_t &verifiedCentreTick) {
   writeServoRegister(id, REG_ST3215_EEPROM_LOCK, ST3215_EEPROM_LOCKED);
   delay(ST3215_EEPROM_SETTLE_MS);
 
-  outcome = verifyServoTeach(id, true, encoded);
+  outcome = verifyServoTeach(id, true, encoded, encoded != 0);
   if (outcome == ZERO_OK) {
     verifiedCentreTick = ST3215_SERVO_CENTRE_TICK;
   }

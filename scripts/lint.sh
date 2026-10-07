@@ -7,12 +7,10 @@ cd "$ROOT"
 echo "[lint] go vet"
 go vet ./...
 
-echo "[lint] ruff (Python ground-station remnants; gone in step 8)"
-if [ -e gs ] || [ -e tools/gs_probe.py ]; then
-    ruff check gs/ tools/gs_probe.py
-else
-    echo "[lint] SKIP ruff: no Python ground station left to check"
-fi
+# ruff and the Python Ground Station are gone: gs/ and tools/gs_probe.py were
+# deleted with the Python console, so there is no Python in this repository to
+# lint. The firmware tests are still Python (firmware/tests) and are run by
+# scripts/test.sh; they are not linted here.
 
 echo "[lint] buf lint"
 buf lint

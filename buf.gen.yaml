@@ -1,7 +1,12 @@
 version: v2
 
-# One schema, three generators. The Go and Python outputs are the same wire
-# format as the C output; there is no second contract to keep in sync.
+# One schema, two generators. The Go and C outputs are the same wire format;
+# there is no second contract to keep in sync.
+#
+# The Python target (`remote: buf.build/protocolbuffers/python`, out: gs) was
+# removed with the Python Ground Station. It was the only plugin that needed the
+# network -- everything else here is local -- and nothing consumed its output
+# once the Python console was deleted. The whole pipeline is now offline.
 #
 # The nanopb plugin is the vendored binary, referenced by path rather than
 # fetched from the BSR, for two reasons: the build works with no network, and
@@ -21,17 +26,6 @@ plugins:
     out: api
     opt:
       - paths=source_relative
-
-  # Python via the BSR rather than a local `protoc-gen-python`. The C and Go
-  # targets are local and work offline; there is no maintained standalone
-  # protoc-gen-python binary, and the one that exists needs a protobuf runtime
-  # installed, which the Ground Station's build environment does not otherwise
-  # require. This is the only step that needs a network.
-  #
-  # To make the whole pipeline offline, install protoc-gen-python and swap this
-  # for `local: protoc-gen-python` -- the out/opt are identical.
-  - remote: buf.build/protocolbuffers/python
-    out: gs
 
 # No `input:` here. In buf v2 the input is the workspace's `modules:` list in
 # buf.yaml, and declaring it in both places is an error rather than a default.

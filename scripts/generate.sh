@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 #
-# One schema, three generators.
+# One schema, two generators.
 #
 #   Go     -> api/rocsar/v1/*.pb.go     OBC            (build time, gitignored)
-#   Python -> gs/rocsar/v1/*_pb2.py     Ground Station (committed: the GS must
-#                                                 install on a laptop with no
-#                                                 toolchain)
 #   C      -> firmware/*.pb.{c,h}       RP2040         (committed: the Arduino
 #                                                 build compiles by proximity)
+#
+# The Python Ground Station is gone. Its `gs/rocsar/v1/*_pb2.py` target was the
+# only step that needed the network (buf's BSR python plugin), and nothing read
+# the output once the Python console was deleted, so both the target and the
+# package are removed. This pipeline is now fully offline.
 #
 # Why the C target does not go through buf
 # ----------------------------------------
@@ -53,9 +55,9 @@ echo "[gen] build (the whole module must import cleanly)"
 buf build -o /dev/null
 
 # ---------------------------------------------------------------------------
-# Go + Python: the whole module. buf drives both.
+# Go: the whole module, driven by buf.
 # ---------------------------------------------------------------------------
-echo "[gen] go + python"
+echo "[gen] go"
 buf generate
 
 # ---------------------------------------------------------------------------
@@ -168,5 +170,4 @@ fi
 
 echo "[gen] ok"
 echo "[gen]   go:      $(ls api/rocsar/v1/*.pb.go 2>/dev/null | wc -l) files"
-echo "[gen]   python:  $(ls gs/rocsar/v1/*_pb2.py 2>/dev/null | wc -l) files"
 echo "[gen]   firmware: $(ls firmware/*.pb.[ch] 2>/dev/null | wc -l) files, $(ls firmware/*.c | wc -l) .c"

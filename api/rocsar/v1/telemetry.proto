@@ -95,6 +95,22 @@ message LinkStatus {
   // "shaping disabled by config" are three different operator actions and
   // collapsing them into a bool sends someone to debug the wrong thing.
   optional string inactive_reason = 6;
+
+  // Measured throughput on the link device, in kbit/s, sampled by the OBC from
+  // the interface counters once per telemetry interval.
+  //
+  // optional, and absent is NOT zero. A genuine zero is a real reading -- an
+  // idle link -- while absent means there is no measurement yet (the first tick
+  // has nothing to difference against), the counters were unreadable, or the
+  // interface was reset under us. A console that drew absent as 0 kbit/s would
+  // say "the link is idle" in exactly the cases where it does not know.
+  //
+  // tx is what leaves the OBC toward the Ground Station -- telemetry, artefact
+  // fetches, and anything else on the device. rx is the reverse. This is the
+  // shaped interface, so these are the numbers rate_kbps bounds, measured two
+  // ways: one is the cap, these are what is actually crossing it.
+  optional uint32 measured_tx_kbps = 7;
+  optional uint32 measured_rx_kbps = 8;
 }
 
 message SystemStatus {

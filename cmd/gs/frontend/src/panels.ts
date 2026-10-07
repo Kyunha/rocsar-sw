@@ -21,6 +21,7 @@
  */
 import {
     barGauge,
+    budgetBar,
     clockText,
     compass,
     percent,
@@ -31,7 +32,7 @@ import {
     tickRing,
     durationText,
 } from './widgets';
-import type { View, LinkState, AxisView } from './models';
+import type { View, LinkState, LinkView, AxisView } from './models';
 import type { ChipKind } from './widgets';
 
 export function esc(s: string): string {
@@ -153,6 +154,33 @@ function feedbackKind(feedback: string): ChipKind {
         return 'warn';
     }
     return 'dim';
+}
+
+/* subsystemKind maps a SubsystemState string onto a chip colour.
+ *
+ * The wire carries the domain enum's own spelling and nothing else:
+ * DISCONNECTED, READY, BUSY, ERROR, UNSPECIFIED. Two comparisons in this file
+ * tested for 'RUNNING' and 'ACTIVE', which are not in that set and which no
+ * producer anywhere emits -- so the SDR and link chips rendered permanently
+ * 'dim', including while an acquisition was running and while the link was
+ * healthy. A chip that can never light up is worse than no chip: it looks like a
+ * deliberate judgement about the state.
+ *
+ * READY and BUSY are both 'ok'. For the SDR, BUSY is an acquisition in flight;
+ * for the link, BUSY is shaping in force with a caveat the reason line spells
+ * out. Neither is a fault, and colouring them 'dim' would say otherwise.
+ *
+ * Anything unrecognised is 'bad' rather than a healthy colour. A state string
+ * this build does not know is a client and server that disagree about the
+ * schema, and it must not read as fine. */
+function subsystemKind(state: string): ChipKind {
+    switch (state) {
+        case 'READY':
+        case 'BUSY':
+            return 'ok';
+        default:
+            return 'bad';
+    }
 }
 
 function axisCard(a: AxisView): string {
@@ -290,7 +318,7 @@ export function renderPico(v: View): string {
 /* camera · sdr · link                                                */
 /* ------------------------------------------------------------------ */
 
-export function renderCameraSdrLink(v: View): string {
+export function renderCameraSdrLink(v: View, txHistory: number[] = []): string {
     const c = v.camera;
     const photos = c.photos_taken === null || c.photos_taken === undefined ? '—' : `${c.photos_taken}`;
     const photosChip = stateChip(`${photos} photo(s)`, 'dim');
@@ -311,11 +339,40 @@ export function renderCameraSdrLink(v: View): string {
         ? stateChip('shaping on', 'info')
         : stateChip(`shaping off${l.inactive_reason ? `: ${l.inactive_reason}` : ''}`, 'dim');
 
-    return `<div class="w-card-head"><b>camera</b> ${stateChip(c.state, c.state === 'READY' ? 'ok' : 'dim')}${device} ${photosChip}${last}</div>
-        <div class="w-card-head"><b>sdr</b> ${stateChip(s.state, s.state === 'RUNNING' ? 'ok' : 'dim')}${pid}</div>
+    return `<div class="w-card-head"><b>camera</b> ${stateChip(c.state, subsystemKind(c.state))}${device} ${photosChip}${last}</div>
+        <div class="w-card-head"><b>sdr</b> ${stateChip(s.state, subsystemKind(s.state))}${pid}</div>
         ${sdrErr}${sdrLog}
-        <div class="w-card-head"><b>link</b> ${stateChip(l.state, l.state === 'ACTIVE' ? 'ok' : 'dim')} ${esc(l.device)} ${l.rate_kbps} kbit/s ${shaping}</div>
+        <div class="w-card-head"><b>link</b> ${stateChip(l.state, subsystemKind(l.state))} ${esc(l.device)} ${l.rate_kbps} kbit/s ${shaping}</div>
+        ${renderBudget(l, txHistory)}
         <div class="hint">priority ${l.priority_kbps} kbit/s</div>`;
+}
+
+/* The budget bar plus a short history of tx. The sparkline is what shows a
+ * burst after it has ended; the bar alone is only ever "now". */
+export function renderBudget(l: LinkView, txHistory: number[]): string {
+    return `<div class="budget">
+      ${budgetBar({ capKbps: l.rate_kbps, measuredKbps: l.measured_tx_kbps, enforced: l.shaping_active })}
+      <div class="budget-history">
+        <div class="w-tile-label">tx history</div>
+        ${sparkline({ values: txHistory, label: 'measured tx, kbit/s', min: 0 })}
+      </div>
+    </div>`;
+}
+
+/* Tiles for the persistent status strip. Kept separate from the bar because the
+ * strip is rendered from the link-connection event and the bar from the frame;
+ * both draw the same LinkView fields but are refreshed at different times. */
+export function renderBudgetTiles(l: LinkView | null): string {
+    if (l === null) {
+        return '';
+    }
+    const rate = (v: number | null): string => (v === null ? 'no reading' : `${v}`);
+    const kind = (v: number | null): ChipKind => (v === null ? 'dim' : v > l.rate_kbps ? 'bad' : 'ok');
+    return (
+        statTile({ label: 'cap', value: `${l.rate_kbps} kbit/s` }) +
+        statTile({ label: 'tx', value: rate(l.measured_tx_kbps), sub: 'kbit/s', kind: kind(l.measured_tx_kbps) }) +
+        statTile({ label: 'rx', value: rate(l.measured_rx_kbps), sub: 'kbit/s', kind: kind(l.measured_rx_kbps) })
+    );
 }
 
 /* ------------------------------------------------------------------ */

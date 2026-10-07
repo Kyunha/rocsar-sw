@@ -129,6 +129,12 @@ type Shaper struct {
 	// lostAt records when the qdisc was last found missing, so a re-verification
 	// loop can report how long the link has been unbounded.
 	lostAt time.Time
+
+	// counters measures what actually crosses the device, independent of whether
+	// this shaper installed a cap. It is a property of the interface, not of the
+	// shaper, which is why NullShaper has one too: an unshaped link is exactly
+	// where the operator most wants to see the throughput.
+	counters LinkCounters
 }
 
 // NewShaper returns a shaper. Pass nil for ops to use rtnetlink.
@@ -330,12 +336,16 @@ func (s *Shaper) Status() domain.LinkStatus {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
+	tx, rx := s.counters.Sample(s.device)
+
 	st := domain.LinkStatus{
-		State:         domain.SubsystemReady,
-		Device:        s.device,
-		RateKbps:      s.rateKbps,
-		PriorityKbps:  s.rateKbps, // one class: the whole cap is the telemetry floor
-		ShapingActive: s.active,
+		State:          domain.SubsystemReady,
+		Device:         s.device,
+		RateKbps:       s.rateKbps,
+		PriorityKbps:   s.rateKbps, // one class: the whole cap is the telemetry floor
+		ShapingActive:  s.active,
+		MeasuredTxKbps: tx,
+		MeasuredRxKbps: rx,
 	}
 	if !s.active {
 		// Three different operator actions live behind this one field: the device
@@ -458,6 +468,10 @@ type NullShaper struct {
 	// Station can show the operator what the link is meant to be limited to even
 	// on a machine where nothing is limiting it.
 	rateKbps uint32
+	// counters measures the interface anyway. Shaping being off is precisely
+	// when the throughput matters most -- nothing is bounding the link, so the
+	// measurement is the only thing telling the operator what it is doing.
+	counters LinkCounters
 }
 
 // NewNullShaper returns a shaper that does nothing, with the given explanation.
@@ -499,13 +513,19 @@ func (n *NullShaper) reasonLocked() string {
 
 func (n *NullShaper) Status() domain.LinkStatus {
 	n.mu.RLock()
-	defer n.mu.RUnlock()
+	device, rate, reason := n.device, n.rateKbps, n.reason
+	n.mu.RUnlock()
+
+	tx, rx := n.counters.Sample(device)
+
 	return domain.LinkStatus{
 		State:          domain.SubsystemReady,
-		Device:         n.device,
-		RateKbps:       n.rateKbps,
-		PriorityKbps:   n.rateKbps,
+		Device:         device,
+		RateKbps:       rate,
+		PriorityKbps:   rate,
 		ShapingActive:  false,
-		InactiveReason: n.reason,
+		InactiveReason: reason,
+		MeasuredTxKbps: tx,
+		MeasuredRxKbps: rx,
 	}
 }

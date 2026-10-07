@@ -358,6 +358,62 @@ export function sparkline(o: SparkOpts): string {
 }
 
 /* ------------------------------------------------------------------ */
+/* link budget                                                        */
+/* ------------------------------------------------------------------ */
+
+export interface BudgetOpts {
+    /** the cap the link is limited to, kbit/s (link.rate_kbps) */
+    capKbps: number;
+    /** measured throughput, kbit/s; null is "no measurement", not zero */
+    measuredKbps: number | null;
+    /** whether the cap is actually installed (shaping_active) */
+    enforced: boolean;
+}
+
+/** budgetBar draws measured throughput against the cap.
+ *
+ *  Three states, and no fourth:
+ *    - measured: a filled bar, with the cap as the track's full width.
+ *    - no measurement: a hatched track and the words "no reading". Never a
+ *      zero-length bar, which would read as an idle link (7.1).
+ *    - over the cap: the fill is drawn full and coloured as a warning, and the
+ *      number beside it says the true figure. HTB is a scheduler, not a
+ *      policer, so measured can exceed cap; silently clamping the bar would
+ *      hide exactly the event an operator needs to see.
+ *
+ *  When shaping is not active the cap is not being applied, and the bar says so
+ *  rather than letting "40 of 115" imply a limit that is not there. */
+export function budgetBar(o: BudgetOpts): string {
+    const enforced = o.enforced ? '' : ` ${stateChip('cap not enforced', 'warn', 'shaping is inactive, so nothing is limiting this device')}`;
+    const head = `<div class="w-budget-head"><span>link budget</span><b>cap ${o.capKbps} kbit/s</b>${enforced}</div>`;
+
+    if (o.measuredKbps === null) {
+        return `<div class="w-budget">
+      ${head}
+      <div class="w-bar-track w-bar-held" role="img" aria-label="link budget: no reading yet"><span class="w-hatch"></span></div>
+      <div class="w-budget-foot"><span class="w-held-word">no reading</span></div>
+    </div>`;
+    }
+
+    const over = o.measuredKbps > o.capKbps;
+    const p = percent(o.measuredKbps, o.capKbps);
+    const fill = over ? 100 : p;
+    const kind = over ? 'w-bad' : '';
+    const pctText = o.capKbps > 0 ? `${p.toFixed(0)}% of cap` : '';
+
+    return `<div class="w-budget">
+      ${head}
+      <div class="w-bar-track" role="img" aria-label="link budget: ${o.measuredKbps} of ${o.capKbps} kbit/s">
+        <span class="w-bar-fill ${kind}" style="width:${fill.toFixed(1)}%"></span>
+      </div>
+      <div class="w-budget-foot">
+        <span>measured <b>${o.measuredKbps}</b> kbit/s${over ? ' — over cap' : ''}</span>
+        <span class="hint">${pctText}</span>
+      </div>
+    </div>`;
+}
+
+/* ------------------------------------------------------------------ */
 /* knob                                                               */
 /* ------------------------------------------------------------------ */
 
