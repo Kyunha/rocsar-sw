@@ -26,6 +26,58 @@ esac
 
 LDFLAGS="-s -w"
 
+# ============================================================================
+# Generate the Go protobuf bindings if they are stale
+# ============================================================================
+# api/rocsar/v1/*.pb.go is gitignored and generated at build time, so this script
+# used to depend on someone having run scripts/generate.sh first. If it had not,
+# the failure was a wall of
+#
+#     convert.go:35: m.GetGondolaRollDeg undefined (type *rocsarv1.PicoTelemetry
+#
+# naming hand-written files that are entirely innocent. The source of truth is
+# api/rocsar/v1/*.proto and nothing in that message says so.
+#
+# So: regenerate when a .proto is newer than its .pb.go, and refuse clearly when
+# that cannot be done. Only the Go target is touched -- the nanopb C under
+# firmware/ and the Python under gs/ are committed, which is why generate.sh's
+# header explains that asymmetry.
+proto_dir="api/rocsar/v1"
+
+needs_generate() {
+    local pb proto base
+    for pb in "$proto_dir"/*.pb.go; do
+        [[ -e "$pb" ]] || return 0
+        base="$(basename "$pb" .pb.go)"
+        for proto in "$proto_dir"/*.proto; do
+            [[ "$(basename "$proto" .proto)" == "$base" ]] || continue
+            if [[ "$proto" -nt "$pb" ]]; then
+                return 0
+            fi
+        done
+    done
+    return 1
+}
+
+ensure_generated() {
+    if ! needs_generate; then
+        return 0
+    fi
+
+    if ! command -v buf >/dev/null 2>&1; then
+        echo "[build] FAIL: the Go protobuf bindings are stale and buf is not installed." >&2
+        echo "[build]      a file under $proto_dir/*.proto is newer than its .pb.go," >&2
+        echo "[build]      and $proto_dir/*.pb.go is gitignored (generated at build" >&2
+        echo "[build]      time). Install buf and re-run this script, or run:" >&2
+        echo "[build]          ./scripts/generate.sh" >&2
+        exit 1
+    fi
+
+    echo "[build] generating Go protobuf bindings (a .proto is newer than its .pb.go)"
+    buf lint
+    buf generate
+}
+
 build() {
     local out="$1" pkg="$2"
     if $RELEASE; then
@@ -52,6 +104,8 @@ build_frontend() {
     echo "[build] building the Ground Station frontend"
     ( cd "$frontend" && npm install --silent && npm run build )
 }
+
+ensure_generated
 
 mkdir -p bin
 
