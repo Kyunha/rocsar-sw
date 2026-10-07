@@ -356,7 +356,11 @@ func (c *console) command(ctx context.Context, name string, args []string) error
 			// or the operator retries `zero` and cannot tell what is already centred.
 			return fmt.Errorf("%w (axis %d of %d had already been sent)", err, i, len(reqs))
 		}
-		fmt.Printf("%s: success=%v error=%s\n", name, resp.GetSuccess(), resp.GetError())
+		// The request id, not the command name. A multi-axis batch runs the same
+		// verb once per axis and each request is "zero-1", "zero-2" -- printing
+		// "zero" twice gives the operator two identical lines and no way to tell
+		// which servo is which when one of them fails.
+		fmt.Printf("%s: success=%v error=%s\n", resp.GetRequestId(), resp.GetSuccess(), resp.GetError())
 		if m := resp.GetMessage(); m != "" {
 			fmt.Printf("  %s\n", m)
 		}
@@ -365,7 +369,16 @@ func (c *console) command(ctx context.Context, name string, args []string) error
 				n, resp.GetArtefactSizeBytes(), resp.GetArtefactKind(), n)
 		}
 		if !resp.GetSuccess() {
-			return fmt.Errorf("the OBC refused: %s", resp.GetError())
+			// The same "how far did it get" suffix the transport error carries.
+			// It matters more here, not less: ERROR_CALIBRATION_FAILED is specifically
+			// "the servo may now hold a correction we cannot vouch for", and a
+			// two-axis `zero` that taught axis 1 and refused axis 2 leaves the
+			// operator needing to know which servo that is about.
+			if i > 0 {
+				return fmt.Errorf("%s: %s (axis %d of %d had already been sent)",
+					resp.GetRequestId(), resp.GetError(), i, len(reqs))
+			}
+			return fmt.Errorf("%s: %s", resp.GetRequestId(), resp.GetError())
 		}
 	}
 	return nil

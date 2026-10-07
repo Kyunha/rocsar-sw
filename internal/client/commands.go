@@ -279,6 +279,17 @@ func BuildRequests(name string, args []string) ([]*rocsarv1.CommandRequest, erro
 	case "zero":
 		// Both axes unless one is named. Each is its own command because the
 		// PicoCommand oneof carries a single servo_id.
+		//
+		// The arity is checked in both directions, and unlike every other command
+		// here that is not pedantry. `need()` only rejects too few arguments, so a
+		// stray extra one used to fall through the len()==1 test and silently mean
+		// "both axes" -- `zero 1 2` teaching servo 2 when the operator asked about
+		// servo 1. For `jog` or `mount` an extra argument is inert junk; for `zero`
+		// it is a write to the EEPROM of a servo the operator did not name.
+		if len(args) > 1 {
+			return nil, fmt.Errorf("zero takes at most one servo id, got %d (%s)",
+				len(args), strings.Join(args, " "))
+		}
 		ids := []uint32{1, 2}
 		if len(args) == 1 {
 			v, err := u32(0)

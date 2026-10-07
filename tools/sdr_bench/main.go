@@ -102,7 +102,9 @@ func printUsage() {
   connect       start connect detached, output to a timestamped log
   reset-usb     power-cycle the SDR's USB port
 
-set accepts: PRF FS TX_FREQ BW NORMALIZED_GAIN_TX NORMALIZED_GAIN_RX SESSION_DURATION
+set accepts: PRF FS TX_FREQ BW NORMALIZED_GAIN_TX NORMALIZED_GAIN_RX
+           SESSION_DURATION T_MIN_US T_MAX_US START_OFFSET_S
+           TX_ANTENNA RX_ANTENNA
 
   sdr_bench set PRF=3000
   sdr_bench set TX_FREQ=5.7e9 BW=40e6

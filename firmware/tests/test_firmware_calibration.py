@@ -129,63 +129,80 @@ def strip_comments(text: str) -> str:
 # ============================================================================
 # The offset arithmetic
 # ============================================================================
-class TestZeroOffset:
-    """`servoZeroOffset()` -- the one line the whole teach rests on.
+class TestZeroCorrection:
+    """The correction for the 0x1F fallback path -- and why it is a fallback.
 
-    Register 0x1F is 16 bits and it is not documented whether the servo reads it
-    as signed or unsigned. Those two disagree across the wrap, and the failure is
-    a servo pointing somewhere plausible rather than an error, so the arithmetic
-    masks into [0, 4095] instead of computing a signed delta. That works under
-    either interpretation, and these cases are what make that claim checkable.
+    Register 0x1F is documented as "Position correction", two bytes, EEPROM,
+    range **-2047 to +2047**, with bit 11 as the direction bit. An earlier version
+    of this computed `(desired + 4096 - raw) & 0xFFF` on the reasoning that masking
+    into [0, 4095] would work whether the servo read the register signed or
+    unsigned. That was wrong, and the vendor table is what shows it: for a register
+    whose bit 11 is the direction bit, masking a *negative* correction into
+    [0, 4095] does not produce a valid encoding, it lands in the undocumented hole
+    between +2047 and -2048. It put an out-of-spec value on the wire for every
+    servo sitting above the centre tick.
+
+    The primary path does not use this at all -- it writes 128 to the Torque switch
+    and lets the servo do the sum. These tests exist to keep the fallback honest
+    while it is still there.
     """
 
-    def test_teaching_an_axis_at_the_default_needs_no_offset(self, probe):
-        # The case that matters most: an axis already sitting at the centre tick
-        # stores zero, and a servo storing zero is indistinguishable from one that
-        # was never taught. This is why the taught flag cannot be derived from the
-        # register, and why `center_zeroed` has to be stored separately.
-        assert offset(probe, CENTRE_TICK, CENTRE_TICK) == 0
+    def test_a_servo_at_the_default_needs_no_correction(self, probe):
+        assert correction(probe, CENTRE_TICK) == (0, True)
 
-    def test_a_small_position_needs_a_large_positive_offset(self, probe):
-        assert offset(probe, 100, CENTRE_TICK) == 1948
+    def test_a_servo_below_centre_gets_a_positive_correction(self, probe):
+        assert correction(probe, 100) == (1948, True)
 
-    def test_a_large_position_wraps_rather_than_going_negative(self, probe):
-        # 2048 - 4000 is -1952. Unsigned that is 63584, and if the servo added it
-        # as an unsigned and wrapped, the answer would be wrong by whole turns.
-        result = offset(probe, 4000, CENTRE_TICK)
-        assert result == 2144
-        assert 0 <= result <= 4095
+    def test_a_servo_above_centre_gets_a_negative_correction(self, probe):
+        # The case the masking version got wrong. 4000 is above centre, so the
+        # correction is -1952, not 2144.
+        assert correction(probe, 4000) == (-1952, True)
 
-    def test_the_result_is_always_inside_one_revolution(self, probe):
+    def test_every_correction_is_inside_the_documented_range(self, probe):
+        # The assertion the old implementation would have failed for half of all
+        # positions.
+        limit = 2047
         for raw in range(0, 4096, 37):
-            value = offset(probe, raw, CENTRE_TICK)
-            assert 0 <= value <= 4095, f"raw {raw} gave {value}"
+            value, ok = correction(probe, raw)
+            if ok:
+                assert -limit <= value <= limit, f"raw {raw} gave {value}"
 
-    def test_every_position_lands_within_the_tolerance_of_the_centre(self, probe):
-        # The property the whole thing relies on: applying the offset the firmware
-        # would write brings the encoder back to the centre tick, for every
-        # position. If this ever fails, the teach writes an offset that does not
-        # teach anything.
-        tolerance = int(TOLERANCE_RE.group(1))
+    def test_a_correction_of_plus_2048_is_refused_rather_than_clamped(self, probe):
+        # A servo sitting at exactly tick 0 needs +2048, which does not fit. It is
+        # reported, because clamping it would teach the wrong centre and the
+        # read-back would then disagree with what was asked for -- which is the one
+        # failure this mechanism exists to make impossible.
+        value, ok = correction(probe, 0)
+        assert value == 2048
+        assert ok is False
+
+    def test_the_extreme_negative_correction_is_still_representable(self, probe):
+        assert correction(probe, 4095) == (-2047, True)
+
+    def test_applying_the_correction_lands_on_the_centre(self, probe):
+        # The property the fallback rests on, for every position that can be
+        # encoded: raw + correction, taken mod 4096, must reach the centre tick.
+        limit = 2047
         for raw in range(0, 4096, 97):
-            value = offset(probe, raw, CENTRE_TICK)
-            assert ring_distance(raw + value, CENTRE_TICK) <= tolerance
-
-    def test_it_is_documented_why_the_mask_is_there(self):
-        assert "& 0x0FFFu" in MODEL
-        assert "signed or unsigned" in MODEL
+            value, ok = correction(probe, raw)
+            if not ok:
+                continue
+            assert ring_distance((raw + value) % 4096, CENTRE_TICK) <= limit
 
 
-def offset(probe, raw: int, desired: int = CENTRE_TICK) -> int:
-    """The offset the firmware would write for a servo sitting at `raw`.
+def correction(probe, raw: int) -> tuple[int, bool]:
+    """The correction the firmware would compute for a servo sitting at `raw`.
 
-    Read back out of the ZERO line, which prints what `servoZeroOffset()` produced
-    -- so this tests the firmware's arithmetic rather than reimplementing it here.
-    A host-side copy of the formula would be a second home for the same fact, and
-    agreeing with a bug is exactly what a second home lets you do.
+    Read back out of the ZERO line, which prints what the firmware produced -- so
+    this tests its arithmetic rather than reimplementing it here. A host-side copy
+    of the formula would be a second home for the same fact, and agreeing with a
+    bug is exactly what a second home lets you do.
+
+    Returns (correction, representable).
     """
     out = run(probe, "--zero-seq", "1", str(raw), "ok")
-    return int(zero_lines(out)[0]["offset"])
+    line = zero_lines(out)[0]
+    return int(line["correction"]), line["representable"] == "1"
 
 
 def ring_distance(a: int, b: int) -> int:
@@ -197,55 +214,75 @@ def ring_distance(a: int, b: int) -> int:
 # Verifying a teach
 # ============================================================================
 class TestJudgeServoZero:
-    """`judgeServoZero()` -- the decision, and the reason a half-failed teach
-    cannot be acknowledged as success."""
+    """`judgeServoZero()` -- the decision, and why a half-failed teach cannot be
+    acknowledged as success.
 
-    def test_a_clean_teach_passes(self, probe):
-        assert judge(probe, 0, 0, 1, CENTRE_TICK, CENTRE_TICK) == "ok"
+    The `expect` flag is the only thing the two paths differ on. On the 0x28
+    command the servo computed the correction, so the firmware has no value to
+    check 0x1F against and only the encoder's answer is trustworthy. On the 0x1F
+    fallback the firmware chose the value, so it can demand the register reads
+    back exactly that.
+    """
 
-    def test_a_teach_from_any_position_passes(self, probe):
-        for raw in (0, 1, 2047, 2048, 4000, 4095):
-            assert judge(probe, (CENTRE_TICK - raw) % 4096, (CENTRE_TICK - raw) % 4096, 1, raw, CENTRE_TICK) == "ok"
+    def test_a_clean_teach_on_the_command_path_passes(self, probe):
+        assert judge(probe, expect=0, wrote=0, stored=1952, resolution=1, after=CENTRE_TICK) == "ok"
+
+    def test_a_clean_teach_on_the_fallback_path_passes(self, probe):
+        assert judge(probe, expect=1, wrote=1952, stored=1952, resolution=1, after=CENTRE_TICK) == "ok"
+
+    def test_the_fallback_can_demand_the_register_agree(self, probe):
+        assert judge(probe, expect=1, wrote=1952, stored=1953, resolution=1, after=CENTRE_TICK) == "correction-mismatch"
+
+    def test_the_command_path_cannot_check_a_register_it_did_not_write(self, probe):
+        # Nothing to compare against, so a differing stored value is not a failure
+        # of the command path -- the servo chose it.
+        assert judge(probe, expect=0, wrote=0, stored=4242, resolution=1, after=CENTRE_TICK) == "ok"
 
     def test_the_axis_landing_one_tick_out_still_counts(self, probe):
-        # One tick is 0.088 degrees at the servo and it sits behind a 5:1 gear
-        # train, so demanding an exact match would reject good teaches. The
-        # tolerance is named in the firmware; this pins its value.
         tolerance = int(TOLERANCE_RE.group(1))
         assert tolerance == 1
-        assert judge(probe, 0, 0, 1, CENTRE_TICK, CENTRE_TICK + 1) == "ok"
+        assert judge(probe, expect=0, wrote=0, stored=1, resolution=1, after=CENTRE_TICK + 1) == "ok"
 
     def test_the_axis_landing_two_ticks_out_does_not_count(self, probe):
-        assert judge(probe, 0, 0, 1, CENTRE_TICK, CENTRE_TICK + 2) == "position-mismatch"
+        assert judge(probe, expect=0, wrote=0, stored=1, resolution=1, after=CENTRE_TICK + 2) == "position-mismatch"
 
     def test_a_position_that_does_not_move_is_refused(self, probe):
-        # This is the case that catches the register not doing what the Waveshare
-        # tool implies. If 0x1F were applied only to the goal side, the encoder
-        # would keep reporting where it always did, and without this the axis
-        # would read as taught while pointing at whatever the old offset meant.
-        assert judge(probe, 2144, 2144, 1, 4000, 4000) == "position-mismatch"
+        # This is the case that catches the correction not doing what the memory
+        # table says. If 0x28 or 0x1F were applied only to the commanded side, the
+        # encoder would keep reporting where it always did.
+        assert judge(probe, expect=0, wrote=0, stored=1952, resolution=1, after=4000) == "position-mismatch"
 
-    def test_an_offset_that_did_not_store_is_refused(self, probe):
-        assert judge(probe, 2144, 2145, 1, 4000, CENTRE_TICK) == "offset-mismatch"
+    def test_a_centred_axis_with_nothing_stored_is_not_persistent(self, probe):
+        # The outcome that could not exist before there were two paths. The encoder
+        # reads centre, so the teach worked this boot -- but 0x1F reads zero, so it
+        # landed somewhere volatile and will be gone at the next power cycle. A
+        # centre that silently evaporates is worse than no centre, because the axis
+        # looks centred until the reboot.
+        assert judge(probe, expect=0, wrote=0, stored=0, resolution=1, after=CENTRE_TICK) == "not-persistent"
 
     def test_a_changed_tick_scale_is_refused_before_anything_else(self, probe):
         # Checked first, and deliberately: a changed resolution makes every other
-        # reading meaningless, so it must not be reported as an offset problem.
-        assert judge(probe, 2144, 9999, 3, 4000, 5000) == "angular-resolution"
-        assert judge(probe, 2144, 2144, 0, 4000, CENTRE_TICK) == "angular-resolution"
+        # reading meaningless, so it must not be reported as a position problem.
+        assert judge(probe, expect=1, wrote=1952, stored=1953, resolution=3, after=5000) == "angular-resolution"
+        assert judge(probe, expect=1, wrote=1952, stored=1952, resolution=0, after=CENTRE_TICK) == "angular-resolution"
 
     def test_the_scale_must_be_exactly_one(self, probe):
-        assert judge(probe, 0, 0, 1, CENTRE_TICK, CENTRE_TICK) == "ok"
+        assert judge(probe, expect=0, wrote=0, stored=1, resolution=1, after=CENTRE_TICK) == "ok"
         for resolution in (0, 2, 3, 255):
-            assert judge(probe, 0, 0, resolution, CENTRE_TICK, CENTRE_TICK) == "angular-resolution"
+            assert judge(probe, expect=0, wrote=0, stored=1, resolution=resolution, after=CENTRE_TICK) == "angular-resolution"
 
     def test_the_tolerance_is_measured_either_way_round_the_ring(self, probe):
-        assert judge(probe, 0, 0, 1, 0, 4095) == "position-mismatch"
-        assert judge(probe, 0, 0, 1, 0, CENTRE_TICK) == "ok"
+        assert judge(probe, expect=0, wrote=0, stored=1, resolution=1, after=0) == "position-mismatch"
+        assert judge(probe, expect=0, wrote=0, stored=1, resolution=1, after=CENTRE_TICK) == "ok"
+
+    def test_a_scale_fault_outranks_a_position_fault(self, probe):
+        # Order is load-bearing for whoever is debugging this: reporting the
+        # downstream cause sends them to the wrong register.
+        assert judge(probe, expect=0, wrote=0, stored=1, resolution=2, after=999) == "angular-resolution"
 
 
-def judge(probe, wrote: int, readback: int, resolution: int, before: int, after: int) -> str:
-    out = run(probe, "--judge-zero", str(wrote), str(readback), str(resolution), str(before), str(after))
+def judge(probe, expect: int, wrote: int, stored: int, resolution: int, after: int) -> str:
+    out = run(probe, "--judge-zero", str(expect), str(wrote), str(stored), str(resolution), str(after))
     assert out.startswith("JUDGE "), out
     return out.split()[1]
 
@@ -291,8 +328,8 @@ class TestZeroCommand:
         # This is the case that could not exist before: the centre is in the
         # servo's EEPROM, so a lost write has left hardware in an unknown state,
         # and the record must not claim otherwise.
-        out = run(probe, "--zero-seq", "1", "4000", "offset-lost")
-        assert zero_lines(out)[0]["outcome"] == "offset-mismatch"
+        out = run(probe, "--zero-seq", "1", "4000", "correction-lost")
+        assert zero_lines(out)[0]["outcome"] == "correction-mismatch"
         assert axis(out, 0)["zeroed"] == "0"
 
     def test_an_offset_that_stored_without_moving_the_encoder_is_refused(self, probe):
@@ -306,9 +343,9 @@ class TestZeroCommand:
         # half-failed is fixed by running it again. Both halves of that have to
         # hold -- the first attempt must not have recorded anything, and the
         # second must actually record.
-        out = run(probe, "--zero-seq", "1", "4000", "offset-lost", "4000", "ok")
+        out = run(probe, "--zero-seq", "1", "4000", "correction-lost", "4000", "ok")
         attempts = zero_lines(out)
-        assert [a["outcome"] for a in attempts] == ["offset-mismatch", "ok"]
+        assert [a["outcome"] for a in attempts] == ["correction-mismatch", "ok"]
         assert attempts[0]["committed"] == "0"
         assert attempts[1]["committed"] == "1"
         assert axis(out, 0)["zeroed"] == "1"
@@ -331,6 +368,18 @@ class TestZeroCommand:
         out = run(probe, "--zero-seq", "99", "4000", "ok")
         assert "VALIDATE axis=-1" in out
         assert "ZERO" not in out
+
+    def test_a_correction_that_cannot_be_encoded_is_reported_not_clamped(self, probe):
+        # A servo sitting at exactly tick 0 needs +2048 and 0x1F tops out at 2047.
+        # Clamping would teach the wrong centre.
+        out = run(probe, "--zero-seq", "1", "0", "unrepresentable")
+        assert zero_lines(out)[0]["outcome"] == "unrepresentable"
+        assert axis(out, 0)["zeroed"] == "0"
+
+    def test_a_correction_that_lands_but_does_not_store_is_not_persistent(self, probe):
+        out = run(probe, "--zero-seq", "1", "4000", "volatile")
+        assert zero_lines(out)[0]["outcome"] == "not-persistent"
+        assert axis(out, 0)["zeroed"] == "0"
 
     def test_the_zero_command_is_not_in_applycommand(self, probe):
         # The old zero case was three lines in applyCommand that set centerTick.
@@ -634,21 +683,42 @@ class TestShape:
     """The structural claims, which are the ones a reviewer has to take on trust
     from reading the diff."""
 
-    def test_the_teach_never_disables_torque(self):
-        # Register 0x28. A third-party register table claims EEPROM writes need
-        # torque disabled; the vendor's tool does not do that, and torque-off on a
-        # 5:1 gear train carrying an antenna means the axis goes limp. The
-        # read-back settles it per write, so the safe choice is not to write it.
+    def test_the_teach_writes_the_correction_command_and_never_disables_torque(self, probe):
+        # Register 0x28 carries three commands: 0 turns torque off, 1 turns it on,
+        # and 128 corrects the current position to 2048. Only the third is ever
+        # written here.
         #
-        # Scoped to zeroServoHardware, not the whole sketch: 0x28 is also the
-        # BNO055's I2C address and appears in the constructor, so a file-wide
-        # search would flag the IMU. Comments are stripped because both files
-        # discuss 0x28 at length and this is an assertion about code.
+        # This is the inverse of what the test asserted before the vendor's memory
+        # table was found: it used to be "0x28 appears nowhere", on the reasoning
+        # that disabling torque on a 5:1 gear train carrying an antenna means the
+        # axis goes limp. That reasoning still holds -- it is just that 0x28 turns
+        # out to be the documented way to set a centre at all.
         teach = strip_comments(_ino_symbol("zeroServoHardware"))
-        assert "0x28" not in teach
-        assert "TORQUE" not in teach.upper()
-        # And the torque register is not even named in the model.
-        assert "TORQUE" not in strip_comments(MODEL).upper()
+        assert "REG_ST3215_TORQUE_SWITCH" in teach
+        assert "ST3215_CORRECT_POSITION_COMMAND" in teach
+        # And never 0 or 1 to it: no torque-off, so nothing drops.
+        assert "TORQUE_OFF" not in teach
+        assert not re.search(r"REG_ST3215_TORQUE_SWITCH,\s*0\b", teach)
+        assert not re.search(r"REG_ST3215_TORQUE_SWITCH,\s*1\b", teach)
+
+    def test_the_correction_command_is_the_documented_value(self, probe):
+        # "write 128: current position correction is 2048", from register 0x28's
+        # entry in the vendor memory table.
+        assert re.search(r"#define\s+ST3215_CORRECT_POSITION_COMMAND\s+128\b", MODEL)
+
+    def test_the_command_path_is_tried_before_the_fallback(self, probe):
+        teach = _ino_symbol("zeroServoHardware")
+        command = teach.index("REG_ST3215_TORQUE_SWITCH")
+        fallback = teach.index("REG_ST3215_POSITION_CORRECTION")
+        assert command < fallback
+
+    def test_the_fallback_is_only_reached_when_the_command_did_not_move_the_axis(self, probe):
+        # Falling back on, say, a changed tick scale would be guessing: the
+        # fallback writes a correction the scale has already invalidated.
+        teach = _ino_symbol("zeroServoHardware")
+        guard = teach.index("ZERO_POSITION_MISMATCH")
+        assert teach.index("verifyServoTeach") < guard
+        assert teach.index("servoZeroCorrection") > guard
 
     def test_the_vendor_settle_delay_is_used_and_is_theirs(self):
         assert "delay(ST3215_EEPROM_SETTLE_MS)" in INO
@@ -668,20 +738,19 @@ class TestShape:
         # The order is the verification. Reading the register before writing it
         # would verify the old value and pass.
         #
-        # rindex for the position read: zeroServoHardware takes its own reading
-        # first, and that one is supposed to come before everything.
+        # Checked in verifyServoTeach(), which both paths share -- so a check here
+        # covers the command and the fallback at once.
         teach = _ino_symbol("zeroServoHardware")
-        first_read = teach.index("readServoTelemetryHardware")
-        assert first_read < teach.index("writeServoRegister16")
-        assert teach.index("writeServoRegister16") < teach.index("readServoRegisterHardware")
-        assert teach.index("readServoRegisterHardware") < teach.rindex("readServoTelemetryHardware")
+        verify = _ino_symbol("verifyServoTeach")
+        assert verify.index("readServoRegisterHardware") < verify.index("readServoTelemetryHardware")
+        assert teach.index("verifyServoTeach") < teach.index("servoZeroCorrection")
 
     def test_the_decision_comes_after_both_readbacks(self):
-        # judgeServoZero needs the offset written, the register read back and the
-        # position read back. Deciding before the last read would decide on a
-        # position that had not been observed.
-        teach = _ino_symbol("zeroServoHardware")
-        assert teach.rindex("readServoTelemetryHardware") < teach.index("judgeServoZero")
+        # judgeServoZero needs the register read back and the position read back.
+        # Deciding before the last read would decide on a position that had not
+        # been observed.
+        verify = _ino_symbol("verifyServoTeach")
+        assert verify.rindex("readServoTelemetryHardware") < verify.index("judgeServoZero")
 
     def test_the_bus_is_drained_before_each_read(self):
         # Half-duplex: every request comes back as an echo. The official tool
@@ -699,8 +768,7 @@ class TestShape:
         # work. An ack sent first would report success for a write that never
         # landed -- which is the one thing this command must not do.
         handler = _ino_symbol("handleZeroCommand")
-        assert handler.index("zeroServoHardware") < handler.index("switch (outcome)")
-        assert handler.index("switch (outcome)") < handler.rindex("sendCommandResponse")
+        assert handler.index("zeroServoHardware") < handler.rindex("sendCommandResponse")
 
     def test_the_only_early_ack_is_a_validation_refusal(self):
         # There is one ack before the hardware, and it answers "no such servo" --
@@ -715,11 +783,17 @@ class TestShape:
         assert "ERROR_INVALID_SERVO" in refusal
 
     def test_a_failed_teach_reports_calibration_failed_not_a_generic_fault(self):
-        # It means "the servo may now hold a partial change", which is a
-        # different thing from "nothing answered on the bus".
-        handler = _ino_symbol("handleZeroCommand")
-        assert "ERROR_CALIBRATION_FAILED" in handler
-        assert "ERROR_HARDWARE_FAULT" in handler
+        # It means "the servo may now hold a partial change", which is a different
+        # thing from "nothing answered on the bus". The mapping lives in the model
+        # now, in one function, so the two places that used to reason about which
+        # error means what cannot drift apart.
+        mapping = _model_symbol("servoZeroErrorCode")
+        assert "ERROR_CALIBRATION_FAILED" in mapping
+        assert "ERROR_HARDWARE_FAULT" in mapping
+        assert "ZERO_NO_SERVO_REPLY" in mapping
+        # And the sketch uses that mapping rather than switching on the outcome.
+        assert "servoZeroErrorCode(outcome)" in _ino_symbol("handleZeroCommand")
+        assert "switch (outcome)" not in _ino_symbol("handleZeroCommand")
 
     def test_the_record_is_saved_only_on_a_teach_that_took(self):
         handler = _ino_symbol("handleZeroCommand")

@@ -144,11 +144,61 @@ void readImuHeading(unsigned long now) {
 
   clearImuMisses(gondola);
   applyImuHeading(gondola, event.orientation.x, true);
+  // All three Euler angles arrive in this one read and two of them were being
+  // thrown away. Tilt is not filtered: it exists to be a confidence signal on the
+  // heading, and filtering the evidence would only delay it.
+  applyImuAttitude(gondola, event.orientation.y, event.orientation.z, true);
+
   // Read alongside the heading so the two agree about the sensor: a miss
   // above holds the last temperature rather than zeroing it, the same posture
   // as the bearing and the servo readings. The BNO055 reports whole degrees;
   // a tenth of a degree is far finer than anyone acts on.
   gondola.imuTemperatureC = (float)bno.getTemp();
+}
+
+// One register read, the whole reason it is here: whether the sensor is
+// calibrated. A 2-24 hour flight with a night-to-day temperature swing at
+// altitude degrades the BNO055's fusion, and `imu_present` only ever said that
+// a sensor answered -- which an uncalibrated one does just as readily.
+void readImuCalibration() {
+  uint8_t system = 0, gyroscope = 0, accelerometer = 0, magnetometer = 0;
+  bno.getCalibration(&system, &gyroscope, &accelerometer, &magnetometer);
+  setImuCalibration(gondola, packImuCalibration(system, gyroscope, accelerometer,
+                                                magnetometer));
+}
+
+// Feeds the peak-hold accumulator.
+//
+// A second getEvent(), and it has to be a second one: the BNO055 fills the
+// sensors_event_t union with one vector per call, so asking for linear
+// acceleration through the same read as the Euler angles would silently return
+// the Euler angles again and peak-hold them as if they were accelerations.
+// That is why the two are separate functions rather than one read.
+void readImuPeakAccel() {
+  sensors_event_t linear;
+  if (!bno.getEvent(&linear, Adafruit_BNO055::VECTOR_LINEARACCEL)) {
+    // Not a miss for the presence counter. That counts getEvent failures on the
+    // *heading* read, which is what the re-probe and the wire's presence bit are
+    // about; a second read failing says nothing about whether the sensor is there,
+    // and counting it would declare a working sensor absent.
+    return;
+  }
+
+  // The type check is not ceremony.
+  //
+  // Adafruit_BNO055 fills the SAME union member -- event->acceleration -- for
+  // VECTOR_LINEARACCEL, VECTOR_ACCELEROMETER and VECTOR_GRAVITY, and
+  // distinguishes them only by event->type. So asking for the wrong one yields
+  // plausible accelerations with gravity still in them, and nothing about the
+  // numbers looks wrong: the raw accelerometer would peak-hold at 1 g on a level
+  // gondola and the peak would never mean a shock. The type is the only thing in
+  // the event that says which of the three this actually is.
+  if (linear.type != SENSOR_TYPE_LINEAR_ACCELERATION) {
+    return;
+  }
+
+  noteImuPeakAccel(gondola, linear.acceleration.x, linear.acceleration.y,
+                   linear.acceleration.z);
 }
 
 void sendTelemetryMessage() {
@@ -213,34 +263,28 @@ void handleZeroCommand(const rocsar_v1_PicoCommand &cmd) {
     commitServoZero(gondola, axisIndex, verifiedCentre);
 
     // Persist the fact that a teach took. This is the only place the record
-    // changes, and it is on the far side of the bus work so the EEPROM erase --
-    // which takes interrupts off for tens of milliseconds -- cannot delay the
-    // acknowledgement or stall the control tick.
+    // changes.
+    //
+    // It does sit between the bus work and the acknowledgement, and that is
+    // deliberate rather than accidental: EEPROMClass::commit() takes interrupts
+    // off for a whole sector erase, so the cost is paid either way, and paying it
+    // before the ack means the ack is sent from a board whose record already
+    // matches what it is reporting. Doing it after would risk acknowledging a
+    // teach and then losing the record that says so, with the servo already
+    // holding a correction nobody has a note about.
+    //
+    // Neither ordering rescues the control tick: handleZeroCommand is called from
+    // loop(), so the tick is stalled for the erase either way. That is part of the
+    // 100-250 ms the acknowledgement timeout is documented against.
     CalibrationRecord record;
     snapshotCalibration(gondola, record);
     calibrationSave(record);
   }
 
-  // A dead servo is a different fact from a teach that did not take, and they
-  // want different responses: nothing was written in the first case, while in the
-  // second the servo may be holding a partial change to its own centre. Hence two
-  // codes rather than one generic hardware fault.
-  rocsar_v1_ErrorCode error;
-  switch (outcome) {
-    case ZERO_OK:
-      error = rocsar_v1_ErrorCode_ERROR_NONE;
-      break;
-    case ZERO_NO_SERVO_REPLY:
-      error = rocsar_v1_ErrorCode_ERROR_HARDWARE_FAULT;
-      break;
-    default:
-      // The offset did not store, the encoder did not reach the centre, or the
-      // tick scale changed under us. Re-running `zero` converges, because the
-      // offset is always recomputed from wherever the servo actually is.
-      error = rocsar_v1_ErrorCode_ERROR_CALIBRATION_FAILED;
-      break;
-  }
-  sendCommandResponse(cmd.sequence, error);
+  // One mapping, in the model, so there is one place that knows a dead servo
+  // (nothing written) is a different fact from a teach that did not take (the
+  // servo may be holding a correction nobody can vouch for).
+  sendCommandResponse(cmd.sequence, servoZeroErrorCode(outcome));
 }
 
 void handleCommand(const rocsar_v1_PicoCommand &cmd) {
@@ -452,13 +496,71 @@ bool readServoRegisterHardware(uint8_t id, ServoCalibRead &out) {
   return false;
 }
 
+// One pass of the EEPROM unlock / correction / relock sequence.
+//
+// `correctionByte` and `correctionValue` are what gets written between the
+// unlock and the relock, so both paths share one sequence and one set of vendor
+// settle delays rather than each carrying its own copy.
+//
+// Kept separate from the caller because the two paths differ only in that one
+// write, and the differences that matter -- which register, what value, and what
+// the servo should then report -- belong to the two functions that own them.
+bool applyServoCorrection(uint8_t id, uint8_t correctionByte,
+                          uint8_t correctionValue) {
+  writeServoRegister(id, REG_ST3215_EEPROM_LOCK, ST3215_EEPROM_UNLOCKED);
+  delay(ST3215_EEPROM_SETTLE_MS);
+
+  writeServoRegister(id, correctionByte, correctionValue);
+  delay(ST3215_EEPROM_SETTLE_MS);
+
+  // Re-lock even if the correction write was lost. Leaving a servo's EEPROM
+  // unlocked is a thing a later, unrelated write could then land in, and there is
+  // no way to know from here whether it took.
+  writeServoRegister(id, REG_ST3215_EEPROM_LOCK, ST3215_EEPROM_LOCKED);
+  delay(ST3215_EEPROM_SETTLE_MS);
+  return true;
+}
+
+// Reads 0x1E..0x1F and the position, and judges a teach that has already been
+// attempted. Shared by both paths so the two cannot disagree about how to verify.
+ServoZeroOutcome verifyServoTeach(uint8_t id, bool expectCorrection,
+                                  uint16_t wroteCorrection) {
+  ServoCalibRead regs;
+  if (!readServoRegisterHardware(id, regs)) {
+    return ZERO_CORRECTION_MISMATCH;
+  }
+
+  ServoStatus after;
+  if (!readServoTelemetryHardware(id, after)) {
+    return ZERO_POSITION_MISMATCH;
+  }
+
+  return judgeServoZero(expectCorrection, wroteCorrection, regs.positionOffset,
+                        regs.angularResolution, after.positionTicks);
+}
+
 // Teaches one servo its centre and reports whether it took.
 //
-// The sequence is the vendor's, from changeServoID() in the official configure
-// sketch: unlock the EEPROM, write the register, re-lock, with a settle delay
-// either side. What is ours is what comes after -- reading the register back and
-// then reading the position back, because "the write was sent" is not a claim
-// this firmware is willing to acknowledge.
+// Two paths, in order of preference.
+//
+// The first writes 128 to the Torque switch (0x28), which the vendor's memory
+// table documents as "current position correction is 2048": the servo works out
+// the correction from its own encoder. That is preferred over doing the sum here
+// because 0x1F is a *signed* -2047..+2047 register with bit 11 as the direction
+// bit, and the wire encoding of a negative correction is not documented -- two
+// encodings fit the description and they disagree. Asking the servo removes the
+// question. It is also, almost certainly, what Waveshare's "Set Middle Position"
+// button sends.
+//
+// The second writes the correction to 0x1F directly. It exists for a board whose
+// firmware revision does not implement the 0x28 command, and it is a fallback
+// rather than an equal path: it can refuse a servo sitting at exactly tick 0,
+// because a correction of +2048 does not fit the documented range, and clamping
+// it would teach the wrong centre.
+//
+// Both paths are verified the same way and both are idempotent, so a run that
+// half-failed -- a write lost to bus contention, a servo pulled mid-sequence --
+// is fixed by running it again.
 //
 // Blocking, and on purpose. This runs on an explicit operator command and takes
 // 100-250 ms, during which the control loop does not tick and no telemetry goes
@@ -467,18 +569,9 @@ bool readServoRegisterHardware(uint8_t id, ServoCalibRead &out) {
 // asynchronous version would have to answer "accepted" before knowing whether the
 // EEPROM write landed, which is the failure this is most careful about.
 //
-// Idempotent, and that is the safety net. The offset is always recomputed from
-// wherever the servo actually is, so a run that half-failed -- a write lost to
-// bus contention, a servo pulled mid-sequence -- is fixed by running it again.
-// No recovery path, no reset command and no reflash is needed to get back to a
-// known state.
-//
-// Note what is absent: register 0x28, torque. A third-party register table claims
-// EEPROM writes require torque disabled; the vendor's own tool does not do that,
-// and torque-off on a 5:1 gear train carrying an antenna means the axis goes
-// limp. The read-back below settles the question per write either way -- if the
-// offset does not store, the teach is refused rather than assumed -- so the safe
-// choice is not to write it and find out.
+// Note what is never written: 0 or 1 to 0x28. Those turn torque off and on, and
+// torque-off on a 5:1 gear train carrying an antenna means the axis goes limp.
+// Only the 128 command is sent to that register.
 ServoZeroOutcome zeroServoHardware(uint8_t id, uint16_t &verifiedCentreTick) {
   verifiedCentreTick = ST3215_SERVO_CENTRE_TICK;
 
@@ -491,43 +584,45 @@ ServoZeroOutcome zeroServoHardware(uint8_t id, uint16_t &verifiedCentreTick) {
     return ZERO_NO_SERVO_REPLY;
   }
 
-  uint16_t offset = servoZeroOffset(before.positionTicks, ST3215_SERVO_CENTRE_TICK);
+  applyServoCorrection(id, REG_ST3215_TORQUE_SWITCH,
+                       ST3215_CORRECT_POSITION_COMMAND);
+  ServoZeroOutcome outcome =
+      verifyServoTeach(id, false, 0);
 
-  writeServoRegister(id, REG_ST3215_EEPROM_LOCK, ST3215_EEPROM_UNLOCKED);
-  delay(ST3215_EEPROM_SETTLE_MS);
-
-  writeServoRegister16(id, REG_ST3215_POSITION_OFFSET, offset);
-  delay(ST3215_EEPROM_SETTLE_MS);
-
-  // Re-lock even if the writes were lost. Leaving a servo's EEPROM unlocked is a
-  // thing a later, unrelated write could then land in, and there is no way to
-  // know from here whether the register write took.
-  writeServoRegister(id, REG_ST3215_EEPROM_LOCK, ST3215_EEPROM_LOCKED);
-  delay(ST3215_EEPROM_SETTLE_MS);
-
-  ServoCalibRead regs;
-  if (!readServoRegisterHardware(id, regs)) {
-    return ZERO_OFFSET_MISMATCH;
-  }
-
-  ServoStatus after;
-  if (!readServoTelemetryHardware(id, after)) {
-    return ZERO_POSITION_MISMATCH;
-  }
-
-  ServoZeroOutcome outcome = judgeServoZero(offset, regs.positionOffset,
-                                            regs.angularResolution,
-                                            before.positionTicks,
-                                            after.positionTicks);
-  if (outcome != ZERO_OK) {
+  if (outcome != ZERO_POSITION_MISMATCH && outcome != ZERO_CORRECTION_MISMATCH) {
+    // Either it took, or it failed for a reason the fallback cannot fix (the
+    // tick scale changed, or the servo stopped answering). Falling back on those
+    // would be guessing.
+    if (outcome == ZERO_OK) {
+      verifiedCentreTick = ST3215_SERVO_CENTRE_TICK;
+    }
     return outcome;
   }
 
-  // Report what the encoder says, not what we asked for. The two can differ by
-  // up to the tolerance, and the measured value is the one the servo will keep
-  // reporting from now on.
-  verifiedCentreTick = after.positionTicks;
-  return ZERO_OK;
+  // The 0x28 command was not honoured. Fall back to writing the correction.
+  bool representable = false;
+  int32_t correction =
+      servoZeroCorrection(before.positionTicks, ST3215_SERVO_CENTRE_TICK,
+                          representable);
+  if (!representable) {
+    return ZERO_UNREPRESENTABLE;
+  }
+
+  uint16_t encoded = (uint16_t)(correction & 0xFFFF);
+  // Two bytes, so it does not go through applyServoCorrection()'s one-byte
+  // write. The unlock and relock around it are the same sequence.
+  writeServoRegister(id, REG_ST3215_EEPROM_LOCK, ST3215_EEPROM_UNLOCKED);
+  delay(ST3215_EEPROM_SETTLE_MS);
+  writeServoRegister16(id, REG_ST3215_POSITION_CORRECTION, encoded);
+  delay(ST3215_EEPROM_SETTLE_MS);
+  writeServoRegister(id, REG_ST3215_EEPROM_LOCK, ST3215_EEPROM_LOCKED);
+  delay(ST3215_EEPROM_SETTLE_MS);
+
+  outcome = verifyServoTeach(id, true, encoded);
+  if (outcome == ZERO_OK) {
+    verifiedCentreTick = ST3215_SERVO_CENTRE_TICK;
+  }
+  return outcome;
 }
 
 // ============================================================================
@@ -629,6 +724,13 @@ void loop() {
 
     // Smooth IMU Reading
     readImuHeading(now);
+    // Both of these depend on the sensor the read above just used, so they are
+    // called unconditionally rather than guarded on imuPresent: getEvent() fails
+    // harmlessly against an absent sensor, and skipping them on a flag would mean
+    // a sensor that answers intermittently leaves a stale calibration byte and a
+    // peak that silently stops updating.
+    readImuCalibration();
+    readImuPeakAccel();
 
     // Dead-man first, so the telemetry frame this tick already reports the
     // truth: a heater whose keep-alive stopped arriving goes off here, and the

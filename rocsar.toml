@@ -20,14 +20,22 @@
 
 # Top-level, and therefore ABOVE the first [section] header.
 #
-# It sat under [qos] until a test caught it, and it failed *open*: TOML reads a
-# key written after a section header as belonging to that section, so this became
-# the unknown key `qos.require_hardware`, was ignored, and the code default --
-# also false -- was used instead. Identical observable behaviour, wrong reason,
-# and the next person's change to the default would have silently overridden
-# this file. test/config_test.go parses this exact file and fails on any key that
-# is not in config.KnownKeys, which is what catches the nesting.
-require_hardware = false
+# It sat under [qos]
+# DELETED: bulk_rate_bps.
+#
+# It configured a token bucket inside the OBC, pacing the artefact HTTP copy
+# path. That limiter is gone. The cap is now the kernel's, on the link device,
+# set by [link] rate_kbps above and adjustable at runtime with the
+# `set_link_limit` command -- which is what a Ground Station operator uses, and
+# which bounds every flow on the interface rather than the one this process
+# happens to serve.
+#
+# Two things this bought and one it cost. It bounded artefact bytes specifically,
+# leaving the operator's own SSH alone; the kernel cap cannot make that
+# distinction and throttles the whole device, which is the requirement it was
+# kept for. And it needed no capability: this needs CAP_NET_ADMIN, so an unshaped
+# OBC is now an UNBOUNDED link rather than a merely-unshaped one. See
+# ARCHITECTURE.md 6.6.
 
 [server]
 # Bind endpoints. The wildcard is correct on the Pi and undialable from a
@@ -63,25 +71,33 @@ device = "eth0"
 # radio, not a tuning knob. Re-applied at every start, so restarting the OBC
 # returns to the launch value.
 rate_kbps = 115
-# Needs CAP_NET_ADMIN.
+# Needs CAP_NET_ADMIN, and with the in-process limiter gone that is a deployment
+# requirement rather than a tuning choice: shaping = false now means the link is
+# UNBOUNDED, because nothing else in this program limits it.
 #
-# OFF by default, and the reason matters. This installs an HTB hierarchy that
-# genuinely caps the link -- measured on the target at a 41 kbit/s priority floor
-# with a 115 kbit/s ceiling -- and that part works.
+# ON by default. This installs an HTB tree with ONE class at rate_kbps, so the
+# number above is the cap -- measured on the target at 115 kbit/s. It bounds every
+# flow on the device, including the operator's own SSH, which is the requirement
+# it is kept for.
 #
-# What does NOT work is telling bulk traffic apart from priority traffic. The tc
-# flower filter that was meant to do it had no classid, so it matched packets and
-# diverted nothing; the root default was the bulk class, so the priority class was
-# unreachable; and after fixing both, on a classful tree with GRO/GSO disabled, a
-# 30 KB artefact fetch still landed in the priority class and the bulk class stayed
-# at zero packets. Re-adding a filter without reading internal/qos/shaper.go would
-# look like a fix while bulk downloads still shared bandwidth with telemetry.
+# What it does NOT do is tell traffic apart. There is no classifier, so telemetry
+# and artefact downloads share the one class: a download can use the whole cap and
+# telemetry waits behind it. That is acceptable because the cap is far larger than
+# telemetry needs -- a 1 Hz frame is 3.2 kbit/s against 115 -- but it means a very
+# large capture shares with telemetry rather than being isolated from it.
 #
-# Artefact downloads are bounded in-process instead, by qos.bulk_rate_bps below.
-# That covers the traffic that was actually starving telemetry. It does not cover
-# the SDR or any other producer, which is why proper link constraint is deferred
-# to its own module rather than declared finished here.
-shaping = false
+# The tc flower filter that was meant to classify is retired. It had no classid,
+# so it matched packets and diverted nothing; the root default was the bulk class,
+# so the priority class was unreachable; and after fixing both, on a classful tree
+# with GRO/GSO disabled, a 30 KB artefact fetch still landed in the priority class
+# and the bulk class stayed at zero packets. Re-adding a filter without reading
+# internal/qos/shaper.go would look like a fix while nothing is actually steered.
+#
+# rate_kbps is never allowed below qos.MinimumRateKbps -- enough for one
+# worst-case telemetry frame per second. A request below that is clamped up and
+# the reason is reported, because running the link unbounded is worse than capping
+# it slightly too high. Adjust it at runtime with the `set_link_limit` command.
+shaping = true
 
 [pico]
 port = "/dev/ttyACM0"
@@ -120,19 +136,17 @@ program = "third_party/sdr-ettus-b200mini"
 interval = "1s"
 
 [qos]
-# Ceiling on artefact downloads, bytes per second, enforced in-process by a token
-# bucket on the HTTP copy path.
+# DELETED: bulk_rate_bps.
 #
-# This comment described a limiter that did not exist. There was a tc hierarchy
-# and nothing else, and the hierarchy could not tell a download from telemetry --
-# see [link] above and ARCHITECTURE.md 6.6. So artefact bytes were unbounded and
-# a photo fetch consumed the whole link.
+# It configured a token bucket inside the OBC that paced the artefact HTTP copy
+# path. That limiter is gone. The cap is now the kernel's, on the link device,
+# set by [link] rate_kbps above and adjustable at runtime with the
+# `set_link_limit` command -- which is what a Ground Station operator uses, and
+# which bounds every flow on the interface rather than the one this process
+# happens to serve.
 #
-# 8 KiB/s is about 64 kbit/s, a little over half the 115 kbit/s radio. That
-# leaves room for telemetry and commands without claiming a precision the link
-# does not have.
-#
-# What this is NOT: link shaping. It bounds only what this process sends, it
-# back-pressures rather than prevents, and it cannot see the SDR or anything else
-# on the box. Set it to 0 for unbounded, which is what a laptop on wifi wants.
-bulk_rate_bps = 8192
+# Two things it bought, and one it cost. It bounded artefact bytes specifically,
+# leaving the operator's own SSH alone; the kernel cap makes no such
+# distinction and throttles the whole device, which is why it was kept. And it
+# needed no capability: this needs CAP_NET_ADMIN, so an unshaped OBC is now an
+# UNBOUNDED link rather than a merely unshaped one. See ARCHITECTURE.md 6.6.

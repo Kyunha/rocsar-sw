@@ -14,7 +14,10 @@
 // seam.
 package domain
 
-import "time"
+import (
+	"fmt"
+	"time"
+)
 
 // SubsystemState is the health of one piece of hardware or software.
 //
@@ -52,6 +55,17 @@ func (s SubsystemState) String() string {
 // key their success decision off the boolean that accompanies it rather than
 // off this type -- a command that succeeded carries ERROR_NONE and a boolean
 // true, and the enum exists for a log line a human reads.
+//
+// That log line is the whole reason this mirror has to be complete. It used to
+// stop at ErrInternal, so when the flight controller gained
+// ERROR_CALIBRATION_FAILED the value came over the wire correctly and was
+// rendered here as "ERROR_INTERNAL" -- two different names for one failure, in
+// the one message an operator reads when a servo refuses to be taught. The
+// conversion is a bare cast (internal/pico/convert.go), so nothing complains and
+// nothing fails; the default arm of String() just swallows it.
+//
+// TestErrorCodesMirrorTheSchema keeps this in step with the proto, because a
+// missing case is invisible until someone has a fault to read.
 type ErrorCode int
 
 const (
@@ -64,6 +78,7 @@ const (
 	ErrUnsupported
 	ErrHardwareFault
 	ErrInternal
+	ErrCalibrationFailed
 )
 
 func (e ErrorCode) String() string {
@@ -84,9 +99,77 @@ func (e ErrorCode) String() string {
 		return "ERROR_UNSUPPORTED"
 	case ErrHardwareFault:
 		return "ERROR_HARDWARE_FAULT"
-	default:
+	case ErrInternal:
 		return "ERROR_INTERNAL"
+	case ErrCalibrationFailed:
+		return "ERROR_CALIBRATION_FAILED"
+	default:
+		// A value from a firmware newer than this host knows. Reporting it as one
+		// of the codes we do know would be a lie about a fault nobody has
+		// classified; naming the number is the honest report.
+		return fmt.Sprintf("ERROR_UNKNOWN(%d)", int(e))
 	}
+}
+
+// ServoFaultBitNames describes what the ST3215's status bits mean, and why this
+// function does not use them.
+//
+// Register 0x41 ("Servo status") is documented in the vendor memory table
+// (docs/Smart  Bus Servo Communication Protocol Manua/sts3215_memory_table.xlsx)
+// as: "Bit0 Bit1 bit2 bit3 bit4 bit5 corresponding bit is set to 1, indicating
+// that the corresponding error occurs, Voltage sensor temperature current angle
+// overload corresponding bit 0 is no phase error." So for *that register* the bits
+// are Voltage, Sensor, Temperature, Current, Angle, Overload.
+//
+// But feedback_error is not that register. It is the byte between LEN and the
+// payload of a reply packet -- the control/status byte the bus protocol carries --
+// and no document in the tree defines its bit meanings. Reading one as the other
+// would be a guess, and a guess here is how an overheating servo gets named
+// "OVERVOLTAGE" and a genuinely undervolted one gets called clean.
+//
+// So the bits are reported as bits. An earlier version of this named them
+// OVERHEATED / OVERLOADED / UNDERVOLTAGE / OVERVOLTAGE / ENCODER_ERROR /
+// COOLING_DOWN, all six invented, all six wrong against the vendor's own list, and
+// the first two had the pleasing property of being the names an engineer would
+// guess. That is exactly why they were dangerous.
+//
+// What is not invented: that the byte is not an ErrorCode, that a set bit is a
+// fault the servo is reporting while answering a perfectly well-formed frame, and
+// which bits are set.
+var ServoFaultBitNames = [...]string{
+	"VOLTAGE", "SENSOR", "TEMPERATURE", "CURRENT", "ANGLE", "OVERLOAD",
+}
+
+// ServoFaults renders the status byte the servo reported alongside a valid
+// position frame.
+//
+// The byte is rendered in hex and the set bits are listed, because the hex is the
+// part that is certainly true. Naming the bits would require reading a register
+// this firmware does not read; see ServoFaultBitNames.
+//
+// A non-zero byte always yields something. common.proto describes this byte as the
+// servo reporting overheat or an overloaded regulator "while answering a
+// perfectly well-formed frame", so an unnamed bit is still a fault the operator
+// has to see -- reporting nothing would reintroduce the bug that a servo in
+// trouble reads clean.
+func ServoFaults(status int32) []string {
+	if status == 0 {
+		return nil
+	}
+	out := []string{fmt.Sprintf("0x%02x", uint8(status))}
+	for bit := 0; bit < 8; bit++ {
+		if status&(1<<bit) == 0 {
+			continue
+		}
+		if bit < len(ServoFaultBitNames) {
+			// Named, with the caveat above: these are the 0x41 names, not this
+			// byte's, so they are a hint rather than a reading.
+			out = append(out, fmt.Sprintf("bit%d(%s?)", bit, ServoFaultBitNames[bit]))
+			continue
+		}
+		out = append(out, fmt.Sprintf("bit%d", bit))
+	}
+	return out
 }
 
 // FeedbackState says whether an antenna's position, load and temperature are a
@@ -131,6 +214,17 @@ type Fix struct {
 	// distinction matters: a receiver can stop answering while still holding a
 	// perfectly valid fix, and only the age reveals which case this is.
 	ObservedAt time.Time
+
+	// VerticalRateMP is the climb rate in m/s, positive up, fitted over a window
+	// rather than differenced -- see gnss.ClimbEstimator for why that distinction
+	// is the whole ballgame at GNSS altitude noise levels.
+	//
+	// A pointer, and nil is the common case at the start of a flight. Nil means
+	// "not yet derivable": too few samples, or the window has not spanned long
+	// enough. It never means zero. A balloon that has genuinely stopped climbing
+	// reports a small number, and a consumer that cannot tell that from "no data
+	// yet" will eventually render the first minute of every ascent as a stall.
+	VerticalRateMP *float64
 }
 
 // Valid reports whether the fix is usable right now.
@@ -250,6 +344,34 @@ type PicoTelemetry struct {
 	// discipline as GondolaHeadingDeg.
 	ImuTemperatureC float64
 	ObservedAt      time.Time
+	// The rest of what the BNO055 is already reporting.
+	//
+	// Tilt, from the same Euler read as the heading -- the first version of this
+	// firmware used only the first of the three angles and discarded the other
+	// two on every tick. It exists as a confidence signal on the heading: the
+	// BNO055 tilt-compensates its fusion using its accelerometer, and a gondola on
+	// a 10-40 m tether swings at roughly 0-0.2 Hz, so sway corrupts the estimate
+	// the heading correction depends on.
+	GondolaRollDeg  float64
+	GondolaPitchDeg float64
+
+	// The calibration status register, verbatim: two bits per sensor, most
+	// significant first (system, gyroscope, accelerometer, magnetometer), each 0
+	// uncalibrated to 3 fully. Zero-initialised, which reads as "nothing
+	// calibrated" -- the safe direction, since it is what an absent sensor
+	// reports too and imu_present distinguishes the two.
+	IMUCalibration uint32
+
+	// The largest linear acceleration seen since boot, per axis, gravity already
+	// removed by the sensor (VECTOR_LINEARACCEL). Monotonic: this is "hardest
+	// thing that has happened", never "how hard things are going now".
+	IMUPeakAccelMs2 [3]float64
+
+	// Increments once per sample that set a new peak -- once per shock, not once
+	// per axis. Carried beside the peak because a monotonic maximum on its own
+	// cannot say whether anything has happened since the last frame, which is the
+	// only question a 1 Hz link can answer about a millisecond transient.
+	IMUPeakAccelEvent uint32
 }
 
 // Photo is a captured image on disk, not in memory.

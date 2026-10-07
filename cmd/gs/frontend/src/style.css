@@ -1,8 +1,14 @@
 /* ROCSAR Ground Station: an operator console, not a marketing page.
  *
  * Dark, dense, monospace-leaning. State is never colour alone: every coloured
- * dot also has a word beside it, because "no data" must not be
- * indistinguishable from anything by colour or by anything else. */
+ * dot, chip and gauge also carries a word beside it, because "no data" must not
+ * be indistinguishable from anything by colour or by anything else.
+ *
+ * Layout is map-dominant: the map and the flight controller take the large left
+ * column, telemetry and controls the right rail, and reference material
+ * (artefacts, preview, log) the collapsible bottom strip. Below 1100 px it
+ * collapses to one column.
+ */
 :root {
     color-scheme: dark;
     --bg: #121418;
@@ -13,6 +19,9 @@
     --accent: #6aa9ff;
     --ok: #7dd87d;
     --bad: #ff7a7a;
+    --warn: #e0b341;
+    --current: #22d3ee;
+    --target: #ffb454;
     --warn-bg: #3a2f14;
     --err-bg: #3d1a1a;
 }
@@ -31,7 +40,7 @@ body {
 }
 
 #app {
-    max-width: 1280px;
+    max-width: 1600px;
     margin: 0 auto;
     padding: 12px 16px 40px;
 }
@@ -52,47 +61,6 @@ header .conn {
     align-items: baseline;
 }
 
-/* Fixed ops grid. Two stable columns so the eye finds the changed panel
- * instead of re-scanning the page. Left column: system, GNSS, flight
- * controller, artefacts. Right column: map, camera·SDR·link, preview, log.
- * Narrow window: one column. */
-#panels {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 0 12px;
-    align-items: start;
-}
-
-#panels > section {
-    min-width: 0;
-}
-
-/* Left column */
-.p-sys,
-.p-gnss,
-.p-pico,
-.p-art {
-    grid-column: 1;
-}
-
-/* Right column */
-.p-map,
-.p-csl,
-.p-prev,
-.p-log {
-    grid-column: 2;
-}
-
-@media (max-width: 1100px) {
-    #panels {
-        grid-template-columns: 1fr;
-    }
-
-    #panels > section {
-        grid-column: 1 / -1;
-    }
-}
-
 h1 {
     font-size: 16px;
     margin: 0;
@@ -103,7 +71,7 @@ h2 {
     text-transform: uppercase;
     letter-spacing: 0.08em;
     color: var(--dim);
-    margin: 14px 0 6px;
+    margin: 0 0 6px;
 }
 
 section {
@@ -111,14 +79,133 @@ section {
     border: 1px solid var(--line);
     border-radius: 6px;
     padding: 8px 12px;
+}
+
+/* ---- status strip -------------------------------------------------- */
+
+#statusbar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    background: var(--panel);
+    padding: 6px 10px;
     margin-top: 10px;
 }
+
+.status-link {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+}
+
+.status-meta {
+    margin-left: auto;
+    color: var(--dim);
+    white-space: nowrap;
+}
+
+/* ---- attention summary --------------------------------------------- */
+
+#attention {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+    margin-top: 10px;
+    min-height: 1.8em;
+}
+
+.attention-where {
+    margin-right: 8px;
+}
+
+/* ---- layout zones -------------------------------------------------- */
+
+#layout {
+    display: grid;
+    grid-template-columns: minmax(0, 2fr) minmax(340px, 1fr);
+    grid-template-areas:
+        "main rail"
+        "bottom bottom";
+    gap: 12px;
+    align-items: start;
+    margin-top: 12px;
+}
+
+.zone-main,
+.zone-rail {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    min-width: 0;
+}
+
+.zone-main {
+    grid-area: main;
+}
+
+.zone-rail {
+    grid-area: rail;
+}
+
+.zone-bottom {
+    grid-area: bottom;
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 12px;
+}
+
+@media (max-width: 1100px) {
+    #layout {
+        grid-template-columns: 1fr;
+        grid-template-areas:
+            "main"
+            "rail"
+            "bottom";
+    }
+
+    .zone-bottom {
+        grid-template-columns: 1fr;
+    }
+}
+
+/* Collapsible reference panels. The section inside is the stale-dim target, so
+ * it keeps its element and loses only the double border. */
+.panel-fold {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 6px 12px 10px;
+}
+
+.panel-fold > summary {
+    cursor: pointer;
+    color: var(--dim);
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+}
+
+.panel-fold > section {
+    background: none;
+    border: 0;
+    border-radius: 0;
+    padding: 0;
+    margin-top: 8px;
+}
+
+/* ---- rows and text ------------------------------------------------- */
 
 .row {
     display: flex;
     gap: 12px;
     align-items: baseline;
     padding: 1px 0;
+    flex-wrap: wrap;
 }
 
 .row > span:first-child {
@@ -137,11 +224,6 @@ section {
 
 .row i {
     color: var(--dim);
-}
-
-#meta {
-    color: var(--dim);
-    margin-top: 6px;
 }
 
 .banner {
@@ -171,6 +253,8 @@ section {
     color: var(--bad);
 }
 
+/* ---- controls ------------------------------------------------------ */
+
 button {
     background: #242932;
     color: var(--text);
@@ -195,60 +279,16 @@ button[data-motion] {
     border-color: #6b4a1f;
 }
 
-/* The motion gate: an in-window confirmation, not a native dialog. Danger
- * styling on Confirm only -- Cancel is the visually quiet default, because
- * the safe action must also be the easy one. */
-.modal-overlay {
-    position: fixed;
-    inset: 0;
-    background: rgba(0, 0, 0, 0.6);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    z-index: 100;
+button.stop {
+    background: #7a1f1f;
+    border-color: #a33;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    padding: 8px 24px;
 }
 
-.modal {
-    background: var(--panel);
-    border: 1px solid #6b4a1f;
-    border-radius: 8px;
-    padding: 16px 20px;
-    max-width: 460px;
-}
-
-.modal-title {
-    font-size: 12px;
-    text-transform: uppercase;
-    letter-spacing: 0.08em;
-    color: var(--dim);
-}
-
-.modal-what {
-    font-size: 15px;
-    font-weight: 600;
-    margin: 8px 0 4px;
-}
-
-.modal-detail {
-    color: var(--dim);
-    margin-bottom: 14px;
-}
-
-.modal-buttons {
-    display: flex;
-    justify-content: flex-end;
-    gap: 10px;
-}
-
-.modal-confirm {
-    border-color: var(--bad);
-}
-
-/* Stale panels dim but stay readable: the last known values are still the
- * best information available, and blanking them would hide exactly what the
- * operator needs to see while the link is down. */
-section.stale-dim {
-    opacity: 0.55;
+button.stop:hover:not(:disabled) {
+    border-color: #f66;
 }
 
 input {
@@ -262,6 +302,393 @@ input {
 
 a {
     color: var(--accent);
+}
+
+.pico-head {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+    margin-bottom: 8px;
+}
+
+.imu-facts {
+    margin-top: 8px;
+}
+
+.controls {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(228px, 1fr));
+    gap: 8px;
+    margin-top: 10px;
+    border-top: 1px solid var(--line);
+    padding-top: 8px;
+}
+
+.ctl {
+    display: flex;
+    gap: 6px;
+    align-items: center;
+    flex-wrap: wrap;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 6px 8px;
+}
+
+.ctl-label {
+    color: var(--dim);
+    font-size: 11px;
+    flex-basis: 100%;
+}
+
+.ctl-stop {
+    justify-content: center;
+}
+
+/* Stale panels dim but stay readable: the last known values are still the
+ * best information available, and blanking them would hide exactly what the
+ * operator needs to see while the link is down. */
+section.stale-dim {
+    opacity: 0.55;
+}
+
+/* ---- instruments --------------------------------------------------- */
+
+.w-card {
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 6px 8px;
+    margin-top: 6px;
+}
+
+.w-card-head {
+    display: flex;
+    gap: 6px;
+    align-items: center;
+    flex-wrap: wrap;
+    margin-top: 4px;
+}
+
+.servo-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(232px, 1fr));
+    gap: 8px;
+    margin-top: 8px;
+}
+
+.servo-top {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+}
+
+.servo-facts {
+    min-width: 0;
+}
+
+.servo-title {
+    display: flex;
+    gap: 6px;
+    align-items: center;
+}
+
+.servo-line {
+    font-size: 11px;
+    color: var(--dim);
+}
+
+.servo-actions {
+    display: flex;
+    gap: 6px;
+    margin-top: 6px;
+}
+
+.w-compass {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-wrap: wrap;
+}
+
+.w-rose {
+    fill: #0e1014;
+    stroke: var(--line);
+    stroke-width: 1;
+}
+
+.w-tick {
+    stroke: #3a4048;
+    stroke-width: 1;
+}
+
+.w-tick-major {
+    stroke: #5a6470;
+}
+
+.w-card-text,
+.w-compass .w-card {
+    fill: var(--dim);
+    font-size: 11px;
+}
+
+.w-needle-current {
+    stroke: var(--current);
+    stroke-width: 3;
+    stroke-linecap: round;
+}
+
+.w-needle-current.w-held {
+    stroke-dasharray: 4 3;
+}
+
+.w-needle-target {
+    stroke: var(--target);
+    stroke-width: 2;
+    stroke-dasharray: 5 3;
+    stroke-linecap: round;
+}
+
+.w-arc {
+    fill: none;
+    stroke: var(--warn);
+    stroke-width: 2;
+    opacity: 0.85;
+}
+
+.w-hub {
+    fill: var(--text);
+}
+
+.w-legend {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    font-size: 12px;
+}
+
+.w-current {
+    color: var(--current);
+}
+
+.w-target {
+    color: var(--target);
+}
+
+.w-ring {
+    flex: 0 0 auto;
+}
+
+.w-chip {
+    display: inline-block;
+    padding: 0 6px;
+    border: 1px solid var(--line);
+    border-radius: 9px;
+    font-size: 11px;
+    white-space: nowrap;
+}
+
+.w-chip.w-ok {
+    color: #9fe89f;
+    border-color: #2f5a2f;
+}
+
+.w-chip.w-bad {
+    color: #ff9c9c;
+    border-color: #5a2f2f;
+}
+
+.w-chip.w-warn {
+    color: #f0cf7a;
+    border-color: #5c4a1c;
+}
+
+.w-chip.w-info {
+    color: #9cc4ff;
+    border-color: #274068;
+}
+
+.w-chip.w-dim {
+    color: var(--dim);
+}
+
+.w-tile {
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 3px 8px;
+    min-width: 68px;
+}
+
+.w-tile-label {
+    color: var(--dim);
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+}
+
+.w-tile-value {
+    font-weight: 600;
+}
+
+.w-tile-sub {
+    color: var(--dim);
+    font-size: 11px;
+}
+
+.w-tile.w-ok .w-tile-value {
+    color: #9fe89f;
+}
+
+.w-tile.w-warn .w-tile-value {
+    color: #f0cf7a;
+}
+
+.w-tile.w-bad .w-tile-value {
+    color: #ff9c9c;
+}
+
+.w-bar {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 11px;
+    margin-top: 3px;
+}
+
+.w-bar-label {
+    color: var(--dim);
+    min-width: 54px;
+}
+
+.w-bar-track {
+    flex: 1 1 auto;
+    height: 8px;
+    background: #0e1014;
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    overflow: hidden;
+}
+
+.w-bar-fill {
+    display: block;
+    height: 100%;
+    background: var(--accent);
+}
+
+.w-bar-fill.w-warn {
+    background: var(--warn);
+}
+
+.w-bar-fill.w-bad {
+    background: var(--bad);
+}
+
+.w-bar-value {
+    min-width: 54px;
+    text-align: right;
+}
+
+.w-held-word {
+    color: var(--dim);
+    font-style: italic;
+}
+
+/* A held reading is drawn as an empty hatched track, never as a short bar: a
+ * zero-length bar reads as "zero", which is the value it does not have. */
+.w-hatch {
+    display: block;
+    height: 100%;
+    width: 100%;
+    background-image: repeating-linear-gradient(45deg, #2a2e37 0 4px, transparent 4px 8px);
+}
+
+.w-spark {
+    display: block;
+}
+
+.w-spark-line {
+    fill: none;
+    stroke: var(--accent);
+    stroke-width: 1.5;
+}
+
+.w-spark-empty {
+    fill: var(--dim);
+    font-size: 10px;
+}
+
+.w-knob {
+    cursor: grab;
+    touch-action: none;
+}
+
+.w-knob:active {
+    cursor: grabbing;
+}
+
+.w-knob:focus {
+    outline: 1px solid var(--accent);
+    outline-offset: 2px;
+}
+
+.w-knob-arc {
+    fill: none;
+    stroke: var(--line);
+    stroke-width: 4;
+    stroke-linecap: round;
+}
+
+.w-knob-needle {
+    stroke: var(--accent);
+    stroke-width: 3;
+    stroke-linecap: round;
+}
+
+.w-knob-hub {
+    fill: var(--text);
+}
+
+/* ---- map, download, log -------------------------------------------- */
+
+#map {
+    height: 520px;
+    width: 100%;
+}
+
+#position {
+    font-size: 12px;
+    color: var(--dim);
+    margin-top: 6px;
+}
+
+.hint {
+    color: var(--dim);
+    font-size: 11px;
+}
+
+/* The arming-delay suggestion is an offer, not a value: underlined on hover so
+ * it is discoverable as clickable without relying on the accent colour, which
+ * is the same accessibility rule the absence discipline (7.1) rests on. */
+.suggest {
+    color: var(--accent);
+    cursor: pointer;
+    text-decoration: underline dotted;
+}
+
+.suggest:hover {
+    text-decoration: underline;
+}
+
+.dl-track {
+    height: 10px;
+    margin: 4px 0;
+}
+
+.dl-name {
+    font-weight: 600;
+}
+
+.dl-meta {
+    color: var(--dim);
+    font-size: 11px;
 }
 
 #log {
@@ -285,10 +712,4 @@ a {
     border: 1px solid var(--line);
     border-radius: 4px;
     margin-top: 6px;
-}
-
-#map {
-    height: 400px;
-    width: 100%;
-    margin-top: 16px;
 }

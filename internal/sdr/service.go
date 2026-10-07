@@ -216,11 +216,10 @@ func sameFile(a, b string) bool {
 // something else may be editing means the values validated are not necessarily
 // the values written.
 //
-// raw is the file as it stands, including every key this package does not model.
-// That map is what gets written back, which is why T_MIN_US, T_MAX_US,
-// START_OFFSET_S, TX_ANTENNA and RX_ANTENNA survive a partial update: encoding
-// the typed struct instead would drop all five, and load_config()'s j.at() would
-// throw on the next ./connect with no way back from the air.
+// raw is the file as it stands, including every key this package does not model,
+// and it is that map -- not the typed struct -- which gets written back. An
+// unmodelled key therefore survives a partial update rather than being dropped for
+// load_config()'s j.at() to throw on at the next ./connect.
 func (s *Service) loadParams() (domain.SdrParams, map[string]any, error) {
 	var typed domain.SdrParams
 

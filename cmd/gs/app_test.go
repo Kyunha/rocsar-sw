@@ -113,7 +113,7 @@ func newHarness(t *testing.T) *harness {
 			}
 			return
 		}
-		transport.NewFileHandler(store, log, 0).ServeHTTP(w, r)
+		transport.NewFileHandler(store, log).ServeHTTP(w, r)
 	}))
 
 	h.endpoints = client.Config{Control: control, Telemetry: publish, HTTP: h.http.URL, Topic: "telemetry"}

@@ -6,6 +6,7 @@ import (
 	"time"
 
 	rocsarv1 "github.com/rocsar/obc/api/rocsar/v1"
+	"github.com/rocsar/obc/internal/domain"
 )
 
 // This file is presentation and nothing else.
@@ -52,9 +53,20 @@ func printTelemetry(f *rocsarv1.TelemetryFrame) {
 			fmt.Printf("         gnss%s %d  no fix   <- not a position\n", sel, g.GetReceiverId())
 			continue
 		}
-		fmt.Printf("         gnss%s %d  %10.6f, %11.6f  alt %7.1f m  %5.1f m/s  crs %5.1f\n",
+		// Climbrate, and the em dash when there is none.
+		//
+		// Optional on the wire because the estimator needs about a minute of
+		// window before it will fit anything. Printing 0.00 m/s for that first
+		// minute would assert the balloon is at float, which is the one thing it
+		// is not; a balloon that really is at float prints a small number from the
+		// same branch.
+		climb := "        "
+		if v := g.VerticalRateMps; v != nil {
+			climb = fmt.Sprintf("%+6.2f m/s", *v)
+		}
+		fmt.Printf("         gnss%s %d  %10.6f, %11.6f  alt %7.1f m  climb %s  %5.1f m/s  crs %5.1f\n",
 			sel, g.GetReceiverId(), g.GetLatitudeDeg(), g.GetLongitudeDeg(),
-			g.GetAltitudeM(), g.GetGroundSpeedMps(), g.GetCourseDeg())
+			g.GetAltitudeM(), climb, g.GetGroundSpeedMps(), g.GetCourseDeg())
 	}
 
 	if p := f.Pico; p != nil {
@@ -66,10 +78,55 @@ func printTelemetry(f *rocsarv1.TelemetryFrame) {
 			conn, p.GetGondolaHeadingDeg(), p.GetTargetHeadingDeg(),
 			measuredOrHeld(p.GetImuPresent()))
 		if p.GetImuPresent() {
-			// Only meaningful as a measurement: otherwise it is held from the
-			// last reading, and printing it beside HELD invites reading it as one.
+			// Only meaningful as a measurement: otherwise it is held from the last
+			// reading, and printing it beside HELD invites reading it as one.
 			fmt.Printf("  imu temp %.1fC", p.GetImuTemperatureC())
 		}
+
+		// Tilt and calibration, guarded by presence for the same reason: a held
+		// tilt beside a live bearing invites reading the two together when only the
+		// bearing is current.
+		//
+		// Tilt is a confidence signal on the heading rather than attitude in its own
+		// right. The BNO055 tilt-compensates its fusion using its accelerometer, and
+		// a gondola on a 10-40 m tether swings at roughly 0.1 Hz, so sway corrupts
+		// the estimate the heading correction depends on. Erratic tilt is the tell
+		// that the bearing has gone bad.
+		if p.GetImuPresent() {
+			fmt.Printf("         imu    tilt roll %6.2f pitch %6.2f deg\n",
+				p.GetGondolaRollDeg(), p.GetGondolaPitchDeg())
+
+			// Calibration decoded from register 0x35: two bits per sensor, system
+			// first. Only the magnetometer decides whether a heading means anything,
+			// so it is the one called out by name.
+			calib := p.GetImuCalibration()
+			mag := calib & 3
+			verdict := "mag UNCALIBRATED -- heading not trustworthy"
+			if mag == 3 {
+				verdict = "mag calibrated"
+			}
+			fmt.Printf("         imu    calib sys %d gyro %d accel %d mag %d  %s\n",
+				(calib>>6)&3, (calib>>4)&3, (calib>>2)&3, mag, verdict)
+		}
+
+		// The peak never falls, so it is the flight's hardest moment rather than a
+		// live reading, and the counter beside it says whether anything has happened
+		// since the last frame -- which is the only question a 1 Hz link can answer
+		// about a millisecond transient.
+		//
+		// Printed unconditionally, and that is deliberate. The peak of a sensor that
+		// has since stopped answering is exactly what an operator wants afterwards,
+		// and guarding it on presence would erase the record of whatever stopped it.
+		peak := p.GetImuPeakAccelXMs2()
+		if y := p.GetImuPeakAccelYMs2(); y > peak {
+			peak = y
+		}
+		if z := p.GetImuPeakAccelZMs2(); z > peak {
+			peak = z
+		}
+		fmt.Printf("         imu    accel peak %6.1f m/s^2 since boot (%d events)\n",
+			peak, p.GetImuPeakAccelEvent())
+
 		fmt.Printf("  heaters %s/%s\n",
 			onOff(p.GetHeater1State()), onOff(p.GetHeater2State()))
 		for _, a := range p.GetAntennas() {
@@ -97,10 +154,13 @@ func printTelemetry(f *rocsarv1.TelemetryFrame) {
 					a.GetServoId(), a.GetCenterTick())
 			}
 			if e := a.GetFeedbackError(); e != 0 {
-				// The ST3215 reports overheat and overload here while answering
-				// perfectly well-formed frames, so a servo in trouble reads clean
-				// unless this is looked at.
-				fmt.Printf("                servo %d  FAULT %s\n", a.GetServoId(), rocsarv1.ErrorCode(a.GetFeedbackError()).String())
+				// The ST3215's own status bits -- overheat, overload, undervoltage --
+				// which it reports while answering perfectly well-formed frames, so
+				// a servo in trouble reads clean unless this is looked at. Named with
+				// domain.ServoFaults rather than the command ErrorCode, which called
+				// an overheating servo ERROR_INVALID_COMMAND.
+				fmt.Printf("                servo %d  FAULT %s\n", a.GetServoId(),
+					strings.Join(domain.ServoFaults(e), "+"))
 			}
 		}
 	}

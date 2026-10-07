@@ -2,20 +2,37 @@
  *
  * Vanilla TypeScript, no framework. The window renders what Go decodes: every
  * value arrives through the WebSocket bridge (first paint) and events
- * (everything after), already shaped by internal/gsview. This file formats
- * and places; it never converts units, never invents a zero, and never
- * constructs a command -- motion commands go through confirm() per
- * GUI_ARCHITECTURE.md 10.
+ * (everything after), already shaped by internal/gsview. This file formats and
+ * places; it never converts units and never invents a zero. The panel renderers
+ * live in panels.ts and the instruments in widgets.ts, both pure, so the same
+ * markup can be rendered from fixtures without a console.
  *
- * The console is a pure web app: the Go binary serves this file and the
- * operator opens the URL in their own browser. There is no generated binding
- * layer -- bridge.ts is the hand-written client and models.ts the hand-written
- * types. See GUI_ARCHITECTURE.md sections 1.2-1.4.
+ * Motion commands fire without a confirmation step (GUI_ARCHITECTURE.md 10). The
+ * knobs beside the motion inputs set values; the buttons commit them. Nothing is
+ * sent while a knob is dragged.
+ *
+ * The console is a pure web app: the Go binary serves this file and the operator
+ * opens the URL in their own browser. There is no generated binding layer --
+ * bridge.ts is the hand-written client and models.ts the hand-written types.
+ * See GUI_ARCHITECTURE.md sections 1.2-1.4.
  */
 import 'maplibre-gl/dist/maplibre-gl.css';
-import { initMap, setMapClickHandler } from './map';
+import { bearingTo, initMap, setMapClickHandler } from './map';
 import './style.css';
 import { call, on, connect } from './bridge';
+import {
+    esc,
+    fmtBytes,
+    renderAttention,
+    renderCameraSdrLink,
+    renderDownload,
+    renderGnss,
+    renderLinkLine,
+    renderPico,
+    renderSystem,
+    telemetryAgeRing,
+} from './panels';
+import { knob, knobGeometry, knobValueFromPointer } from './widgets';
 import type { View, CommandResult, LinkState, Config, Entry, SdrParamsPatch, FrameEvent, DownloadProgress, DownloadDone } from './models';
 
 /* Stale after three telemetry intervals. A constant, not configuration --
@@ -51,47 +68,23 @@ let frameAgeS = 0;
 let framesSeen = 0;
 let currentPath = '';
 
+/* The last decoded frame and the last link state. The attention summary is a
+ * function of both and they arrive on different events, so whichever lands
+ * second redraws it. Deriving either from the DOM would mean reading rendered
+ * text back, which is the round trip that breaks silently. */
+let currentView: View | null = null;
+let lastLink: LinkState | null = null;
+
+/* Frame-age history for the link sparkline: two minutes at 1 Hz. Bounded,
+ * because a window left open overnight is not. */
+const ageHistory = telemetryAgeRing();
+
 function req(id: string): HTMLElement {
     const el = document.getElementById(id);
     if (el === null) {
         throw new Error(`missing element #${id}`);
     }
     return el;
-}
-
-function esc(s: string): string {
-    return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-}
-
-function fmtDeg(v: number): string {
-    return `${v.toFixed(2)}°`;
-}
-
-function fmtUptime(s: number): string {
-    const h = Math.floor(s / 3600);
-    const m = Math.floor((s % 3600) / 60);
-    const sec = Math.floor(s % 60);
-    return `${h}h${m.toString().padStart(2, '0')}m${sec.toString().padStart(2, '0')}s`;
-}
-
-function fmtBytes(n: number): string {
-    if (n < 1024) {
-        return `${n} B`;
-    }
-    if (n < 1024 * 1024) {
-        return `${(n / 1024).toFixed(1)} KiB`;
-    }
-    return `${(n / 1024 / 1024).toFixed(1)} MiB`;
-}
-
-function fmtAge(s: number): string {
-    if (s < 1.5) {
-        return 'just now';
-    }
-    if (s < 90) {
-        return `${s.toFixed(1)}s ago`;
-    }
-    return `${(s / 60).toFixed(1)}m ago`;
 }
 
 function logLine(text: string): void {
@@ -122,58 +115,18 @@ async function run(name: string, fn: () => Promise<Cmd>): Promise<void> {
     }
 }
 
-/* Motion commands ask first. A typed `jog 1 3000` in a terminal is a
- * deliberate act with an echo; a click is neither. See GUI_ARCHITECTURE.md 10.
- * One overlay per call, removed on settle: concurrent prompts stack rather
- * than replacing each other, so no confirmation can be dismissed by another
- * button's dialog. */
-function confirmMotion(what: string, detail: string): Promise<boolean> {
-    return new Promise((resolve) => {
-        const overlay = document.createElement('div');
-        overlay.className = 'modal-overlay';
-        overlay.innerHTML = `
-            <div class="modal" role="alertdialog" aria-modal="true" aria-label="confirm motion">
-                <div class="modal-title">Confirm motion</div>
-                <div class="modal-what"></div>
-                <div class="modal-detail"></div>
-                <div class="modal-buttons">
-                    <button class="modal-cancel">Cancel (Esc)</button>
-                    <button class="modal-confirm">Confirm</button>
-                </div>
-            </div>`;
-        (overlay.querySelector('.modal-what') as HTMLElement).textContent = what;
-        (overlay.querySelector('.modal-detail') as HTMLElement).textContent = detail;
-        const done = (v: boolean): void => {
-            document.removeEventListener('keydown', onKey);
-            overlay.remove();
-            resolve(v);
-        };
-        const onKey = (ev: KeyboardEvent): void => {
-            if (ev.key === 'Escape') {
-                done(false);
-            } else if (ev.key === 'Enter') {
-                done(true);
-            }
-        };
-        (overlay.querySelector('.modal-cancel') as HTMLButtonElement).onclick = () => done(false);
-        (overlay.querySelector('.modal-confirm') as HTMLButtonElement).onclick = () => done(true);
-        overlay.addEventListener('mousedown', (ev: Event) => {
-            if (ev.target === overlay) {
-                done(false);
-            }
-        });
-        document.addEventListener('keydown', onKey);
-        document.body.appendChild(overlay);
-        (overlay.querySelector('.modal-confirm') as HTMLButtonElement).focus();
-    });
-}
-
-async function runMotion(name: string, what: string, detail: string, fn: () => Promise<Cmd>): Promise<void> {
-    if (!(await confirmMotion(what, detail))) {
-        return;
-    }
-    await run(name, fn);
-}
+/* Motion commands fire directly, with no confirmation step.
+ *
+ * GUI_ARCHITECTURE.md 10 previously required a two-step gate on motion, on the
+ * argument that a slider drag or a button click is not a deliberate act the way
+ * a typed command is. That gate has been removed: the operator is now pointing
+ * at a target on a map and watching the result, and the extra click was a step
+ * between them and the command rather than a safety property. The section
+ * records the reversal.
+ *
+ * The knobs below the map do not weaken this. A knob writes only the number in
+ * the adjacent input; it sends nothing. The adjacent button remains the single
+ * commit act, and it is the thing `data-motion` marks for the stale stand-down. */
 
 function numArg(id: string): number {
     const el = req(id) as HTMLInputElement;
@@ -200,6 +153,11 @@ function clearParams(): void {
     for (const [id] of PARAM_FIELDS) {
         (req(id) as HTMLInputElement).value = '';
     }
+    // Forgetting the arming-delay suggestion matters: it is the one field whose
+    // value this console can arrive at on its own, and clearing the panel is the
+    // operator saying "start from nothing".
+    offsetTouched = false;
+    renderOffsetSuggestion();
 }
 
 /* Input id to params.json key. One table, used for both directions: refresh
@@ -270,6 +228,121 @@ async function refreshParams(): Promise<void> {
     }
 }
 
+/* --------------------------------------------------------------------------
+   Arming delay, suggested from the session length
+   -------------------------------------------------------------------------- */
+
+/* Arming delays that have been flown, keyed by session duration in seconds.
+ *
+ * The OBC does not derive this -- connect.cpp takes START_OFFSET_S as given --
+ * so the relationship lives here, in the console, and is applied only when the
+ * operator asks for it. Provenance is the whole content of this table: it is a
+ * set of flown values, not a formula, and the nearest match is chosen because
+ * interpolating a flight parameter would imply a confidence the data does not
+ * have. */
+const START_OFFSET_BY_DURATION: ReadonlyArray<readonly [number, number]> = [
+    [1, 0.1],
+    [5, 0.1],
+    [10, 0.5],
+    [15, 0.7],
+    [20, 0.9],
+    [25, 1.05],
+];
+
+/* offsetTouched records that the operator has typed their own arming delay.
+ *
+ * It gates the suggestion permanently, and that is the whole safety argument
+ * for this feature. In this console blank means "leave alone", so ANY value in
+ * the field becomes part of the next SetSdrParams whether or not the operator
+ * meant it. Filling the field automatically -- which is what the Tkinter console
+ * does, unconditionally, on every keystroke in SESSION_DURATION -- would mean
+ * tabbing through the session field silently queued an arming-delay change for
+ * the vehicle. So the suggestion is never written into the input; it is shown
+ * beside it and takes one click.
+ *
+ * Once touched it stops appearing, because a suggestion that reappears over a
+ * value somebody deliberately typed is noise at best and a warning at worst. */
+let offsetTouched = false;
+
+/* suggestStartOffset returns the flown arming delay nearest to durationS, or
+ * undefined when the field is empty or not a number. */
+function suggestStartOffset(durationS: number): number | undefined {
+    let best: readonly [number, number] | undefined;
+    for (const entry of START_OFFSET_BY_DURATION) {
+        if (best === undefined || Math.abs(entry[0] - durationS) < Math.abs(best[0] - durationS)) {
+            best = entry;
+        }
+    }
+    return best?.[1];
+}
+
+/* renderOffsetSuggestion repaints the affordance beside the arming-delay input.
+ *
+ * Three states, and no fourth:
+ *   - the operator typed a value: nothing. Their number stands unremarked.
+ *   - a session duration is typed and the field is empty: a clickable chip
+ *     carrying the flown value for that length.
+ *   - no session duration: nothing. Guessing from an empty field is inventing a
+ *     mission parameter.
+ *
+ * The chip states where the number came from rather than presenting it as the
+ * value, because it is one: "flown at 20 s" is not "the value for 20 s". */
+function renderOffsetSuggestion(): void {
+    const slot = document.getElementById('offset-suggestion');
+    if (slot === null) {
+        return;
+    }
+    const offset = req('in-soffset') as HTMLInputElement;
+    if (offsetTouched || offset.value.trim() !== '') {
+        slot.textContent = '';
+        return;
+    }
+
+    const raw = (req('in-sess') as HTMLInputElement).value.trim();
+    if (raw === '') {
+        slot.textContent = '';
+        return;
+    }
+    const duration = Number(raw);
+    if (!Number.isFinite(duration)) {
+        slot.textContent = '';
+        return;
+    }
+    const suggestion = suggestStartOffset(duration);
+    if (suggestion === undefined) {
+        slot.textContent = '';
+        return;
+    }
+
+    slot.textContent = '';
+    const chip = document.createElement('a');
+    chip.href = '#';
+    chip.className = 'suggest';
+    chip.textContent = `use ${suggestion} s (flown at ${duration} s)`;
+    chip.onclick = (ev: Event) => {
+        ev.preventDefault();
+        offset.value = String(suggestion);
+        // Deliberate now: it came from a click, and further changes to the
+        // session length must not overwrite it.
+        offsetTouched = true;
+        renderOffsetSuggestion();
+    };
+    slot.appendChild(chip);
+}
+
+/* Wire the two inputs the suggestion depends on.
+ *
+ * `input` rather than `change`, so the chip appears as the duration is typed
+ * instead of only on blur. */
+function wireOffsetSuggestion(): void {
+    const offset = req('in-soffset') as HTMLInputElement;
+    offset.addEventListener('input', () => {
+        offsetTouched = true;
+        renderOffsetSuggestion();
+    });
+    (req('in-sess') as HTMLInputElement).addEventListener('input', renderOffsetSuggestion);
+}
+
 /* Per-servo buttons are re-rendered with every frame, so they delegate from
  * the persistent container instead of being wired per render: wiring that has
  * to be re-attached every second is wiring that will be forgotten. */
@@ -283,12 +356,12 @@ function wireServoButtons(): void {
         const stop = b.dataset.stopServo;
         if (zero !== undefined) {
             // Not "returns to its centre tick": `zero` teaches the servo the
-            // tick it is already sitting at, so the axis does not move. The axis
-            // does not move is worth saying out loud, because the old wording
-            // implied motion and an operator would reasonably brace for it.
-            void runMotion('zero', `Teach servo ${zero} its centre?`, 'Writes the centre into the servo. The axis does not move -- the tick it is at now becomes 0 degrees. Takes about a quarter second.', () => call<Cmd>('ZeroServo', Number(zero)));
+            // tick it is already sitting at, so the axis does not move. That is
+            // worth saying out loud, because the old wording implied motion and
+            // an operator would reasonably brace for it.
+            void run('zero', () => call<Cmd>('ZeroServo', Number(zero)));
         } else if (stop !== undefined) {
-            void runMotion('stop', `Stop servo ${stop}?`, 'Motion halts on that axis.', () => call<Cmd>('StopServo', Number(stop)));
+            void run('stop', () => call<Cmd>('StopServo', Number(stop)));
         }
     });
 }
@@ -298,104 +371,18 @@ function strArg(id: string): string {
 }
 
 /* ------------------------------------------------------------------ */
-/* panels                                                             */
+/* frame and link                                                     */
 /* ------------------------------------------------------------------ */
-
-function renderSystem(v: View): string {
-    const s = v.system;
-    const mocked = s.mocked && s.mocked.length > 0
-        ? `<div class="banner warn">SIMULATED: ${s.mocked.map(esc).join(', ')} — fabricated, not measured</div>`
-        : '';
-    return `${mocked}
-        <div class="row"><span>state</span><b>${esc(s.state)}</b></div>
-        <div class="row"><span>uptime</span><b>${fmtUptime(s.uptime_s)}</b></div>
-        <div class="row"><span>cpu</span><b>${s.cpu_temp_c.toFixed(0)} °C</b></div>`;
-}
-
-function renderGnss(v: View): string {
-    return v.gnss.map((g) => {
-        const mark = g.selected ? '*' : ' ';
-        const pos = g.position === null || g.position === undefined
-            ? '<i>no fix — not a position</i>'
-            : `${g.position.latitude_deg.toFixed(6)}, ${g.position.longitude_deg.toFixed(6)} alt ${g.position.altitude_m.toFixed(1)} m`;
-        const age = g.fix_age_s === null || g.fix_age_s === undefined ? 'never' : fmtAge(g.fix_age_s);
-        return `<div class="row"><span>gnss${mark} ${g.receiver_id}</span><b>${pos}</b></div>
-            <div class="row sub"><span>fix</span><b>${g.fix_ok ? `ok, ${age}` : 'no fix'}</b></div>
-            <div class="row sub"><span>packets</span><b>ok ${g.packets_accepted} / rej ${g.packets_rejected}</b></div>`;
-    }).join('');
-}
-
-function renderPico(v: View): string {
-    if (v.pico === null || v.pico === undefined) {
-        return '<div class="row"><span>pico</span><b>no data</b></div>';
-    }
-    const p = v.pico;
-    const axes = (p.antennas || []).map((a) => {
-        const load = a.load === null || a.load === undefined
-            ? 'load held'
-            : `load ${a.load}% ${a.temperature_c ?? '?'}C`;
-        const fault = a.feedback_error ? ` <span class="err">FAULT ${esc(a.feedback_error)}</span>` : '';
-        // The centre rides with the axis because center_tick alone cannot say
-        // whether it was measured. The servo holds its own zero now, so an axis
-        // that was never taught reports the same 2048 as one that was -- and
-        // rendering that as "centred" is a lie an operator would act on.
-        const centre = a.center_zeroed
-            ? `centre ${a.center_tick}`
-            : `<span class="err">centre UNTAUGHT (assumed ${a.center_tick})</span>`;
-        return `<div class="row sub"><span>servo ${a.servo_id}</span><b>tick ${a.current_tick} ${fmtDeg(a.current_angle_deg)} ${centre} ${esc(load)} ${esc(a.feedback)}${fault}</b> <button data-motion data-zero-servo="${a.servo_id}">zero</button> <button data-motion data-stop-servo="${a.servo_id}">stop</button></div>`;
-    }).join('');
-    const ack = v.pico_last_ack === null || v.pico_last_ack === undefined
-        ? 'no ack'
-        : `ack #${v.pico_last_ack.command_sequence} ${v.pico_last_ack.success ? 'ok' : esc(v.pico_last_ack.error)}`;
-    const imuTemp = p.imu_temperature_c === null || p.imu_temperature_c === undefined
-        ? '—'
-        : `${p.imu_temperature_c.toFixed(1)}C`;
-    return `<div class="row"><span>pico</span><b>${v.pico_connected ? 'connected' : 'NOT connected'} heading ${fmtDeg(p.gondola_heading_deg)} (target ${fmtDeg(p.target_heading_deg)}) imu ${esc(p.imu)}</b></div>
-        <div class="row sub"><span>heaters</span><b>${p.heater1_on ? 'on' : 'off'} / ${p.heater2_on ? 'on' : 'off'} · ${esc(ack)}</b></div>
-        <div class="row sub"><span>imu temp</span><b>${imuTemp}</b></div>
-        ${axes}`;
-}
-
-function renderCameraSdrLink(v: View): string {
-    const c = v.camera;
-    const photos = c.photos_taken === null || c.photos_taken === undefined ? '—' : `${c.photos_taken} photo(s)`;
-    const last = c.last_photo ? ` last ${esc(c.last_photo)}` : '';
-    const s = v.sdr;
-    const log = s.last_error ? ` last error: ${esc(s.last_error)}` : '';
-    /* The PID, not `running`. This rendered "running pid true" for as long as
-     * the field existed, because the boolean and the pid sit next to each other
-     * in the view and only one of them is a number. An operator checking whether
-     * an acquisition is theirs was reading the word "true". */
-    const pid = s.running ? ` running pid ${s.pid}` : '';
-    /* Where the child's output went. connect writes everything to this file and
-     * the OBC only ever holds its path, so without it on screen there is nowhere
-     * to look when an acquisition stops without an error -- which is the whole
-     * question an operator has at that moment. */
-    const logPath = s.last_log ? ` log ${esc(s.last_log)}` : '';
-    const l = v.link;
-    const shaping = l.shaping_active ? 'shaping on' : `shaping off${l.inactive_reason ? `: ${esc(l.inactive_reason)}` : ''}`;
-    return `<div class="row"><span>camera</span><b>${esc(c.state)} ${photos}${last}</b></div>
-        <div class="row"><span>sdr</span><b>${esc(s.state)}${pid}${log}${logPath}</b></div>
-        <div class="row"><span>link</span><b>${esc(l.state)} ${esc(l.device)} ${l.rate_kbps} kbit/s ${shaping}</b></div>`;
-}
-
-function renderHealth(v: View): string {
-    const bad = !v.healthy || (v.not_healthy_reasons && v.not_healthy_reasons.length > 0);
-    if (!bad) {
-        return '';
-    }
-    const reasons = (v.not_healthy_reasons || []).map(esc).join('; ');
-    return `<div class="banner err">not healthy${reasons ? `: ${reasons}` : ''}</div>`;
-}
 
 function renderFrame(ev: FrameEvent): void {
     const v = ev.view;
+    currentView = v;
     req('sys').innerHTML = renderSystem(v);
     req('gnss').innerHTML = renderGnss(v);
     req('pico').innerHTML = renderPico(v);
     req('csl').innerHTML = renderCameraSdrLink(v);
-    req('health').innerHTML = renderHealth(v);
-    const meta: string[] = [`seq ${v.sequence}`];
+    req('attention').innerHTML = renderAttention(v, lastLink);
+    const meta: string[] = [`seq ${v.sequence}`, `uptime ${Math.floor(v.uptime_s / 60)}m`];
     if (ev.gaps > 0) {
         meta.push(`gap +${ev.gaps}`);
     }
@@ -414,13 +401,13 @@ function renderFrame(ev: FrameEvent): void {
 }
 
 function renderLink(l: LinkState): void {
-    const dot = (ok: boolean): string => ok ? '●' : '○';
-    req('linkline').innerHTML =
-        `<span class="${l.control_connected ? 'ok' : 'bad'}">${dot(l.control_connected)} control</span> ` +
-        `<span class="${l.telemetry_connected ? 'ok' : 'bad'}">${dot(l.telemetry_connected)} telemetry</span> ` +
-        `<span>frames ${l.frames_received} gaps ${l.sequence_gaps} dropped ${l.frames_discarded}</span> ` +
-        `<span>${l.last_error ? esc(l.last_error) : ''}</span>`;
+    lastLink = l;
+    ageHistory.push(l.last_frame_age_s);
+    req('linkline').innerHTML = renderLinkLine(l, ageHistory.values());
     noteLink(l);
+    if (currentView !== null) {
+        req('attention').innerHTML = renderAttention(currentView, l);
+    }
 }
 
 /* Records the two numbers staleness is decided from. Deliberately separate from
@@ -528,13 +515,11 @@ async function downloadByName(name: string, list: Entry[]): Promise<void> {
     }
 }
 
+/* The progress line is a bar with a wall-clock finish time, not a bare duration:
+ * H1 makes progress and an ETA mandatory, and a 30 MB capture at 8 KiB/s is over
+ * an hour, which is a time of day the operator wants, not a seconds count. */
 function renderProgress(p: DownloadProgress): void {
-    const pct = p.total > 0 ? ` ${(100 * p.bytes / p.total).toFixed(1)}%` : '';
-    const eta = p.rate_kbs > 0.1 && p.total > 0
-        ? ` ETA ${Math.round((p.total - p.bytes) / 1024 / p.rate_kbs)}s`
-        : '';
-    req('dlstatus').textContent =
-        `${p.name}: ${fmtBytes(p.bytes)}${p.total > 0 ? ` / ${fmtBytes(p.total)}` : ''}${pct} ${p.rate_kbs.toFixed(1)} KiB/s${eta}`;
+    req('dlstatus').innerHTML = renderDownload(p.name, p.bytes, p.total, p.rate_kbs);
 }
 
 // showPreview fetches one artefact for in-window display. No auto-preview on
@@ -562,6 +547,125 @@ async function showPreview(name: string): Promise<void> {
 }
 
 /* ------------------------------------------------------------------ */
+/* knobs                                                              */
+/* ------------------------------------------------------------------ */
+
+/* A knob is a second view of the numeric input beside it, never a command.
+ *
+ * The input stays the source of truth, so numArg() and the commit buttons are
+ * unchanged from what they were without knobs. The knob writes a value only
+ * while the operator is dragging it; telemetry never writes into a command
+ * input, which is why no "being edited" guard is needed and why nothing here
+ * can fire a motion command. Dragging one cannot send a Jog.
+ *
+ * Units are the units of the command each knob sits beside -- degrees for
+ * SetHeading and MountOffset, ticks for Jog -- so no conversion happens here
+ * (GUI_ARCHITECTURE.md 9.4). A tick/degree conversion in the browser would be
+ * exactly the kind of derived value that rule forbids. */
+interface KnobParts {
+    input: HTMLInputElement;
+    min: number;
+    max: number;
+    step: number;
+    size: number;
+}
+
+function knobParts(svg: SVGElement): KnobParts | null {
+    const forId = svg.dataset.knobFor;
+    if (forId === undefined) {
+        return null;
+    }
+    const input = document.getElementById(forId);
+    if (!(input instanceof HTMLInputElement)) {
+        return null;
+    }
+    return {
+        input,
+        min: Number(svg.dataset.min),
+        max: Number(svg.dataset.max),
+        step: Number(svg.dataset.step) || 1,
+        size: Number(svg.dataset.size) || 64,
+    };
+}
+
+function paintKnob(svg: SVGElement, p: KnobParts, value: number): void {
+    const g = knobGeometry(value, p.min, p.max, p.size);
+    const line = svg.querySelector('.w-knob-needle');
+    if (line !== null) {
+        line.setAttribute('x1', g.x1.toFixed(2));
+        line.setAttribute('y1', g.y1.toFixed(2));
+        line.setAttribute('x2', g.x2.toFixed(2));
+        line.setAttribute('y2', g.y2.toFixed(2));
+    }
+    svg.setAttribute('aria-valuenow', String(value));
+}
+
+function wireKnobs(): void {
+    document.querySelectorAll<SVGElement>('svg.w-knob').forEach((svg) => {
+        const p = knobParts(svg);
+        if (p === null) {
+            return;
+        }
+        let dragging = false;
+
+        const setFromPointer = (ev: PointerEvent): void => {
+            const r = svg.getBoundingClientRect();
+            const dx = ev.clientX - (r.left + r.width / 2);
+            const dy = ev.clientY - (r.top + r.height / 2);
+            const v = knobValueFromPointer(p.min, p.max, p.step, dx, dy);
+            p.input.value = String(v);
+            paintKnob(svg, p, v);
+        };
+
+        svg.addEventListener('pointerdown', (ev: PointerEvent) => {
+            dragging = true;
+            svg.focus();
+            svg.setPointerCapture(ev.pointerId);
+            setFromPointer(ev);
+            ev.preventDefault();
+        });
+        svg.addEventListener('pointermove', (ev: PointerEvent) => {
+            if (dragging) {
+                setFromPointer(ev);
+            }
+        });
+        const release = (ev: PointerEvent): void => {
+            dragging = false;
+            if (svg.hasPointerCapture(ev.pointerId)) {
+                svg.releasePointerCapture(ev.pointerId);
+            }
+        };
+        svg.addEventListener('pointerup', release);
+        svg.addEventListener('pointercancel', release);
+
+        // Keyboard, because a slider that can only be dragged is unusable
+        // without a mouse. Same keys a range input answers to.
+        svg.addEventListener('keydown', (ev: KeyboardEvent) => {
+            const v = Number(p.input.value) || 0;
+            let next = v;
+            if (ev.key === 'ArrowRight' || ev.key === 'ArrowUp') {
+                next = v + p.step;
+            } else if (ev.key === 'ArrowLeft' || ev.key === 'ArrowDown') {
+                next = v - p.step;
+            } else if (ev.key === 'Home') {
+                next = p.min;
+            } else if (ev.key === 'End') {
+                next = p.max;
+            } else {
+                return;
+            }
+            ev.preventDefault();
+            next = Math.min(p.max, Math.max(p.min, Number(next.toFixed(6))));
+            p.input.value = String(next);
+            paintKnob(svg, p, next);
+        });
+
+        // Typing a value moves the dial; the knob is a view of the input.
+        p.input.addEventListener('input', () => paintKnob(svg, p, Number(p.input.value) || 0));
+    });
+}
+
+/* ------------------------------------------------------------------ */
 /* wiring                                                             */
 /* ------------------------------------------------------------------ */
 
@@ -586,13 +690,13 @@ function wireCommands(): void {
     }));
     on('b-gnss', () => void call<Cmd>('SelectReceiver', numArg('in-gnss')).then((r) => cmdLine('gnss', r)));
     on('b-gnss-rot', () => void call<Cmd>('RotateReceiver').then((r) => cmdLine('gnss-rotate', r)));
-    on('b-heading', () => void runMotion('heading', `Point both axes at ${strArg('in-heading')}°?`, 'The target bearing changes on acknowledge. Check the number — there is no undo.', () => call<Cmd>('SetHeading', numArg('in-heading'))));
-    on('b-jog', () => void runMotion('jog', `Jog servo ${strArg('in-jog-id')} to tick ${strArg('in-jog-tick')}?`, 'Absolute tick move in manual mode. Out-of-range ticks are refused before sending.', () => call<Cmd>('Jog', numArg('in-jog-id'), numArg('in-jog-tick'))));
-    on('b-zero', () => void runMotion('zero', 'Teach both axes their centres?', 'Writes each centre into its servo. Neither axis moves -- the tick each is at now becomes 0 degrees.', () => call<Cmd>('ZeroAll')));
-    on('b-mount', () => void runMotion('mount', `Set mount offset of servo ${strArg('in-mount-id')} to ${strArg('in-mount-deg')}°?`, 'Stored on the flight controller; affects subsequent pointing.', () => call<Cmd>('MountOffset', numArg('in-mount-id'), numArg('in-mount-deg'))));
-    on('b-dir', () => void runMotion('dir', `Set direction of servo ${strArg('in-dir-id')} to ${strArg('in-dir-m')}?`, 'Reverses the axis sense. Check the sign — there is no undo.', () => call<Cmd>('SetDirection', numArg('in-dir-id'), numArg('in-dir-m'))));
-    on('b-heater', () => void runMotion('heater', `Switch heater ${strArg('in-heater-id')} ${strArg('in-heater-state')}?`, 'Thermal control; takes effect on acknowledge.', () => call<Cmd>('SetHeater', numArg('in-heater-id'), strArg('in-heater-state') === 'on')));
-    on('b-stop', () => void runMotion('stop', 'Stop every axis?', 'Motion halts on every axis.', () => call<Cmd>('StopAll')));
+    on('b-heading', () => void run('heading', () => call<Cmd>('SetHeading', numArg('in-heading'))));
+    on('b-jog', () => void run('jog', () => call<Cmd>('Jog', numArg('in-jog-id'), numArg('in-jog-tick'))));
+    on('b-zero', () => void run('zero', () => call<Cmd>('ZeroAll')));
+    on('b-mount', () => void run('mount', () => call<Cmd>('MountOffset', numArg('in-mount-id'), numArg('in-mount-deg'))));
+    on('b-dir', () => void run('dir', () => call<Cmd>('SetDirection', numArg('in-dir-id'), numArg('in-dir-m'))));
+    on('b-heater', () => void run('heater', () => call<Cmd>('SetHeater', numArg('in-heater-id'), strArg('in-heater-state') === 'on')));
+    on('b-stop', () => void run('stop', () => call<Cmd>('StopAll')));
     on('b-pico', () => void call<Cmd>('PicoStatusRequest').then((r) => cmdLine('pico-status', r)));
     on('b-probe', () => void call<Cmd>('SdrProbe').then((r) => cmdLine('sdr-probe', r)));
     on('b-sdrcon', () => void call<Cmd>('SdrConnect').then((r) => cmdLine('sdr-connect', r)));
@@ -666,11 +770,22 @@ function wireEvents(): void {
     on('log', (msg) => logLine(String(msg)));
 }
 
+/* ------------------------------------------------------------------ */
+/* layout                                                             */
+/* ------------------------------------------------------------------ */
+
+/* Map-dominant, in three zones.
+ *
+ * The map is what the operator watches and points at, so it takes the large
+ * left cell and the compass sits in the flight-controller panel beside it. The
+ * right rail carries the controls and the per-axis cards. The bottom strip --
+ * artefacts, preview, log -- is reference material rather than a live reading,
+ * so it is collapsible with native <details>. Below ~1100 px the whole thing
+ * falls to one column, same as it always did. */
 function layout(): void {
     req('app').innerHTML = `
     <header>
       <h1>ROCSAR Ground Station</h1>
-      <div id="linkline">…</div>
       <div class="conn">
         <input id="in-control" size="22" title="control endpoint">
         <input id="in-telemetry" size="22" title="telemetry endpoint">
@@ -679,44 +794,92 @@ function layout(): void {
         <button id="b-disconn">disconnect</button>
       </div>
     </header>
+    <div id="statusbar">
+      <div id="linkline" class="status-link">…</div>
+      <div id="meta" class="status-meta"></div>
+    </div>
     <div id="stale" class="banner err" style="display:none">LINK STALE — showing last known values; motion stands down</div>
-    <div id="health"></div>
-    <div id="meta"></div>
-    <div id="panels">
-    <section class="p-sys"><h2>system</h2><div id="sys"></div></section>
-    <section class="p-gnss"><h2>gnss</h2><div id="gnss"></div>
-      <div class="row"><input id="in-gnss" size="4" value="1"><button id="b-gnss">select</button> <button id="b-gnss-rot">rotate</button></div>
-    </section>
-    <section class="p-pico motion-zone"><h2>flight controller</h2><div id="pico"></div>
-      <div class="row"><input id="in-heading" size="8" value="0"><button data-motion id="b-heading">set heading</button> <button id="b-pico">status</button></div>
-      <div class="row"><input id="in-jog-id" size="3" value="1"><input id="in-jog-tick" size="6" value="2048"><button data-motion id="b-jog">jog</button> <button data-motion id="b-zero">zero both</button></div>
-      <div class="row"><input id="in-mount-id" size="3" value="1"><input id="in-mount-deg" size="6" value="0"><button data-motion id="b-mount">mount</button></div>
-      <div class="row"><input id="in-dir-id" size="3" value="1"><input id="in-dir-m" size="4" value="+1"><button data-motion id="b-dir">direction</button></div>
-      <div class="row"><input id="in-heater-id" size="3" value="1"><input id="in-heater-state" size="4" value="on"><button data-motion id="b-heater">heater</button></div>
-      <div class="row"><button data-motion id="b-stop">stop all</button></div>
-    </section>
-    <section class="p-map"><h2>map</h2>
-      <div id="map" style="height: 400px; width: 100%; margin-top: 8px;"></div>
-      <div id="position" style="font-size: 12px; color: var(--dim); margin-top: 4px;"></div>
-    </section>
-    <section class="p-csl"><h2>camera · sdr · link</h2><div id="csl"></div>
-      <div class="row"><button id="b-photo">photo</button> <button id="b-probe">sdr probe</button> <button id="b-sdrcon">sdr connect</button> <button id="b-sdrusb">sdr reset usb</button></div>
-      <div class="row"><input id="in-link" size="6" value="115"><button id="b-link">set limit kbit</button> <button id="b-query">query</button></div>
-      <div class="row" id="cmd-result"></div>
-      <div class="row"><span>sdr params (blank = leave alone)</span></div>
-      <div class="row"><span>prf</span><input id="in-prf" size="8"><span>fs</span><input id="in-fs" size="10"><span>tx</span><input id="in-tx" size="10"></div>
-      <div class="row"><span>gain tx</span><input id="in-gtx" size="6"><span>gain rx</span><input id="in-grx" size="6"><span>bw</span><input id="in-bw" size="10"></div>
-      <div class="row"><span>session s</span><input id="in-sess" size="6"><button id="b-params">apply</button> <button id="b-params-clear">clear</button> <button id="b-params-refresh">refresh</button></div>
-      <div class="row"><span>t min us</span><input id="in-tmin" size="6"><span>t max us</span><input id="in-tmax" size="6"><span>start offset s</span><input id="in-soffset" size="6"></div>
-      <div class="row"><span>tx antenna</span><input id="in-txant" size="10"><span>rx antenna</span><input id="in-rxant" size="10"></div>
-    </section>
-    <section class="p-art"><h2>artefacts <span id="pathline">/</span></h2><div id="files"></div>
-      <div class="row"><button id="b-ls">refresh</button> <button id="b-dlcancel">cancel download</button></div>
-      <div class="row"><span>save to</span><input id="in-destdir" size="24" value="~/rocsar"></div>
-      <div class="row" id="dlstatus"></div>
-    </section>
-    <section class="p-prev"><h2>preview</h2><div id="preview"><i>no preview — fetch one from a camera file above</i></div></section>
-    <section class="p-log"><h2>log</h2><div id="log"></div></section>
+    <div id="attention" class="attention"></div>
+    <div id="layout">
+      <div class="zone-main">
+        <section class="p-pico motion-zone"><h2>flight controller</h2><div id="pico"></div>
+          <div class="controls">
+            <div class="ctl">
+              <span class="ctl-label">heading (deg)</span>
+              ${knob({ forId: 'in-heading', label: 'target heading', min: 0, max: 359, step: 1, value: 0, unit: '°' })}
+              <input id="in-heading" size="5" value="0" title="target heading in degrees">
+              <button data-motion id="b-heading">set heading</button>
+              <button id="b-pico">status</button>
+            </div>
+            <div class="ctl">
+              <span class="ctl-label">jog (tick 0–4095)</span>
+              ${knob({ forId: 'in-jog-tick', label: 'jog tick position', min: 0, max: 4095, step: 1, value: 2048, unit: 'tick' })}
+              <input id="in-jog-id" size="2" value="1" title="servo id">
+              <input id="in-jog-tick" size="5" value="2048" title="absolute tick, 0–4095">
+              <button data-motion id="b-jog">jog</button>
+              <button data-motion id="b-zero">zero both</button>
+            </div>
+            <div class="ctl">
+              <span class="ctl-label">mount offset (deg)</span>
+              ${knob({ forId: 'in-mount-deg', label: 'mount offset', min: -180, max: 180, step: 1, value: 0, unit: '°' })}
+              <input id="in-mount-id" size="2" value="1" title="servo id">
+              <input id="in-mount-deg" size="5" value="0" title="mount offset in degrees">
+              <button data-motion id="b-mount">mount</button>
+            </div>
+            <div class="ctl">
+              <span class="ctl-label">direction</span>
+              <input id="in-dir-id" size="2" value="1" title="servo id">
+              <input id="in-dir-m" size="3" value="+1" title="+1 or -1">
+              <button data-motion id="b-dir">direction</button>
+            </div>
+            <div class="ctl">
+              <span class="ctl-label">heater</span>
+              <input id="in-heater-id" size="2" value="1" title="heater id">
+              <input id="in-heater-state" size="4" value="on" title="on or off">
+              <button data-motion id="b-heater">heater</button>
+            </div>
+            <div class="ctl ctl-stop">
+              <button data-motion id="b-stop" class="stop">STOP ALL</button>
+            </div>
+          </div>
+        </section>
+        <section class="p-map"><h2>map <span class="hint">click to point both antennas</span></h2>
+          <div id="map"></div>
+          <div id="position"></div>
+        </section>
+      </div>
+      <div class="zone-rail">
+        <section class="p-sys"><h2>system</h2><div id="sys"></div></section>
+        <section class="p-gnss"><h2>gnss</h2><div id="gnss"></div>
+          <div class="row"><input id="in-gnss" size="4" value="1"><button id="b-gnss">select</button> <button id="b-gnss-rot">rotate</button></div>
+        </section>
+        <section class="p-csl"><h2>camera · sdr · link</h2><div id="csl"></div>
+          <div class="row"><button id="b-photo">photo</button> <button id="b-probe">sdr probe</button> <button id="b-sdrcon">sdr connect</button> <button id="b-sdrusb">sdr reset usb</button></div>
+          <div class="row"><input id="in-link" size="6" value="115"><button id="b-link">set limit kbit</button> <button id="b-query">query</button></div>
+          <div class="row" id="cmd-result"></div>
+          <div class="row"><span>sdr params (blank = leave alone)</span></div>
+          <div class="row"><span>prf</span><input id="in-prf" size="8"><span>fs</span><input id="in-fs" size="10"><span>tx</span><input id="in-tx" size="10"></div>
+          <div class="row"><span>gain tx</span><input id="in-gtx" size="6"><span>gain rx</span><input id="in-grx" size="6"><span>bw</span><input id="in-bw" size="10"></div>
+          <div class="row"><span>session s</span><input id="in-sess" size="6"><button id="b-params">apply</button> <button id="b-params-clear">clear</button> <button id="b-params-refresh">refresh</button></div>
+          <div class="row"><span>t min us</span><input id="in-tmin" size="6"><span>t max us</span><input id="in-tmax" size="6"><span>start offset s</span><input id="in-soffset" size="6"><span id="offset-suggestion" class="hint"></span></div>
+          <div class="row"><span>tx antenna</span><input id="in-txant" size="10"><span>rx antenna</span><input id="in-rxant" size="10"></div>
+        </section>
+      </div>
+      <div class="zone-bottom">
+        <details class="panel-fold" open><summary>artefacts <span id="pathline">/</span></summary>
+          <section class="p-art"><div id="files"></div>
+            <div class="row"><button id="b-ls">refresh</button> <button id="b-dlcancel">cancel download</button></div>
+            <div class="row"><span>save to</span><input id="in-destdir" size="24" value="~/rocsar"></div>
+            <div class="row" id="dlstatus"></div>
+          </section>
+        </details>
+        <details class="panel-fold" open><summary>preview</summary>
+          <section class="p-prev"><div id="preview"><i>no preview — fetch one from a camera file above</i></div></section>
+        </details>
+        <details class="panel-fold" open><summary>log</summary>
+          <section class="p-log"><div id="log"></div></section>
+        </details>
+      </div>
     </div>`;
 }
 
@@ -745,8 +908,17 @@ async function boot(): Promise<void> {
     await connect();
     layout();
     initMap();
+    /* A click gives a position; a heading command takes a bearing. They are not
+     * the same number, and sending the latitude was a real bug: bearingTo
+     * computes the great-circle initial bearing from the gondola to the clicked
+     * point, and refuses when there is no fix to measure from. */
     setMapClickHandler((lat, lon) => {
-        void runMotion('map-click', `Point both antennas at ${lat.toFixed(4)}°, ${lon.toFixed(4)}°?`, 'The target bearing is set from the map click. Check the location — there is no undo.', () => call('SetHeading', lat));
+        const bearing = bearingTo(lat, lon);
+        if (bearing === null) {
+            logLine('map click ignored: no position fix yet');
+            return;
+        }
+        void run('map-click', () => call<Cmd>('SetHeading', bearing));
     });
     // Viewport and version go to the log first: layout complaints ("single
     // column") are undecidable without the CSS pixel width, and binary
@@ -759,6 +931,8 @@ async function boot(): Promise<void> {
     wireEvents();
     wireCommands();
     wireServoButtons();
+    wireKnobs();
+    wireOffsetSuggestion();
     setInterval(refreshStale, 1000);
     setInterval(() => {
         void call<LinkState>('LinkState').then(renderLink, (err: unknown) => logLine(`link poll: ${err}`));

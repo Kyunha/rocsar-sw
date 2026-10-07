@@ -23,6 +23,11 @@ go test ./...
 if command -v npm >/dev/null 2>&1; then
     echo "[test] npm run build (frontend tsc + vite)"
     (cd cmd/gs/frontend && npm run build)
+    # The instruments carry the arithmetic that absence-forbids-a-zero and
+    # held-is-not-a-measurement rules turn into, so it is tested rather than
+    # eyeballed. Node strips the types itself; no test framework.
+    echo "[test] npm test (frontend widgets)"
+    (cd cmd/gs/frontend && npm test)
 else
     echo "[test] SKIP npm run build: no npm on PATH (enter the nix shell for the full gate)"
 fi
@@ -47,6 +52,34 @@ else
     echo "[test]      heading/zeroing policy shared with firmware/ went unchecked." >&2
     echo "[test]      Install it, or add pytest to shell.nix." >&2
     exit 1
+fi
+
+# The sketch itself.
+#
+# firmware/tests/ compiles gondola_model.h and calibration.h on the host, so the
+# model is covered -- but nothing in that suite compiles firmware.ino. The
+# source-shape assertions read it as text, and text reads fine through a missing
+# brace: firmware.ino was once left with a stray `}` and a truncated function
+# signature, and 176 tests passed while the sketch did not compile for the board
+# it runs on. This step is the only thing that would have caught it.
+#
+# Same rule as npm above: skipped loudly, never silently, and a failure to compile
+# is a failure of the gate rather than a warning.
+if command -v arduino-cli >/dev/null 2>&1; then
+    echo "[test] firmware sketch compiles for the Pico"
+    OUT="$(mktemp -d)"
+    trap 'rm -rf "$OUT"' EXIT
+    # Matches scripts/flash-firmware.sh. Without this the sketch is never built
+    # for the board it runs on, which is the only target that matters.
+    if ! arduino-cli compile --fqbn rp2040:rp2040:rpipicow --output-dir "$OUT" firmware; then
+        echo "[test] FAIL: firmware.ino does not compile for rp2040:rp2040:rpipicow" >&2
+        exit 1
+    fi
+else
+    echo "[test] SKIP firmware sketch compile: no arduino-cli on PATH."
+    echo "[test]      firmware.ino is NOT checked by the host suite -- it is text-asserted"
+    echo "[test]      only, and text reads fine through a syntax error. Enter the nix"
+    echo "[test]      shell with arduino-cli to close this gap."
 fi
 
 echo "[test] ok"

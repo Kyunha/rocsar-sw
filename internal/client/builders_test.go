@@ -11,6 +11,10 @@ import (
 // Moved here from tools/gs_cli unchanged when the client was promoted out of
 // package main. The cases were written against real commands reaching real
 // servos; none of them is decorative.
+//
+// Note the arity is checked in both directions, not just for missing arguments.
+// need() rejects too few, which is all a command whose extra arguments are inert
+// needs -- but `zero`'s extra argument changes which servos get an EEPROM write.
 
 // Arguments are validated before a command is sent, not after.
 //
@@ -35,6 +39,12 @@ func TestArgumentsAreRefusedBeforeSending(t *testing.T) {
 		{"zero link rate", "link", []string{"0"}, "greater than zero"},
 		{"unknown command", "teleport", nil, "unknown command"},
 		{"heading is not a number", "heading", []string{"north"}, "not a number"},
+		// `zero 1 2` used to be silently accepted and meant "both axes", because
+		// the arity test was len(args) == 1 and need() only rejects too few. For
+		// jog or mount a stray argument is inert junk; for zero it is a write to
+		// the EEPROM of a servo the operator did not name.
+		{"zero takes at most one servo id", "zero", []string{"1", "2"}, "at most one servo id"},
+		{"zero does not take a servo id and a value", "zero", []string{"1", "90"}, "at most one servo id"},
 	} {
 		_, err := BuildRequests(tc.cmd, tc.args)
 		if err == nil {

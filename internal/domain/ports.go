@@ -105,7 +105,7 @@ type Sdr interface {
 // use is a bricked SDR, not a runtime error, which is why SetParams validates
 // before it writes.
 //
-// Every key load_config() reads with j.at() is modelled here. That includes
+// Every key load_config() reads with j.at() is modelled here, plus
 // PulseDurationS, which the program does NOT read: config.hpp has that line
 // commented out, so it is carried as data and never offered as a control. The
 // three keys below the antenna pair are the sweep window and the arming delay,
@@ -164,9 +164,18 @@ type LinkShaper interface {
 	Active() bool
 	// Status reports what the shaper believes, for telemetry.
 	Status() LinkStatus
-	// QdiscPresent reads the device back from the kernel. The absence of this
-	// read-back is why an unnoticed classification failure can persist: the
-	// calls succeed and the traffic still lands in the wrong class.
+	// Verify re-reads the device and reports whether the cap is genuinely in
+	// force, re-applying if it has gone.
+	//
+	// This exists because the in-process limiter that used to be the backstop is
+	// gone: if the kernel tree is not on the device, the link is UNBOUNDED, and
+	// nothing else in this program would know. Active and Status answer from
+	// flags cached at Apply time, so without a read-back a qdisc removed by
+	// NetworkManager or a hand-run tc is invisible while telemetry goes on
+	// claiming protection.
+	Verify(ctx context.Context) (bool, string)
+	// QdiscPresent reads the device back from the kernel without changing
+	// anything, for a caller that wants to look rather than to repair.
 	QdiscPresent(ctx context.Context, device string) (bool, error)
 }
 

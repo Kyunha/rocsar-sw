@@ -1,6 +1,7 @@
 package test
 
 import (
+	"math"
 	"testing"
 	"time"
 
@@ -29,15 +30,24 @@ func worstCaseSnapshot() telemetry.Snapshot {
 	}
 
 	gnss := make([]domain.ReceiverStatus, 0, 3)
+	// Receiver 1 has a rate, receivers 2 and 3 do not. That mix is deliberate:
+	// the optional field has to survive the wire for one receiver and stay absent
+	// for the others, and a test that only ever sets it proves neither.
+	rate1 := 5.25
 	for i := 1; i <= 3; i++ {
+		fix := domain.Fix{
+			ReceiverID: i, LatitudeDeg: 38.722252, LongitudeDeg: -9.139337,
+			AltitudeM: 1234.5678, GroundSpeedMP: 250.5, CourseDeg: 359.999,
+			ObservedAt: now,
+		}
+		if i == 1 {
+			fix.VerticalRateMP = &rate1
+		}
 		gnss = append(gnss, domain.ReceiverStatus{
 			ReceiverID: i, Selected: i == 1, FixOK: true, HasFix: true,
-			Fix: domain.Fix{
-				ReceiverID: i, LatitudeDeg: 38.722252, LongitudeDeg: -9.139337,
-				AltitudeM: 1234.5678, GroundSpeedMP: 250.5, CourseDeg: 359.999,
-				ObservedAt: now,
-			},
-			FixAge: 1500 * time.Millisecond, Accepted: 1 << 40, Rejected: 1 << 20,
+			Fix:      fix,
+			FixAge:   1500 * time.Millisecond,
+			Accepted: 1 << 40, Rejected: 1 << 20,
 		})
 	}
 
@@ -54,6 +64,14 @@ func worstCaseSnapshot() telemetry.Snapshot {
 			GondolaHeadingDeg: 359.9999, TargetHeadingDeg: 180.0001,
 			Heater1State: true, Heater2State: true, IMUPresent: true,
 			ImuTemperatureC: 85.5,
+			// Extremes, so a truncating encoder or a mis-ordered copy shows up.
+			// Roll and pitch both sit near a signed-degree limit, the calibration
+			// byte is a real packed register value (sys 3 gyro 3 accel 2 mag 1),
+			// and the event counter is at uint32 max so a uint16 truncation would
+			// wrap it to a value that looks like a small event count.
+			GondolaRollDeg: -179.999, GondolaPitchDeg: 89.999,
+			IMUCalibration: 0xF9, IMUPeakAccelEvent: 4294967295,
+			IMUPeakAccelMs2: [3]float64{-30.5, 12.25, 0},
 			Axes:            axes, ObservedAt: now,
 		},
 		PicoAck: &domain.Ack{CommandSequence: 4294967295, Success: false, Error: domain.ErrHardwareFault},
@@ -222,6 +240,44 @@ func TestSnapshotRoundTrip(t *testing.T) {
 	// reports the same 2048. Only the true case can fail.
 	if !back.Pico.Axes[0].CenterZeroed {
 		t.Error("center_zeroed lost across the round trip; a taught axis reads as untaught")
+	}
+	// Vertical rate: present for one receiver, absent for the others.
+	//
+	// The absent case is the one that matters. A plain double on the wire would
+	// decode an underived rate to 0.0, and every consumer downstream would read
+	// "balloon at float" for the first minute of every flight.
+	if back.GNSS[0].Fix.VerticalRateMP == nil {
+		t.Error("the selected receiver's vertical rate was lost")
+	} else if math.Abs(*back.GNSS[0].Fix.VerticalRateMP-5.25) > 1e-6 {
+		t.Errorf("vertical rate = %v, want 5.25", *back.GNSS[0].Fix.VerticalRateMP)
+	}
+	for _, i := range []int{1, 2} {
+		if back.GNSS[i].Fix.VerticalRateMP != nil {
+			t.Errorf("receiver %d gained a vertical rate it never had: %v",
+				i+1, *back.GNSS[i].Fix.VerticalRateMP)
+		}
+	}
+
+	// The IMU channels. Tilt and the peak-hold are the new fields most likely to
+	// be dropped by a codec that was not updated, and the calibration byte and
+	// event counter are the two a truncating encoder would mangle.
+	if got := back.Pico.GondolaRollDeg; math.Abs(got-(-179.999)) > 1e-3 {
+		t.Errorf("roll = %v, want -179.999", got)
+	}
+	if got := back.Pico.GondolaPitchDeg; math.Abs(got-89.999) > 1e-3 {
+		t.Errorf("pitch = %v, want 89.999", got)
+	}
+	if got := back.Pico.IMUCalibration; got != 0xF9 {
+		t.Errorf("imu_calibration = %#x, want 0xF9", got)
+	}
+	// uint32 max: a uint16 field on the wire would wrap this to 65535.
+	if got := back.Pico.IMUPeakAccelEvent; got != 4294967295 {
+		t.Errorf("imu_peak_accel_event = %d, want 4294967295", got)
+	}
+	for i, want := range []float64{-30.5, 12.25, 0} {
+		if got := back.Pico.IMUPeakAccelMs2[i]; math.Abs(got-want) > 1e-3 {
+			t.Errorf("peak accel axis %d = %v, want %v", i, got, want)
+		}
 	}
 	if back.Pico.ImuTemperatureC != s.Pico.ImuTemperatureC {
 		t.Errorf("imu temperature changed: %v -> %v", s.Pico.ImuTemperatureC, back.Pico.ImuTemperatureC)

@@ -9,8 +9,8 @@ require (
 	github.com/vishvananda/netlink v1.3.1
 	github.com/vishvananda/netns v0.0.5
 	go.bug.st/serial v1.8.0
+	golang.org/x/image v0.33.0
 	golang.org/x/sys v0.46.0
-	golang.org/x/time v0.16.0
 	google.golang.org/protobuf v1.36.12
 )
 

@@ -5,7 +5,9 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test": "node --test test/*.test.ts",
+    "fixture": "esbuild test/fixture.ts --bundle --platform=node --format=esm --outfile=/tmp/gs-fixture.mjs && node /tmp/gs-fixture.mjs /tmp/gs-preview.html"
   },
   "devDependencies": {
     "typescript": "^5.6.3",

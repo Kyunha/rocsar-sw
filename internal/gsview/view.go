@@ -38,6 +38,7 @@ package gsview
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/rocsar/obc/internal/domain"
@@ -106,6 +107,15 @@ type PositionView struct {
 	AltitudeM      float64 `json:"altitude_m"`
 	GroundSpeedMps float64 `json:"ground_speed_mps"`
 	CourseDeg      float64 `json:"course_deg"`
+
+	// Climbrate in m/s, positive up. Nil until the estimator has a window worth
+	// fitting, which for a launch is about a minute.
+	//
+	// Nil rather than zero, and this is the one field where the difference is the
+	// whole point: a balloon at float genuinely reads ~0, so a client that
+	// cannot tell "no rate yet" from "not climbing" will eventually call the
+	// first minute of every ascent a stall.
+	VerticalRateMps *float64 `json:"vertical_rate_mps"`
 }
 
 // PicoView is the flight controller. Nil View.Pico means never heard from it,
@@ -121,8 +131,34 @@ type PicoView struct {
 	// unless the IMU is present (measured): a held value is the last reading,
 	// and showing it as a measurement repeats the held-bearing trap this
 	// column exists to prevent.
-	ImuTemperatureC *float64   `json:"imu_temperature_c"`
-	Antennas        []AxisView `json:"antennas"`
+	ImuTemperatureC *float64 `json:"imu_temperature_c"`
+
+	// Roll and pitch in degrees. Nil unless the IMU is present, on the same
+	// reasoning as the temperature: a held tilt next to a live bearing invites
+	// reading the two together, and only one of them is current.
+	GondolaRollDeg  *float64 `json:"gondola_roll_deg"`
+	GondolaPitchDeg *float64 `json:"gondola_pitch_deg"`
+
+	// The BNO055's calibration status as the raw register byte: two bits per
+	// sensor, most significant first (system, gyroscope, accelerometer,
+	// magnetometer), each 0 uncalibrated to 3 fully. Nil unless present, for the
+	// same reason.
+	//
+	// Carried verbatim rather than unpacked into four numbers. It is one register,
+	// the firmware does not act on it, and a decoded form would invite four
+	// separate "calibrated: yes/no" claims where one byte says it once.
+	ImuCalibration *uint32 `json:"imu_calibration"`
+
+	// The largest linear acceleration seen since boot, m/s^2, gravity already
+	// removed by the sensor. Monotonic, so this never falls -- it is "hardest
+	// thing that has happened", not "how hard things are going now". PeakAccelEvent
+	// beside it is what says whether anything new has.
+	ImuPeakAccelMs2 [3]float64 `json:"imu_peak_accel_ms2"`
+
+	// Increments once per sample that set a new peak. One increment per shock,
+	// not per axis: a chute deployment moves all three at once and is one event.
+	ImuPeakAccelEvent uint32     `json:"imu_peak_accel_event"`
+	Antennas          []AxisView `json:"antennas"`
 }
 
 // AxisView is one antenna axis. Load and TemperatureC are nil unless the servo
@@ -243,11 +279,12 @@ func buildReceiver(r domain.ReceiverStatus) ReceiverView {
 	}
 	if r.FixOK {
 		out.Position = &PositionView{
-			LatitudeDeg:    r.Fix.LatitudeDeg,
-			LongitudeDeg:   r.Fix.LongitudeDeg,
-			AltitudeM:      r.Fix.AltitudeM,
-			GroundSpeedMps: r.Fix.GroundSpeedMP,
-			CourseDeg:      r.Fix.CourseDeg,
+			LatitudeDeg:     r.Fix.LatitudeDeg,
+			LongitudeDeg:    r.Fix.LongitudeDeg,
+			AltitudeM:       r.Fix.AltitudeM,
+			GroundSpeedMps:  r.Fix.GroundSpeedMP,
+			CourseDeg:       r.Fix.CourseDeg,
+			VerticalRateMps: r.Fix.VerticalRateMP,
 		}
 	}
 	if r.HasFix {
@@ -269,6 +306,17 @@ func buildPico(p domain.PicoTelemetry) *PicoView {
 	if p.IMUPresent {
 		temp := p.ImuTemperatureC
 		out.ImuTemperatureC = &temp
+		roll, pitch := p.GondolaRollDeg, p.GondolaPitchDeg
+		out.GondolaRollDeg, out.GondolaPitchDeg = &roll, &pitch
+		calib := p.IMUCalibration
+		out.ImuCalibration = &calib
+		// The peak is copied unconditionally, even when the sensor is absent.
+		// It is a monotonic maximum over the whole flight, so it remains the
+		// hardest thing that has happened after the sensor stops answering --
+		// which is exactly when an operator most wants to know it. Zeroing it on
+		// absence would erase the record of the event that stopped the sensor.
+		out.ImuPeakAccelMs2 = p.IMUPeakAccelMs2
+		out.ImuPeakAccelEvent = p.IMUPeakAccelEvent
 	}
 	for _, a := range p.Axes {
 		axis := AxisView{
@@ -287,7 +335,9 @@ func buildPico(p domain.PicoTelemetry) *PicoView {
 			axis.Load, axis.TemperatureC = &load, &temp
 		}
 		if a.FeedbackError != 0 {
-			name := domain.ErrorCode(a.FeedbackError).String()
+			// The servo's own status bits, not an ErrorCode. See domain.ServoFaults
+			// for why sharing that enum was wrong.
+			name := strings.Join(domain.ServoFaults(a.FeedbackError), "+")
 			axis.FeedbackError = &name
 		}
 		out.Antennas = append(out.Antennas, axis)

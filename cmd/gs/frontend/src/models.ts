@@ -61,6 +61,11 @@ export interface PositionView {
     altitude_m: number;
     ground_speed_mps: number;
     course_deg: number;
+    // Climbrate, m/s, positive up. Null until the estimator has a window worth
+    // fitting -- about a minute after launch. Null is NOT zero: a balloon at float
+    // genuinely reads ~0, and a console that cannot tell the two apart will
+    // eventually call the start of every ascent a stall.
+    vertical_rate_mps: number | null;
 }
 
 export interface ReceiverView {
@@ -98,6 +103,20 @@ export interface PicoView {
     heater2_on: boolean;
     imu: string;
     imu_temperature_c: number | null;
+    // Tilt in degrees, null unless the IMU is present.
+    gondola_roll_deg: number | null;
+    gondola_pitch_deg: number | null;
+    // The BNO055 calibration register verbatim: two bits per sensor, most
+    // significant first (system, gyroscope, accelerometer, magnetometer), each 0
+    // uncalibrated to 3 fully. One byte, not four claims.
+    imu_calibration: number | null;
+    // Largest linear acceleration since boot, m/s^2, gravity already removed.
+    // Monotonic: this is "hardest thing that has happened", not "right now".
+    imu_peak_accel_ms2: [number, number, number];
+    // Increments once per shock (not once per axis). Beside the peak because a
+    // monotonic maximum cannot say whether anything has happened since the last
+    // frame.
+    imu_peak_accel_event: number;
     antennas: AxisView[];
 }
 

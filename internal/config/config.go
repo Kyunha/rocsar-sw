@@ -98,9 +98,6 @@ type Config struct {
 	Telemetry struct {
 		Interval time.Duration
 	}
-	QOS struct {
-		BulkRateBps int
-	}
 
 	// Mocked names the subsystems running against a fake. It is surfaced in
 	// telemetry rather than only logged: a system that fabricated a reading
@@ -140,7 +137,6 @@ var KnownKeys = map[string]bool{
 	"camera.device":             true,
 	"sdr.program":               true,
 	"telemetry.interval":        true,
-	"qos.bulk_rate_bps":         true,
 	"require_hardware":          true,
 }
 
@@ -157,7 +153,18 @@ func Defaults() Config {
 	c.HTTP.Root = "/mnt/rocsar/data"
 	c.Link.Device = "eth0"
 	c.Link.RateKbps = defaultLinkRateKbps
-	c.Link.Shaping = false
+	// ON by default, and that changed because the in-process limiter was deleted.
+	//
+	// It used to default off because the kernel hierarchy could not classify
+	// traffic and the in-server token bucket was doing the actual protecting --
+	// with shaping off, artefact bytes were still bounded. That bucket is gone, so
+	// shaping off now means an UNBOUNDED link: there is nothing else.
+	//
+	// It needs CAP_NET_ADMIN. Without it the OBC still starts and still serves
+	// telemetry (ARCHITECTURE.md 8: never refuse to serve telemetry), and reports
+	// shaping inactive with the reason, but the link is not being limited. That is
+	// a deployment requirement now rather than a tuning choice.
+	c.Link.Shaping = true
 	c.Pico.Port = "/dev/ttyACM0"
 	c.Pico.Baudrate = picoBaudrate
 	c.GNSS.Ports = []int{gnssPortBase, gnssPortBase + 1, gnssPortBase + 2}
@@ -166,12 +173,10 @@ func Defaults() Config {
 	c.Camera.Device = "/dev/video0"
 	c.SDR.Program = "third_party/sdr-ettus-b200mini"
 	c.Telemetry.Interval = time.Second
-	// 8 KiB/s, about 64 kbit/s: a little over half the 115 kbit/s radio, so
-	// telemetry and commands have room without claiming precision the link lacks.
-	//
-	// The previous default was 64 KiB/s -- 512 kbit/s, more than four times the
-	// link. It read as a constraint and constrained nothing.
-	c.QOS.BulkRateBps = 8 * 1024
+	// QOS.BulkRateBps is gone. It configured a token bucket inside this process
+	// that paced the artefact HTTP copy path; the limiter that used it has been
+	// deleted and the cap is the kernel's now, set by link.rate_kbps and
+	// adjustable at runtime with set_link_limit. See ARCHITECTURE.md 6.6.
 	c.Mocked = map[string]bool{}
 
 	return c

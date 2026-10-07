@@ -46,6 +46,13 @@ type Bank struct {
 	cancel  context.CancelFunc
 	wg      sync.WaitGroup
 	running bool
+
+	// One climb estimator per receiver, and its own lock. Deliberately separate
+	// from mu: the estimator does real arithmetic on a window of history, and
+	// holding the bank's lock across it would serialise the three receiver
+	// goroutines against each other for no reason.
+	estMu      sync.Mutex
+	estimators map[int]*ClimbEstimator
 }
 
 // NewBank creates receivers for the given ports.
@@ -109,6 +116,19 @@ func (b *Bank) Start(ctx context.Context) error {
 					if !ok {
 						return
 					}
+					// Fed before the fix is stored, so the stored copy already
+					// carries the rate.
+					//
+					// Every receiver gets its own estimator rather than one shared
+					// on the selected: a rate fitted from receiver 2's altitude
+					// stream is receiver 2's, and borrowing the selected one's
+					// would put a number on a fix that did not produce it.
+					if f.Valid() {
+						est := b.estimatorFor(f.ReceiverID)
+						est.Observe(f.ObservedAt, f.AltitudeM)
+						f.VerticalRateMP = est.Rate(f.ObservedAt, b.staleAfter)
+					}
+
 					b.mu.Lock()
 					b.latest[f.ReceiverID] = f
 					b.mu.Unlock()
@@ -183,6 +203,22 @@ func (b *Bank) SelectedID() int {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 	return b.selectedID
+}
+
+// estimatorFor returns the climb estimator belonging to one receiver, creating it
+// on first use.
+func (b *Bank) estimatorFor(receiverID int) *ClimbEstimator {
+	b.estMu.Lock()
+	defer b.estMu.Unlock()
+	if b.estimators == nil {
+		b.estimators = make(map[int]*ClimbEstimator, len(b.receivers))
+	}
+	e, ok := b.estimators[receiverID]
+	if !ok {
+		e = NewClimbEstimator()
+		b.estimators[receiverID] = e
+	}
+	return e
 }
 
 // SelectedFix returns the trusted receiver's most recent fix and whether it is

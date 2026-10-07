@@ -337,6 +337,15 @@ func (a *App) submitAll(name string, reqs []*client.Request) CommandResult {
 			out.Artefact = &ArtefactMeta{Name: n, SizeBytes: resp.GetArtefactSizeBytes(), Kind: resp.GetArtefactKind()}
 		}
 		if !resp.GetSuccess() {
+			// Naming the axis, on the refusal path as well as the transport one. A
+			// `zero` that taught axis 1 and had axis 2 refused with
+			// ERROR_CALIBRATION_FAILED leaves a servo holding a correction we cannot
+			// vouch for, and "the flight controller refused the command" does not say
+			// which one.
+			if i > 0 {
+				out.Message = fmt.Sprintf("%s (axis %d of %d had already been sent)",
+					out.Message, i, len(reqs))
+			}
 			break
 		}
 	}

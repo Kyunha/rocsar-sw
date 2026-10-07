@@ -218,9 +218,12 @@ class TestTheParserAccepts:
         """The byte the reference sketches parsed straight past.
 
         A checksum-valid frame with a non-zero error is the servo saying "I am
-        talking and I am in trouble". Both `tools/ST3215_Configure` and
-        `tools/servo_tester` read this frame and discarded index 4, so an
+        talking and I am in trouble". The reference sketch at
+        `docs/ST3215_Configure` reads this frame and discards index 4, so an
         overheat or an over-voltage read as a clean status.
+
+        (It used to be cited as `tools/ST3215_Configure`, a path that is not in
+        the tree, alongside a `tools/servo_tester` that never was.)
         """
         result = _scan(probe, _reply(1, tick=3000, error=3), 1)
         assert result["matched"] == 1
@@ -462,19 +465,35 @@ class TestFoldingFeedbackIntoTheAxis:
 
 class TestTheScaleConstants:
     def test_load_is_scaled_to_percent_and_the_constant_is_named(self, probe: Path) -> None:
-        """The one number here with no document behind it.
+        """The scale has a vendor datum behind it now.
 
-        `Docs/ST3215_ProtocolManual.pdf` is not the servo manual -- it is a 5-page
-        Joy-IT heatsink and fan manual for a Raspberry Pi 5. So SERVO_LOAD_PERCENT_SCALE
-        is the widely-published STS3215 control-table value and is NOT confirmed
-        against this part. It is a named constant precisely so the bench check can
-        disagree with it and change one number.
+        This test used to assert that "UNVERIFIED" was present in
+        gondola_model.h, and to explain in its docstring that the servo manual was
+        not in the tree -- it had been confused with a Raspberry Pi cooling-unit
+        manual at a path that does not exist here.
+
+        Both halves of that were wrong. The vendor's memory table is checked in at
+        docs/Smart  Bus Servo Communication Protocol Manua/sts3215_memory_table.xlsx
+        and documents register 0x10, Maximum torque, as "set 1000 = 100% * locked
+        torque". So the /10 scale rests on the vendor's own datum rather than on a
+        widely-published control table.
+
+        The assertion below therefore pins the citation rather than the doubt. A
+        test that can only pass by keeping a false claim in the source is a test
+        that protects the falsehood, and it is why the comment survived as long as
+        it did. One bench step is still outstanding and is described in the
+        comment: whether 0x3C reports current as the same fraction of that limit.
         """
-        source = (
-            FIRMWARE_DIR / "gondola_model.h"
-        ).read_text()
-        assert "#define SERVO_LOAD_PERCENT_SCALE" in source
-        assert "UNVERIFIED" in source, (
-            "the unverified scale must stay labelled; a bench check is pending"
+        source = (FIRMWARE_DIR / "gondola_model.h").read_text()
+        assert "#define SERVO_LOAD_PERCENT_SCALE 10.0f" in source
+        assert "sts3215_memory_table.xlsx" in source, (
+            "the load scale must cite the vendor memory table it now rests on"
+        )
+        assert "set 1000 = 100% * locked torque" in source, (
+            "the datum behind the /10 scale should be quoted, not paraphrased"
+        )
+        assert "UNVERIFIED" not in source, (
+            "no scale in this header is unverified now; if one becomes so, say "
+            "which register it came from rather than labelling the whole file"
         )
         assert _scan(probe, _reply(1, load=1000), 1)["load"] == pytest.approx(100.0)

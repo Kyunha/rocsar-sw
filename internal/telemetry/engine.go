@@ -17,9 +17,10 @@ import (
 
 // FrameBudgetBytes is the hard cap on a serialised telemetry frame.
 //
-// The link's priority class is 41 kbit/s, about 5 kB/s. A 2048-byte frame at
-// 1 Hz uses 41% of it -- headroom for a resync and for a slow joiner -- while a
-// 5 kB frame would use the entire class and starve command responses.
+// At the 115 kbit/s link cap a 2048-byte frame at 1 Hz is about 14% of it, so a
+// resync frame and a slow join both fit alongside a command reply. It is also the
+// number the link floor is derived from: qos.MinimumRateKbps must be able to move
+// one of these per second, which is why a cap below it is refused.
 //
 // Enforced by test/telemetry_test.go. A frame that outgrows this is a bug in
 // whatever was added, and the test names the field.

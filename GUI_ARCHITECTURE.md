@@ -90,41 +90,108 @@ data through WebGL and Web Workers, and no Go-native toolkit reproduces it.
 This is the constraint that decides the toolkit question, and it is why every
 Go-native option below is rejected regardless of its other merits.
 
-#### 1.2.1 The basemap: Natural Earth 50m GeoJSON
+#### 1.2.1 The basemap: Natural Earth vector + topographic relief
 
-The requirement is *low-detail geographic context* — rivers, lakes, coastlines
-and mountains at a regional scale — not a street basemap. Two datasets were
-measured against that requirement:
+The operating area is **Northern Europe** (lon −12…45, lat 50…72). The
+requirement is *low-detail geographic context* — rivers, lakes, coastlines and
+visible terrain — not a street basemap. The basemap is two committed assets,
+both from Natural Earth and both drawn by MapLibre:
 
-| Dataset | Size (gzip) | Rivers | Lakes | Mountains | Verdict |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| **Natural Earth 10m** | 21.4 MB | 1 in Portugal | **0 in Portugal** | **0 in Portugal** | **Rejected.** Bigger than anything else and delivers no Portuguese hydrography or peaks. |
-| **Natural Earth 50m** | **1.5 MB** | 462 | 405 | 127 ranges, 76 summits | **Chosen.** |
-| Natural Earth 110m | 0.29 MB | 13 | 25 | 10 ranges, 12 summits | Fallback if 50m proves too detailed a look. |
-| OpenMapTiles pmtiles | 2.5 MB (Porto only) | street-scale | yes | terrain | Replaced: a real operating-area extract is far larger, and the requirement is context, not streets. |
+1. **Vector GeoJSON** — ocean, land, mountain ranges and named summits at 50m
+   globally, plus lakes and rivers at 10m clipped to the operating area.
+   Produced by `scripts/fetch-basemap.py`.
+2. **A hypsometric-relief image** over the operating area, carrying elevation
+   as colour and slope as shading. Produced by `scripts/fetch-relief/main.go`.
 
-50m was chosen because 10m — the scale that *sounds* most detailed — has no
-lakes and no mountains anywhere in Portugal, while costing 14× more. The
-detail that matters is coverage of the operating area, not the nominal scale.
+**Why not DEM terrain tiles.** MapLibre can render hillshade (a `hillshade`
+layer) and 3D terrain (`setTerrain`) from a `raster-dem` source, and AWS
+Terrarium tiles are free and keyless. Measured over this box, the pyramid costs
+**z0..z6 9.2 MiB, z0..z7 26.7 MiB, z0..z8 ~133 MiB**, and the useful detail is
+coarse: MapLibre builds a 128×128 mesh per 256 px tile, so the elevation grid is
+always *half* the linear tile resolution — 2 446 m per vertex at z6, 1 223 m at
+z7. A cropped Natural Earth relief image covering the same box is **611 KB at
+928 m/px**, which is comparable to a z6 DEM for roughly a hundredth of the
+bytes, with no tile server, no `maxzoom` declaration, no 404 fallback cascade
+and no licence mosaic to carry. The DEM route stays the documented fallback if
+3D pitch is ever wanted; the *shading* is not worth 27 MiB.
 
-The assets are produced by `scripts/fetch-basemap.py`, which downloads the
-upstream GeoJSON, rounds coordinates to 6 dp (the linework is generalised;
-14-digit precision is noise), and filters `geography_regions_polys` to
-`featurecla == "Range/mtn"` — 127 of its 514 features are mountains, and
+**Why the image is reprojected at build time.** MapLibre places an `image`
+source by mapping its four corners to their Mercator tile coordinates and
+interpolating linearly across the quad (`maplibre-gl/src/source/image_source.ts`)
+— there is no projection transform. Natural Earth rasters are plate carrée
+(equal degrees), so over 22° of latitude the difference between
+linear-in-latitude and linear-in-Mercator-y reaches ~2° (~200 km) at the
+midpoint, which would put the Scandinavian mountains in the North Sea.
+`fetch-relief` resamples the crop onto a Web Mercator grid first, making the
+four-corner quad exact. It also bakes the palette, because MapLibre's raster
+paint properties can crush and stretch luminance but cannot *tint* an image —
+with no saturation, `raster-hue-rotate` is a no-op.
+
+**Why the relief is two rasters.** A shaded-relief raster (`SR_HR`) encodes which
+way a slope faces, not how high it is: a sunlit valley floor and a shadowed
+2 000 m ridge can share a luminance, so no recolouring of it can ever produce
+elevation bands. `HYP_HR` is Natural Earth's hypsometric tint, which *is* colour
+by elevation, and it sits on the same 1/60° plate carrée grid. `fetch-relief`
+takes the hue from `HYP_HR` and the shading multiplier from `SR_HR`, so the map
+shows both what is high and what is steep. Neither source's own colours are used:
+the tint is multiplied by a gain that lands lowlands on the console's land tone
+and holds even the brightest peaks below the cyan and amber command accents. The
+palette was measured rather than guessed — over this box it runs teal lowlands
+`#799f99` through khaki `#ddccaa` to peaks around `#d5c3ac` — and `--no-tint`
+still reproduces the earlier greyscale hillshade for comparison.
+
+One trap: `HYP_HR` carries no water and paints the ocean flat `#ffffff`. Near-
+white is therefore water, and it is safer to say so than to rely on the vector
+ocean layer to cover a grey sea: measurement put every land feature, glaciers and
+the highest peaks included, at or below `#d5c3ac`, so the threshold is not close.
+`fetch-relief` paints those pixels the map's own ocean colour, which makes the sea
+seamless whether the vector fill is drawn or not. The build downloads are cached
+under `~/.cache/rocsar-relief`, because the two products are 42 MB and 83 MB.
+
+**What the vector tool does.** `fetch-basemap.py` merges and reduces upstream
+GeoJSON. It rounds coordinates to 6 dp (the linework is generalised; 14-digit
+precision is noise), filters `geography_regions_polys` to
+`featurecla == "Range/mtn"` — only 127 of its 514 features are mountains, and
 shipping island groups and deserts to draw mountains would be paying 3 MB for
-map never rendered. That filter turns a 10.4 MB file into 78 KB gzipped. The
-script writes pre-compressed `.json.gz`; `cmd/gs/bridge.go` serves them with
-`Content-Encoding: gzip`, so the bytes embedded in the binary are the
-compressed ones and the frontend still reads plain JSON URLs.
+map never rendered — and clips the 10m hydrography to the operating box. It
+writes pre-compressed `.json.gz`; `cmd/gs/bridge.go` serves them with
+`Content-Encoding: gzip`, so the bytes embedded in the binary are the compressed
+ones and the frontend still reads plain JSON URLs.
+
+**Why the water is at a different scale from the land.** At 50m the whole of
+Northern Europe carries **58 lakes and 34 rivers**, which is why the map
+appeared to have no inland water at all — Finland alone has some 188,000 lakes.
+The 10m hydrography is the fix, but Natural Earth publishes its denser European
+coverage as *supplements* that exclude what the global set already contains:
+`ne_10m_lakes_europe` has no Ladoga and no Vänern, `ne_10m_rivers_europe` has no
+Rhine and no Danube. Either file alone is therefore incomplete, so the global
+10m set and its European supplement are merged. That is **686 lakes and 666
+rivers** over the operating area, for 282 KB and 357 KB gzipped. The clip is
+bounding-box overlap rather than a geometric clip, so a river crossing the edge
+runs on off the map instead of stopping at an invisible line.
+
+**Cost.** Vector ~1.74 MB gzipped plus relief 611 KB ≈ **2.3 MB embedded**.
 
 Natural Earth is **public domain** (`naturalearthdata.com/about/terms-of-use`),
-which removes the attribution obligation a tile basemap would carry.
+raster included, and crediting the authors is unnecessary. That is a decisive
+advantage over the AWS Terrarium DEM, whose terms are a mosaic requiring an
+eleven-bullet attribution block — EU-DEM, SRTM/GMTED, ETOPO1, LINZ CC BY 3.0 NZ,
+UK EA OGL v3 and more — to ship inside the binary.
 
-**Recorded limitation.** Natural Earth has no terrain, no hillshade, no
-contours, and no dedicated mountain file. Mountains exist only as range
-*outlines* (coarse polygons) and named summit *points* with metre elevations.
-If visual relief is ever required, it is a raster hillshade layer, which is a
-new asset and a new decision — not a change to this one.
+**Recorded limitations.**
+- **Relief and detailed water exist only inside the operating-area box.**
+  Outside it there is the 50m vector basemap — land, ocean, coastlines, mountain
+  ranges, summits — with no terrain and no fine hydrography. Global relief would
+  have to be downsampled to roughly 6 km/px, which shows nothing.
+- **No 3D and no elevation.** The relief is a flat raster, so `setTerrain` is
+  unavailable and a click's `lngLat` is not terrain-adjusted. 3D means the DEM
+  route above.
+- **The relief is a backdrop, not a survey.** At 928 m/px it shows *where* the
+  mountains are, not what a particular hillside does.
+- **The elevation bands are Natural Earth's, not ours.** The hypsometric tint is
+  a published product at its own class breaks; `fetch-relief` recolours it but
+  does not re-derive elevation, so a band edge is where Natural Earth drew it,
+  not where this project believes one belongs.
 
 ### 1.3 Toolkit options
 
@@ -183,9 +250,11 @@ H1–H5 from `ARCHITECTURE.md` §1.1 bind the console. Restated as they bear on 
 *client*, which is not the same reading as for a server:
 
 - **H1 — 115 kbit/s.** Artefacts are fetched over HTTP with resume, never
-  through ZeroMQ. Progress and an ETA are mandatory, not polish: the default
-  `qos.bulk_rate_bps` is 8192 B/s, so a 30 MB capture is over an hour. A
-  progress bar with no ETA is a hang from the operator's side.
+  through ZeroMQ. Progress and an ETA are mandatory, not polish: at the
+  `link.rate_kbps` cap of 115 kbit/s a 66 MB capture is about an hour, so a
+  progress bar with no ETA is a hang from the operator's side. The cap is
+  adjustable at runtime by the operator (`set_link_limit`), so the ETA is measured
+  rather than claimed — the operator may have moved it since.
 - **H4 — the link may die.** The console must survive the OBC disappearing,
   reconnect when it returns, and never queue a command across the gap. A command
   sent at the moment the link drops must fail, not arrive late (§6.4).
@@ -460,8 +529,27 @@ The HTTP contract, from `internal/transport/http.go` and `internal/storage`:
 
 The client keeps `render.go`'s resumable fetch and adds what a GUI needs:
 progress events (coalesced to ~10 Hz — see §9.2), a `cancel`, and an ETA derived
-from the observed rate rather than from `qos.bulk_rate_bps`, which the client
-cannot read and which the operator may have overridden anyway.
+from the observed rate rather than from the configured cap, which the operator may
+have changed with `set_link_limit` while the transfer runs.
+
+**Transfers are long, and the ETA is not decoration.** `qos.bulk_rate_bps` is gone
+and the cap is the kernel's, adjustable at runtime (§6.6 of
+`ARCHITECTURE.md`). The artefact server no longer carries a write deadline — the
+5-minute one truncated a capture at a couple of MiB, because a rate-limited link
+means a real capture runs for hours — so a fetch no longer fails partway through,
+it simply takes as long as it takes. A 66 MiB capture at 115 kbit/s is about an
+hour.
+
+Two consequences the window has to respect:
+
+- **Progress is the only evidence the transfer is alive.** The status line carries
+  bytes, total, percent and rate; without it a long transfer is indistinguishable
+  from a hung link, which is the operator's first question.
+- **A preview states its duration before it starts**, computed from the size the
+  listing already gave and the cap in the same telemetry frame. It is shown, not
+  confirmed: §10 puts no gate between an operator and something they asked for,
+  and the missing thing was never consent — it was that a click which looks
+  instant is not.
 
 ---
 
@@ -535,6 +623,30 @@ the words the wire uses. `gs_probe.py` called this the failure a Ground Station
 most needs to avoid; it is still true of a GUI, which is easier to believe than
 a terminal.
 
+### 7.6 What a gauge may show
+
+An instrument is a rendering of a rule, not decoration, and three of them hold
+for every gauge added later:
+
+- **A held reading is an empty gauge carrying the word "held", never a short
+  bar.** A zero-length bar is indistinguishable from a measured zero, which is
+  the one value a held reading is not (§7.2). The load bar of an axis whose
+  servo did not answer is hatched and empty for exactly that reason.
+- **A servo position is shown in ticks and in degrees, and neither is derived
+  from the other.** The ring is drawn on the fixed 0–4095 tick range the wire
+  and `internal/client/commands.go` already bound; `current_angle_deg` is
+  printed as the number the view supplied. The console never multiplies a tick
+  by a degrees-per-tick constant — §9.4 applied to a dial.
+- **The compass names both bearings and their error, and calls the error the
+  shortest.** Its needle colours match the map's bearing lines (`#22d3ee`
+  current, `#ffb454` target) so the rose and the map read as one instrument, and
+  the antipodal case is stated as ambiguous rather than resolved silently.
+
+The instruments live in `widgets.ts` as pure string builders, which is what lets
+`test/widgets.test.ts` hold these rules without a browser. `test/fixture.ts`
+renders the panels from a fixture `View` to a static page (`npm run fixture`) so
+the layout can be looked at, which a unit test cannot do.
+
 ---
 
 ## 8. The bound surface
@@ -582,12 +694,12 @@ so a control for it would save a value the program never looks at. See
 Three absences, all deliberate:
 
 - **`SystemReset` is not bound.** The dispatcher answers it `ERROR_UNSUPPORTED`
-  (`internal/command/dispatcher.go:116`). A GUI button for a command that is
+  (`internal/command/dispatcher.go:140`). A GUI button for a command that is
   guaranteed to fail is a button that trains the operator to ignore errors.
 - **No generic `SendCommand(json)`.** The frontend never constructs a
   `CommandRequest` or touches a `oneof`. Every command is a named, typed method
   that validates its arguments host-side, exactly as `buildRequests` does in
-  `tools/gs_cli/client.go:229`. A generic escape hatch would put a protobuf
+  `internal/client/commands.go:268`. A generic escape hatch would put a protobuf
   oneof in the browser, where a renumbering is a silent runtime failure.
 - **No `RevealArtefact`.** Showing a file in the OS file manager needs either
   a platform API (a browser has none) or `os/exec` (forbidden to
@@ -648,54 +760,76 @@ their age is displayed alongside them.
   frontend draws the distinction it is given and does not invent one.
 - Retain a command it has sent. The reply arrives as an event, matched on
   request id.
+- Send anything on a knob drag. The knobs beside the motion inputs are a second
+  view of the numeric field, not a writer of it: dragging one changes the number
+  in the box and nothing else, and the adjacent button is still the single commit
+  (§10). The paired input stays the source of truth, which is also why telemetry
+  can never write a command value into it.
 - Open a native file dialog. GTK's file chooser aborts the whole process with
   SIGABRT when GSettings schemas are missing from the environment, which is
   uncatchable from Go (`git log` the `SaveFileDialog` removal for the trace).
   Destinations are typed into the window instead. This is not a styling choice;
   it is the only file picker that cannot kill the console.
+- Fill a field with a value nobody typed. This one is subtler than it looks and
+  it is a consequence of the blank-means-leave-alone rule rather than a separate
+  rule. Because an empty parameter input is excluded from the patch, **any**
+  value present in a field becomes part of the next `SetSdrParams`. A console
+  that auto-filled `START_OFFSET_S` from the session length — which is a
+  reasonable thing to build, and which the Tkinter console did on every
+  keystroke — would queue an arming-delay change to the aircraft as a side
+  effect of tabbing through a neighbouring field.
+
+  So the arming-delay suggestion in `main.ts` is a **click**, not a fill: it
+  renders beside the input as `use 0.5 s (flown at 10 s)`, states where the
+  number came from rather than presenting itself as the value for that length,
+  and disappears permanently once the operator types their own. It is also the
+  only mission-derived value in the frontend, and it is display-only — it
+  reaches the OBC solely by being typed into the field the operator can edit.
 
 ---
 
 ## 10. Command safety
 
-Motion commands — `Jog`, `SetHeading`, `Mount`, `SetDirection`, `Stop`,
-`SetHeater`, `ZeroServo`, `ZeroAll` — require an explicit confirmation step.
-Non-motion commands (`QueryStatus`, `TakePhoto`, `Probe`, `SelectReceiver`,
-`SetLinkLimit`) do not.
+**Motion commands fire without any confirmation step.** `Jog`, `SetHeading`,
+`Mount`, `SetDirection`, `Stop`, `SetHeater`, `ZeroServo`, `ZeroAll` and a map
+click all command immediately. There is no modal, no arm gate, and no second
+click.
 
-`ZeroServo` and `ZeroAll` were missing from this list while the code already
-gated both, and they are listed now on their own merits rather than as a
-correction: `zero` writes a position offset into the servo's own EEPROM, which is
-a write to hardware that outlives the board's power and outlives a reflash. It
-does not *move* the axis — a teach relabels the tick the axis is already sitting
-at — so it is not motion in the sense the rest of this list is about, but it is
-durable and it is deliberate, and the confirmation is where an operator should be
-told so. The prompt says exactly that, rather than implying the axis will return
-somewhere.
+**This reverses an earlier decision in this document, and the earlier reasoning
+is kept here because it was not wrong when it was written.** It read:
 
-**This is a decision against precedent in this repository, and the precedent is
-recorded.** `tools/gs_cli/main.go:190`:
+> The `gs_cli` reasoning is sound for a terminal: `jog 1 3000` is a typed,
+> deliberate act with a visible echo in the scrollback, and a typo is caught
+> before it is sent. None of that transfers to a window. A jog is a drag of a
+> slider, or a click on a button that also says "Stop" somewhere else on screen;
+> there is no echo; and there is no undo. The failure the gate prevents — motion
+> the operator did not intend, on an antenna — is not one an extra keystroke was
+> ever going to prevent anyway, but it *is* one that a two-step click reduces.
 
-> There is no arm gate. That was removed deliberately: it added a step between an
-> operator and a command without making anything safer, because the one consumer
-> that had it was a bench tool.
+The reversal turns on something the earlier text did not weigh: the map is now
+the primary command surface (§1.2), and clicking a point on it *is* the
+deliberate act the gate was trying to manufacture. A confirmation after "point
+here" asks the operator to re-affirm the coordinates they chose by looking at
+them, and the dismissing click is the same click that would have sent the
+command. It turned a one-click mistake into a two-click one while putting a step
+in front of every correct command to do it. `tools/gs_cli` reached the same
+conclusion for the terminal first; this brings the window to it.
 
-`tools/pico_bench` has an arm gate and still does.
+The one thing the gate did carry is the `zero` warning, and it is still owed:
+`zero` writes a position offset into the servo's own EEPROM, which outlives
+power and outlives a reflash, and a teach relabels the tick the axis is already
+sitting at rather than moving it. That is a fact to *display*, not a step to
+enforce, so it belongs beside the button rather than in a modal that interrupts
+the command. **Recorded as an open item: the window does not yet say it.**
 
-The `gs_cli` reasoning is sound for a terminal: `jog 1 3000` is a typed,
-deliberate act with a visible echo in the scrollback, and a typo is caught
-before it is sent. None of that transfers to a window. A jog is a drag of a
-slider, or a click on a button that also says "Stop" somewhere else on screen;
-there is no echo; and there is no undo. The failure the gate prevents — motion
-the operator did not intend, on an antenna — is not one an extra keystroke was
-ever going to prevent anyway, but it *is* one that a two-step click reduces.
+`Jog` remains bounded: ticks outside 0–4095 are refused client-side, as in
+`internal/client/commands.go:279`. The firmware refuses them too, but refusing in
+the console means nothing travels to the flight controller at all. That is a
+bound, not a gate, and it survives the reversal.
 
-The rule is written down rather than left to a widget's behaviour because the
-next person will find the missing gate and assume it was an oversight.
-
-`Jog` is additionally bounded: ticks outside 0–4095 are refused client-side, as
-in `tools/gs_cli/client.go:313`. The firmware refuses them too, but refusing in
-the console means nothing travels to the flight controller at all.
+`tools/pico_bench` keeps its arm gate, and should. It is a bench tool whose
+purpose is firing one command at a servo by hand; a prompt there costs nothing
+and the operator is not in a loop with a map.
 
 ---
 
@@ -723,7 +857,9 @@ is no key for it. Default `http://127.0.0.1:5557`.
 | `window_height` | `900` | |
 | `stale_after` | `3s` | §6.7. Three telemetry intervals. |
 | `download_dir` | `$HOME/rocsar` | where fetches land |
-| `confirm_motion` | `true` | §10. Configurable, defaulting to safe. |
+
+`confirm_motion` was in this table and is gone with the confirmation step (§10);
+there is no longer anything for it to turn off.
 
 Every key here goes into `config.KnownKeys` and gets a `case` in
 `internal/config/parse.go`, or `test/config_test.go` fails — it parses the
@@ -811,6 +947,8 @@ Additions to `test/layering_test.go` and new files in `test/`.
 | `TestCommandSurfaceIsBound` — every `CommandRequest` variant is either a bound method or documented absent (§8) | a command existing on the wire and in no window |
 | `test/client_test.go` — slow-joiner discard, request-id correlation, single-in-flight refusal, sequence gap and restart, independent SUB/DEALER reconnect | §6 |
 | `test/gsview_test.go` — `feedback_state` 0/1/2 and an unknown value; fix suppressed when `fix_ok` false; degrees not converted | §7 |
+| `test/widgets.test.ts` (`npm test`, run by `scripts/test.sh`) — shortest-angle difference, tick/percent clamping, ETA formatting, and the two absence rules: a held bar renders a word and no number, a ring drawn on the 0–4095 range saturates at both ends | §7.1, §7.2 and §7.6 quietly regressing in the browser, where `go test` cannot see them |
+| `test/fixture.ts` (`npm run fixture`) — renders the panels from a fixture `View` to a static page | the layout being shipped without ever having been looked at |
 
 Two gaps in `ARCHITECTURE.md` §12 are worth closing while the boundary test is
 already open:
@@ -899,9 +1037,13 @@ Stated so nobody mistakes silence for coverage.
   confined to `cmd/gs` — `internal/client` and `internal/gsview` do not import
   Wails. That containment is the reason for §4's split, and it is a design
   intention, not a tested claim.
-- **No accessibility or operator-ergonomics work.** Dark/light, fonts, colour
-  coding for state, and the like are unaddressed. The one exception is §7's
-  absence discipline, which is an accessibility property: "no data" must not be
+- **Operator ergonomics are partly addressed.** The instruments (compass, per-
+  servo cards, link tiles, sparkline, download bar) and the map-dominant layout
+  exist, and §7.6 states the rules they hold. What is still open: colour-blind
+  safety beyond "never colour alone", light mode, font scaling, and the fact that
+  no operator has used any of it. The layout has been rendered from fixtures
+  (§13) and looked at; it has not been used. The one property that is treated as
+  non-negotiable is §7's absence discipline: "no data" must not be
   indistinguishable from a zero, by colour or by anything else.
 - **Artefact integrity is still unverified.** No catalogue, no checksums — the
   same gap `ARCHITECTURE.md` §6.7 records for the OBC. A resumed download is
@@ -909,10 +1051,11 @@ Stated so nobody mistakes silence for coverage.
 - **`decoded` does not mean `trusted`.** `internal/gsview` renders what the OBC
   sent. It cannot tell a correct reading from a plausible one, and nothing here
   claims otherwise.
-- **The map is now in scope (§1.2) but its implementation is not built.** The
-  requirements are stated and the toolkit question is open (§1.3–§1.4). The
-  `telemetry:frame` event shape (`{view, gaps, restart}` with `view` per §7)
-  is the contract the map builds against and will not move under it. Open
-  questions -- tile sourcing for offline field use, projection of degrees,
-  marker assets, click-to-point wiring -- belong to the map track, not to the
-  console shell.
+- **The map is built (§1.2.1) but only lightly exercised.** The basemap, the
+  position marker, the IMU heading line, the position trail and click-to-point
+  are implemented; the relief and vector layers were checked at build time but
+  the palette has not been tuned against a real console at night. The
+  `telemetry:frame` event shape (`{view, gaps, restart}` with `view` per §7) is
+  the contract the map builds against and will not move under it. What remains
+  open is listed in §1.2.1: relief outside the operating box, 3D elevation, and
+  any higher-resolution relief.

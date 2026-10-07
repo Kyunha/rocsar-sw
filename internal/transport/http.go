@@ -25,46 +25,50 @@ import (
 // starves the telemetry and command traffic sharing it. And the transfer can be
 // resumed: a capture that dies at 80% over a marginal link is resumable over
 // HTTP with Range, and is not resumable at all over a datagram socket.
+//
+// The transfer is NOT paced here. It used to be, by a token bucket in this
+// package, and that is gone: the cap is enforced by the kernel on the link
+// device (internal/qos), which bounds every flow on the interface rather than
+// the one this process happens to serve. See ARCHITECTURE.md 6.6.
 type HTTP struct {
 	log   *slog.Logger
 	store *storage.Store
 	srv   *http.Server
 	addr  string
-
-	// limiter bounds artefact downloads. Built once here rather than per request
-	// so that two concurrent downloads share one rate: the constraint is the link,
-	// not the request.
-	limiter *bulkLimiter
-	// bulkRate is kept so the handler can be rebuilt (tests, restarts) from the
-	// same configuration rather than from a rate already rounded through a bucket.
-	bulkRate int
 }
 
 // NewHTTP returns a file server rooted at the given data directory.
-//
-// bytesPerSec bounds artefact downloads; zero or negative means unbounded.
-func NewHTTP(addr string, store *storage.Store, log *slog.Logger, bytesPerSec int) *HTTP {
+func NewHTTP(addr string, store *storage.Store, log *slog.Logger) *HTTP {
 	if log == nil {
 		log = slog.Default()
 	}
-	h := &HTTP{log: log, store: store, addr: addr, bulkRate: bytesPerSec}
-	if lim := newBulkLimiter(bytesPerSec); lim != nil {
-		h.limiter = lim
-		h.log.Info("artefact downloads bounded", "rate", lim.String())
-	}
-	return h
+	return &HTTP{log: log, store: store, addr: addr}
 }
 
 // Start binds the address and serves in the background.
 func (h *HTTP) Start(ctx context.Context) error {
 	h.srv = &http.Server{
 		Addr:    h.addr,
-		Handler: NewFileHandler(h.store, h.log, h.bulkRate),
+		Handler: NewFileHandler(h.store, h.log),
 		// A slow operator on a marginal link must not tie up a goroutine
 		// indefinitely, and an unbounded request body is an invitation.
 		ReadHeaderTimeout: 10 * time.Second,
-		WriteTimeout:      5 * time.Minute,
-		IdleTimeout:       60 * time.Second,
+		// NO WriteTimeout, deliberately, and this used to be 5 minutes.
+		//
+		// A write deadline is a wall clock on the whole response, set when the
+		// request header is read and not reset per chunk, so it truncates any
+		// transfer slower than size/deadline. The link is rate-limited, so
+		// transfers are measured in hours: from the shipped params.json a burst is
+		// 200 us at 31.251 MS/s, making a one-second session at PRF 2750 about
+		// 66 MiB. At the old five minutes and the old in-process rate that is a
+		// 2.3 MiB ceiling, and it failed quietly -- a short read reported as an
+		// ordinary transfer error, leaving a plausibly-sized file on disk.
+		//
+		// What bounds a transfer now is the kernel's rate cap. The residual cost
+		// is a client that stops reading holding a goroutine and a socket until
+		// the OBC restarts, which is the trade; IdleTimeout still reaps idle
+		// keep-alives. Pinned by TestTheArtefactServerHasNoWriteDeadline.
+		IdleTimeout: 60 * time.Second,
 	}
 
 	ln, err := net.Listen("tcp", h.addr)
@@ -106,18 +110,14 @@ func (h *HTTP) Stop() {
 // want, and because the traversal, Range and content-type behaviour is worth
 // testing directly. It is not exported *for* the tests -- the tests use it
 // because it is the same function the server runs.
-// bytesPerSec bounds artefact downloads. Zero or negative means unbounded, which
-// is what a caller that has not been told a rate gets -- a laptop on wifi, a test,
-// a developer who wants to see what the link really does.
-func NewFileHandler(store *storage.Store, log *slog.Logger, bytesPerSec int) http.HandlerFunc {
+func NewFileHandler(store *storage.Store, log *slog.Logger) http.HandlerFunc {
 	if log == nil {
 		log = slog.Default()
 	}
-	lim := newBulkLimiter(bytesPerSec)
-	return func(w http.ResponseWriter, r *http.Request) { serve(w, r, store, log, lim) }
+	return func(w http.ResponseWriter, r *http.Request) { serve(w, r, store, log) }
 }
 
-func serve(w http.ResponseWriter, r *http.Request, store *storage.Store, log *slog.Logger, lim *bulkLimiter) {
+func serve(w http.ResponseWriter, r *http.Request, store *storage.Store, log *slog.Logger) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		w.Header().Set("Allow", "GET, HEAD")
 		http.Error(w, "only GET and HEAD", http.StatusMethodNotAllowed)
@@ -150,7 +150,7 @@ func serve(w http.ResponseWriter, r *http.Request, store *storage.Store, log *sl
 		serveList(w, r, store, abs)
 		return
 	}
-	serveFile(w, r, store, log, abs, info, lim)
+	serveFile(w, r, store, log, abs, info)
 }
 
 // serveList returns a directory as JSON.
@@ -184,7 +184,7 @@ func serveList(w http.ResponseWriter, r *http.Request, store *storage.Store, abs
 
 // serveFile returns bytes, honouring Range.
 func serveFile(w http.ResponseWriter, r *http.Request, store *storage.Store, log *slog.Logger,
-	abs string, info os.FileInfo, lim *bulkLimiter) {
+	abs string, info os.FileInfo) {
 
 	f, err := os.Open(abs)
 	if err != nil {
@@ -205,7 +205,7 @@ func serveFile(w http.ResponseWriter, r *http.Request, store *storage.Store, log
 		if r.Method == http.MethodHead {
 			return
 		}
-		if _, err := io.Copy(w, lim.reader(f)); err != nil {
+		if _, err := io.Copy(w, f); err != nil {
 			// The client went away mid-transfer, which on a marginal link is
 			// routine and not an error worth a stack trace.
 			log.Debug("transfer interrupted", "file", info.Name(), "err", err)
@@ -243,7 +243,7 @@ func serveFile(w http.ResponseWriter, r *http.Request, store *storage.Store, log
 		return
 	}
 
-	if _, err := io.CopyN(w, lim.reader(f), end-start+1); err != nil {
+	if _, err := io.CopyN(w, f, end-start+1); err != nil {
 		log.Debug("range transfer interrupted", "file", info.Name(), "err", err)
 	}
 }

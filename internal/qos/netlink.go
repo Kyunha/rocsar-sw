@@ -15,18 +15,16 @@ import (
 const (
 	handleUnit = 1 << 16 // one minor number
 
-	// The hierarchy, in tc notation. Exported because they are the documented
-	// shape of the link (ARCHITECTURE.md 6.6) and a test should be able to assert
-	// that shape rather than a rendering of it.
-	RootHandle    = 1*handleUnit + 0   // 1:
-	PriorityClass = 1*handleUnit + 10  // 1:10
-	BulkClass     = 1*handleUnit + 20  // 1:20
-	PriorityLeaf  = 110*handleUnit + 0 // 110:
-	BulkLeaf      = 120*handleUnit + 0 // 120:
+	// The tree, in tc notation. Exported because they are the documented shape of
+	// the link (ARCHITECTURE.md 6.6) and a test should be able to assert that
+	// shape rather than a rendering of it.
+	RootHandle  = 1*handleUnit + 0   // 1:
+	ShapedClass = 1*handleUnit + 10  // 1:a
+	ShapedLeaf  = 110*handleUnit + 0 // 110:
 
-	// DefaultClassMinor is 10, not 20: unclassified traffic belongs in the class
-	// with a guaranteed floor, so a device with no classifier still protects
-	// telemetry rather than the other way round.
+	// DefaultClassMinor points every unclassified flow at the one class there is.
+	// There is no second class to be wrong about: see shaper.go for why the tree
+	// was collapsed, and what that cost.
 	DefaultClassMinor = 10
 )
 
@@ -81,8 +79,8 @@ func (NetlinkOps) ClearRoot(device string) error {
 	return nil
 }
 
-// AddRootHTB installs the root discipline with unclassified traffic defaulting to
-// the priority class.
+// AddRootHTB installs the root discipline, with unclassified traffic defaulting to
+// the one class this tree has.
 //
 // Parent is HANDLE_ROOT, not zero. A root qdisc has to say so explicitly: the
 // zero value tells the kernel to look for a parent qdisc with major number 0,

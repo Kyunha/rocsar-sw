@@ -6,55 +6,64 @@
 //
 // Usage:
 //   firmware_encoder_probe                        -> prints sample TX frames as hex
-//   firmware_encoder_probe <hex-with-delim>       -> prints "DECODED <seq> <tag> <detail>"
-//   firmware_encoder_probe --response-for <hex> <ok|err>
-//                                                     -> decodes, then prints the
-//                                                        response frame the Pico
-//                                                        would send back
-//   firmware_encoder_probe --apply <hex> [<hex>...]
+//   firmware_encoder_probe --apply-synth <kind> <args...>
 //                                                     -> runs the firmware's real
-//                                                        command handling, printing
-//                                                        one "REPLY/STATE/DRIVE"
-//                                                        set per command; a `t=<ms>`
-//                                                        argument sets the clock the
-//                                                        commands arrive with
-//   firmware_encoder_probe --apply-synth <kind> <args...]
-//                                                     -> the same, for a command
-//                                                        built here rather than
-//                                                        decoded from a frame
-//                                                        (the host has no encoder)
-//   firmware_encoder_probe --heater-lifetime <step>...]
+//                                                        command handling on a
+//                                                        command built here
+//   firmware_encoder_probe --heater-lifetime <step>...
 //                                                     -> drives the heater dead-man
 //                                                        over a timeline of t=/on/off
 //   firmware_encoder_probe --boot-state            -> initial state plus what the
 //                                                      first control tick transmits
 //   firmware_encoder_probe --heading <step> [<step>...]
 //                                                   -> drives applyImuHeading() with a
-//                                                      sequence of samples, printing one
-//                                                      "HEADING ..." line per step
+//                                                      sequence of samples
 //   firmware_encoder_probe --target-tick <heading> <target>
 //                                                   -> prints the tick the firmware
-//                                                      would command, for the seam guard
+//                                                      would command
 //   firmware_encoder_probe --servo-packet <id> <tick>
-//                                                   -> prints the 13 STS3215 wire bytes
-//                                                      as hex, checksum included
+//                                                   -> the goal-position write packet
 //   firmware_encoder_probe --servo-status-request <id>
-//                                                   -> prints the status-read request hex
+//                                                   -> the 0x38 telemetry read request
 //   firmware_encoder_probe --servo-status-scan <hex> <id>
-//                                                   -> runs scanServoStatus() over raw
-//                                                      bus bytes and prints the verdict
-//   firmware_encoder_probe --apply-feedback <hex> <id> [<hex> <id>...]
-//                                                   -> folds parsed status into the axes
-//                                                      and prints the resulting state
-//   firmware_encoder_probe --telemetry-from-state <heading> <target> <imu> <h1> <h2>
-//                                                   -> fills a TelemetryMessage through
-//                                                      the firmware's own mapping and
-//                                                      prints it as hex
+//                                                   -> scanServoStatus() over bytes
+//                                                      the test builds
+//   firmware_encoder_probe --apply-feedback <id> <tick> <load> <temp> <err>
+//                                                   -> folds a parsed status into an
+//                                                      axis, as the loop does
+//   firmware_encoder_probe --zero-seq <servo-id> <before> <outcome> [...]
+//                                                   -> whole teach attempts through
+//                                                      validate/judge/commitServoZero
+//   firmware_encoder_probe --judge-zero <expect> <wrote> <stored> <res> <after>
+//                                                   -> judgeServoZero() alone
+//   firmware_encoder_probe --servo-calib-scan <hex> <id>
+//                                                   -> scanServoCalibRead() over bytes
+//                                                      the test builds
+//   firmware_encoder_probe --servo-write8  <id> <reg> <value>
+//   firmware_encoder_probe --servo-write16 <id> <reg> <value>
+//   firmware_encoder_probe --servo-register-read <id> <reg> <count>
+//                                                   -> the teach's bus packets, for
+//                                                      comparison against the vendor
+//                                                      tool in docs/ST3215_Configure
+//   firmware_encoder_probe --calib <zeroed0> <zeroed1>
+//                                                   -> encode then decode the EEPROM
+//                                                      record, printing both
+//   firmware_encoder_probe --calib-decode <hex>
+//                                                   -> decode bytes the test corrupted
+//   firmware_encoder_probe --attitude <roll> <pitch> [...]
+//                                                   -> drive applyImuAttitude() over a
+//                                                      sequence; "none" for absent
+//   firmware_encoder_probe --calibration <sys> <gyro> <accel> <mag>
+//                                                   -> pack register 0x35 and store it
+//   firmware_encoder_probe --peak-accel <x> <y> <z> [...]
+//                                                   -> drive noteImuPeakAccel() and
+//                                                      print whether each sample
+//                                                      raised the maximum
 //
-// A <step> for --heading is a number (a real sample), "none" (no sensor fitted),
-// "nan"/"inf" (a non-finite sample), or "nodata" (a fitted sensor that delivered
-// nothing this tick -- the sketch holds and counts the miss, declaring the
-// sensor absent after IMU_MISSED_SAMPLES_MAX of them).
+// Every mode below is called from a .py file in this directory, and every one of
+// those was checked: three modes that were never called by anything have been
+// removed rather than left to rot in the header. Register and value arguments are
+// base-0, so 0x1F and 31 both work.
 
 #include <stdio.h>
 #include <string.h>
@@ -246,6 +255,10 @@ static void printState(const GondolaState& state) {
            (int)axis.feedbackState, axis.feedbackError, axis.load,
            axis.temperatureC, axis.awaitingCommand ? 1 : 0);
   }
+  printf(" | imu roll=%.3f pitch=%.3f calib=0x%02X peak=%.3f,%.3f,%.3f events=%u",
+         state.gondolaRollDeg, state.gondolaPitchDeg, (unsigned)state.imuCalibration,
+         state.peakAccelMs2[0], state.peakAccelMs2[1], state.peakAccelMs2[2],
+         (unsigned)state.peakAccelEvent);
   printf("\n");
 }
 
@@ -410,35 +423,6 @@ static int applyFeedback(int argc, char** argv) {
   return 0;
 }
 
-// Applies encoded command frames through the firmware's real applyCommand().
-//
-// An argument of the form `t=<ms>` sets the clock the commands are applied
-// with -- which is how the heater dead-man is driven from this entry point,
-// since "on" records the time it arrived. Commands before any `t=` use 0.
-static int applyFrames(int argc, char** argv) {
-  GondolaState state;
-  initGondolaState(state);
-
-  unsigned long nowMs = 0;
-  for (int i = 0; i < argc; i++) {
-    if (strncmp(argv[i], "t=", 2) == 0) {
-      nowMs = strtoul(argv[i] + 2, nullptr, 10);
-      printf("TIME %lu\n", nowMs);
-      continue;
-    }
-    rocsar_v1_PicoCommand command =
-        rocsar_v1_PicoCommand_init_zero;
-    // Suppress the per-command DECODED line; only the resulting state matters here.
-    if (decodeFrame(argv[i], &command, false) != 0) {
-      return 2;
-    }
-    rocsar_v1_ErrorCode error = applyCommand(state, command, nowMs);
-    printReply(command, error);
-    printState(state);
-    printDrive(state);
-  }
-  return 0;
-}
 
 // One command built here rather than decoded from a frame, for the cases a
 // host cannot encode: there is no Python or Go command encoder in this repo
@@ -656,49 +640,6 @@ static int servoPacket(int argc, char** argv) {
   return 0;
 }
 
-// Fills a TelemetryMessage through the firmware's own mapping and prints the
-// encoded frame, so the Python side can decode it with the codec it really uses
-// and the two cannot disagree about a field. <imu> and <h1>/<h2> are 0/1.
-static int telemetryFromState(int argc, char** argv) {
-  if (argc < 7) {
-    fprintf(stderr,
-            "usage: --telemetry-from-state <heading> <target> <imu> <h1> <h2>\n");
-    return 2;
-  }
-  GondolaState state;
-  initGondolaState(state);
-
-  applyImuHeading(state, strtof(argv[2], nullptr), strcmp(argv[4], "0") != 0);
-  state.targetHeading = strtof(argv[3], nullptr);
-  state.heater1 = strcmp(argv[5], "0") != 0;
-  state.heater2 = strcmp(argv[6], "0") != 0;
-
-  // Give the axes something distinguishable to report, so a mapping that
-  // silently copies the wrong field is visible rather than plausible.
-  for (int i = 0; i < NUM_ANTENNAS; i++) {
-    AntennaAxis& axis = state.antennas[i];
-    axis.lastSentTick = (uint16_t)(1000 + 100 * i);
-    axis.manualMode = (i == 1);
-    axis.mountOffsetDeg = 270.0f + (float)i;
-    axis.dirMultiplier = -1.0f;
-    updateAxisFeedback(axis);
-  }
-
-  rocsar_v1_PicoMessage message = rocsar_v1_PicoMessage_init_zero;
-  message.sequence = 11;
-  message.timestamp_us = 99ULL;
-  message.which_payload = rocsar_v1_PicoMessage_telemetry_tag;
-  fillTelemetryMessage(state, message.payload.telemetry);
-
-  uint8_t frame[PICO_TX_FRAME_MAX];
-  size_t len = encodePicoFrame(message, frame, sizeof(frame));
-  if (len == 0) {
-    fprintf(stderr, "telemetry encode failed\n");
-    return 2;
-  }
-  printHex(frame, len);
-  return 0;
-}
 
 // ===========================================================================
 // Teaching a servo its centre
@@ -718,9 +659,11 @@ static const char* outcomeName(ServoZeroOutcome outcome) {
   switch (outcome) {
     case ZERO_OK: return "ok";
     case ZERO_NO_SERVO_REPLY: return "no-servo-reply";
-    case ZERO_OFFSET_MISMATCH: return "offset-mismatch";
+    case ZERO_CORRECTION_MISMATCH: return "correction-mismatch";
     case ZERO_POSITION_MISMATCH: return "position-mismatch";
     case ZERO_ANGULAR_RESOLUTION: return "angular-resolution";
+    case ZERO_NOT_PERSISTENT: return "not-persistent";
+    case ZERO_UNREPRESENTABLE: return "unrepresentable";
   }
   return "?";
 }
@@ -728,9 +671,11 @@ static const char* outcomeName(ServoZeroOutcome outcome) {
 static ServoZeroOutcome outcomeFromName(const char* name) {
   if (strcmp(name, "ok") == 0) return ZERO_OK;
   if (strcmp(name, "no-reply") == 0) return ZERO_NO_SERVO_REPLY;
-  if (strcmp(name, "offset-lost") == 0) return ZERO_OFFSET_MISMATCH;
+  if (strcmp(name, "correction-lost") == 0) return ZERO_CORRECTION_MISMATCH;
   if (strcmp(name, "position-odd") == 0) return ZERO_POSITION_MISMATCH;
   if (strcmp(name, "resolution") == 0) return ZERO_ANGULAR_RESOLUTION;
+  if (strcmp(name, "volatile") == 0) return ZERO_NOT_PERSISTENT;
+  if (strcmp(name, "unrepresentable") == 0) return ZERO_UNREPRESENTABLE;
   fprintf(stderr, "unknown outcome '%s'\n", name);
   exit(2);
 }
@@ -768,20 +713,51 @@ static int zeroSeq(int argc, char** argv) {
 
     ServoZeroOutcome outcome = ZERO_NO_SERVO_REPLY;
     uint16_t verified = ST3215_SERVO_CENTRE_TICK;
+    bool representable = false;
+    int32_t correction =
+        servoZeroCorrection(before, ST3215_SERVO_CENTRE_TICK, representable);
 
     if (simulated != ZERO_NO_SERVO_REPLY) {
-      uint16_t offset = servoZeroOffset(before, ST3215_SERVO_CENTRE_TICK);
-      // Read-back is the offset, except when the write was lost. Position is
-      // centre except when the offset stored without moving it.
-      uint16_t readBack = (simulated == ZERO_OFFSET_MISMATCH) ? (uint16_t)(offset + 1)
-                                                              : offset;
-      uint16_t after = (simulated == ZERO_POSITION_MISMATCH) ? before
-                      : ST3215_SERVO_CENTRE_TICK;
-      uint8_t resolution = (simulated == ZERO_ANGULAR_RESOLUTION) ? 2 : 1;
+      // Two paths, as in the sketch: the 0x28 command first (the servo computes
+      // the correction, so the firmware cannot check it), then the 0x1F fallback
+      // (the firmware chose the value, so it can).
+      bool usedFallback = false;
 
-      outcome = judgeServoZero(offset, readBack, resolution, before, after);
+      if (simulated == ZERO_UNREPRESENTABLE || !representable) {
+        outcome = ZERO_UNREPRESENTABLE;
+      } else {
+        uint8_t resolution = (simulated == ZERO_ANGULAR_RESOLUTION) ? 2 : 1;
+        uint16_t after = (simulated == ZERO_POSITION_MISMATCH) ? before
+                        : ST3215_SERVO_CENTRE_TICK;
+        uint16_t stored = (uint16_t)(correction & 0xFFFF);
+        if (simulated == ZERO_NOT_PERSISTENT) {
+          stored = 0;
+        }
+
+        // A lost correction is indistinguishable from success on the command path:
+        // the servo chose the value, so there is nothing to compare it against, and
+        // the encoder has not moved. That is the honest shape of the failure, and
+        // it is exactly why the fallback exists -- the position read-back cannot see
+        // it either. So model the hardware, not the wish: the command does not take
+        // (position unmoved), which is what sends the sketch to the fallback, and
+        // there the register disagrees with what was written.
+        bool commandMoved = (simulated != ZERO_POSITION_MISMATCH &&
+                             simulated != ZERO_CORRECTION_MISMATCH);
+
+        outcome = judgeServoZero(false, 0, stored, resolution,
+                                 commandMoved ? after : before);
+        if (outcome == ZERO_POSITION_MISMATCH) {
+          usedFallback = true;
+          outcome = judgeServoZero(true, stored,
+                                   (simulated == ZERO_CORRECTION_MISMATCH)
+                                       ? (uint16_t)(stored + 1)
+                                       : stored,
+                                   resolution, after);
+        }
+        (void)usedFallback;
+      }
       if (outcome == ZERO_OK) {
-        verified = after;
+        verified = ST3215_SERVO_CENTRE_TICK;
       }
     }
 
@@ -789,9 +765,8 @@ static int zeroSeq(int argc, char** argv) {
       commitServoZero(state, axisIndex, verified);
     }
 
-    printf("ZERO outcome=%s before=%u offset=%u committed=%d\n",
-           outcomeName(outcome), before,
-           servoZeroOffset(before, ST3215_SERVO_CENTRE_TICK),
+    printf("ZERO outcome=%s before=%u correction=%d representable=%d committed=%d\n",
+           outcomeName(outcome), before, correction, representable ? 1 : 0,
            outcome == ZERO_OK ? 1 : 0);
     printState(state);
   }
@@ -799,22 +774,24 @@ static int zeroSeq(int argc, char** argv) {
   return 0;
 }
 
-// --judge-zero <wrote> <readback> <resolution> <before> <after>
+// --judge-zero <expect> <wrote> <readback> <resolution> <after>
 //
 // The verification decision on its own, so every branch is reachable without
-// having to construct a whole teach around it.
+// having to construct a whole teach around it. <expect> is 1 for the 0x1F
+// fallback, where the firmware chose the correction and can check it, and 0 for
+// the 0x28 command, where the servo chose it.
 static int judgeZero(int argc, char** argv) {
   if (argc < 7) {
     fprintf(stderr,
-            "usage: --judge-zero <wrote> <readback> <resolution> <before> <after>\n");
+            "usage: --judge-zero <expect> <wrote> <readback> <resolution> <after>\n");
     return 2;
   }
   ServoZeroOutcome outcome = judgeServoZero(
-      (uint16_t)strtoul(argv[2], nullptr, 10),
-      (uint16_t)strtoul(argv[3], nullptr, 10),
-      (uint8_t)strtoul(argv[4], nullptr, 10),
-      (uint16_t)strtoul(argv[5], nullptr, 10),
-      (uint16_t)strtoul(argv[6], nullptr, 10));
+      strtoul(argv[2], nullptr, 0) != 0,
+      (uint16_t)strtoul(argv[3], nullptr, 0),
+      (uint16_t)strtoul(argv[4], nullptr, 0),
+      (uint8_t)strtoul(argv[5], nullptr, 0),
+      (uint16_t)strtoul(argv[6], nullptr, 0));
   printf("JUDGE %s\n", outcomeName(outcome));
   return 0;
 }
@@ -909,10 +886,92 @@ static int calibDecode(int argc, char** argv) {
   return 0;
 }
 
-int main(int argc, char** argv) {
-  if (argc > 2 && strcmp(argv[1], "--apply") == 0) {
-    return applyFrames(argc - 2, argv + 2);
+// --attitude <roll> <pitch> [<roll> <pitch>...]
+//
+// Drives applyImuAttitude() through a sequence, printing one ATTITUDE line per
+// step. A step with no sensor present, or with the literal "none" in a slot,
+// exercises the two ways the function can decline a sample.
+static int applyAttitudes(int argc, char** argv) {
+  if (argc < 4 || (argc - 2) % 2 != 0) {
+    fprintf(stderr, "usage: --attitude <roll> <pitch> [<roll> <pitch>...]\n");
+    return 2;
   }
+
+  GondolaState state;
+  initGondolaState(state);
+
+  for (int i = 2; i + 1 < argc; i += 2) {
+    bool present = strcmp(argv[i], "none") != 0 && strcmp(argv[i + 1], "none") != 0;
+    float roll = present ? strtof(argv[i], nullptr) : 0.0f;
+    float pitch = present ? strtof(argv[i + 1], nullptr) : 0.0f;
+    ImuSample result = applyImuAttitude(state, roll, pitch, present);
+    printf("ATTITUDE %s roll=%.3f pitch=%.3f\n", sampleName(result),
+           state.gondolaRollDeg, state.gondolaPitchDeg);
+  }
+
+  printState(state);
+  return 0;
+}
+
+// --calibration <sys> <gyro> <accel> <mag>
+//
+// Packs the four components into the register byte and stores it, so a test can
+// check both the bit layout and that it round-trips.
+static int applyCalibrationStatus(int argc, char** argv) {
+  if (argc < 6) {
+    fprintf(stderr, "usage: --calibration <sys> <gyro> <accel> <mag>\n");
+    return 2;
+  }
+
+  GondolaState state;
+  initGondolaState(state);
+
+  uint8_t sys = (uint8_t)strtoul(argv[2], nullptr, 0);
+  uint8_t gyro = (uint8_t)strtoul(argv[3], nullptr, 0);
+  uint8_t accel = (uint8_t)strtoul(argv[4], nullptr, 0);
+  uint8_t mag = (uint8_t)strtoul(argv[5], nullptr, 0);
+
+  uint8_t packed = packImuCalibration(sys, gyro, accel, mag);
+  printf("PACKED 0x%02X\n", (unsigned)packed);
+
+  setImuCalibration(state, packed);
+  printf("CALIB %u %u %u %u\n", (state.imuCalibration >> 6) & 3,
+         (state.imuCalibration >> 4) & 3, (state.imuCalibration >> 2) & 3,
+         state.imuCalibration & 3);
+
+  printState(state);
+  return 0;
+}
+
+// --peak-accel <x> <y> <z> [<x> <y> <z>...]
+//
+// Feeds linear-acceleration samples into the peak-hold, printing one PEAK line
+// per sample with whether that sample raised the maximum. This is where the
+// "one shock is one event, not three" rule is checked.
+static int applyPeakAccel(int argc, char** argv) {
+  if (argc < 5 || (argc - 2) % 3 != 0) {
+    fprintf(stderr, "usage: --peak-accel <x> <y> <z> [<x> <y> <z>...]\n");
+    return 2;
+  }
+
+  GondolaState state;
+  initGondolaState(state);
+
+  for (int i = 2; i + 2 < argc; i += 3) {
+    float x = strtof(argv[i], nullptr);
+    float y = strtof(argv[i + 1], nullptr);
+    float z = strtof(argv[i + 2], nullptr);
+    bool raised = noteImuPeakAccel(state, x, y, z);
+    printf("PEAK raised=%d peak=%.3f,%.3f,%.3f events=%u\n", raised ? 1 : 0,
+           state.peakAccelMs2[0], state.peakAccelMs2[1], state.peakAccelMs2[2],
+           (unsigned)state.peakAccelEvent);
+  }
+
+  printState(state);
+  return 0;
+}
+
+int main(int argc, char** argv) {
 
   if (argc > 2 && strcmp(argv[1], "--apply-synth") == 0) {
     return applySynth(argc - 2, argv + 2);
@@ -950,20 +1009,28 @@ int main(int argc, char** argv) {
     return applyFeedback(argc, argv);
   }
 
-  if (argc > 6 && strcmp(argv[1], "--telemetry-from-state") == 0) {
-    return telemetryFromState(argc, argv);
-  }
-
   if (argc > 4 && strcmp(argv[1], "--zero-seq") == 0) {
     return zeroSeq(argc, argv);
   }
 
-  if (argc > 6 && strcmp(argv[1], "--judge-zero") == 0) {
+  if (argc > 5 && strcmp(argv[1], "--judge-zero") == 0) {
     return judgeZero(argc, argv);
   }
 
   if (argc > 3 && strcmp(argv[1], "--servo-calib-scan") == 0) {
     return servoCalibScan(argc, argv);
+  }
+
+  if (argc > 3 && strcmp(argv[1], "--attitude") == 0) {
+    return applyAttitudes(argc, argv);
+  }
+
+  if (argc > 5 && strcmp(argv[1], "--calibration") == 0) {
+    return applyCalibrationStatus(argc, argv);
+  }
+
+  if (argc > 4 && strcmp(argv[1], "--peak-accel") == 0) {
+    return applyPeakAccel(argc, argv);
   }
 
   if (argc > 3 && strcmp(argv[1], "--calib") == 0) {
@@ -1007,18 +1074,6 @@ int main(int argc, char** argv) {
     return 0;
   }
 
-  if (argc > 2 && strcmp(argv[1], "--response-for") == 0) {
-    rocsar_v1_PicoCommand command =
-        rocsar_v1_PicoCommand_init_zero;
-    if (decodeFrame(argv[2], &command) != 0) {
-      return 2;
-    }
-    bool ok = (argc <= 3) || strcmp(argv[3], "ok") == 0;
-    emitResponse(command.sequence, ok,
-                 ok ? rocsar_v1_ErrorCode_ERROR_NONE
-                    : rocsar_v1_ErrorCode_ERROR_INVALID_SERVO);
-    return 0;
-  }
 
   if (argc > 1) {
     rocsar_v1_PicoCommand ignored =

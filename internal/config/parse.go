@@ -208,10 +208,6 @@ func (c *Config) assign(key string, raw any) error {
 		c.SDR.Program, err = str()
 	case "telemetry.interval":
 		c.Telemetry.Interval, err = duration()
-	case "qos.bulk_rate_bps":
-		var n uint32
-		n, err = integer()
-		c.QOS.BulkRateBps = int(n)
 	case "require_hardware":
 		c.RequireHardware, err = boolean()
 

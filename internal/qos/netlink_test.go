@@ -97,11 +97,16 @@ func TestNetlinkClassRatesReachTheKernelUnchanged(t *testing.T) {
 		got[htb.Attrs().Handle] = key{rate: htb.Rate * 8, ceil: htb.Ceil * 8}
 	}
 
-	if got[PriorityClass] != (key{41_000, 115_000}) {
-		t.Errorf("priority class = %+v, want rate 41000 ceil 115000 bits/s", got[PriorityClass])
+	// One class, and its rate is the configured rate: rate_kbps means the cap,
+	// which is the whole point of collapsing the tree. Before the collapse this
+	// read back 41_000 for a configured 115, because the cap the operator set was
+	// only ever PriorityShare of what the link actually carried.
+	if got[ShapedClass] != (key{115_000, 115_000}) {
+		t.Errorf("shaped class = %+v, want rate 115000 ceil 115000 bits/s", got[ShapedClass])
 	}
-	if got[BulkClass] != (key{74_000, 74_000}) {
-		t.Errorf("bulk class = %+v, want rate 74000 ceil 74000 bits/s", got[BulkClass])
+	if n := len(got); n != 1 {
+		t.Errorf("%d classes installed, want exactly 1: there is no classifier to "+
+			"steer traffic between them, so a second class is unreachable", n)
 	}
 }
 
@@ -138,11 +143,8 @@ func TestNetlinkInstallsTheHierarchyAndReadsItBack(t *testing.T) {
 			leaves[q.Attrs().Parent] = q.Attrs().Handle
 		}
 	}
-	if leaves[PriorityClass] != PriorityLeaf {
-		t.Errorf("priority leaf = %s, want %s", HandleString(leaves[PriorityClass]), HandleString(PriorityLeaf))
-	}
-	if leaves[BulkClass] != BulkLeaf {
-		t.Errorf("bulk leaf = %s, want %s", HandleString(leaves[BulkClass]), HandleString(BulkLeaf))
+	if leaves[ShapedClass] != ShapedLeaf {
+		t.Errorf("shaped leaf = %s, want %s", HandleString(leaves[ShapedClass]), HandleString(ShapedLeaf))
 	}
 
 	// Removing the hierarchy must actually remove it, which is the read-back that

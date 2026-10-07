@@ -536,8 +536,9 @@ func printTelemetry(tel domain.PicoTelemetry, fresh bool) {
 		marker, tel.GondolaHeadingDeg, tel.TargetHeadingDeg,
 		imuState(tel.IMUPresent), onOff(tel.Heater1State), onOff(tel.Heater2State))
 	for _, a := range tel.Axes {
-		fmt.Printf("    servo %-3d tick %-5d angle %8.3f deg  load %6d  %3d C  %s%s\n",
-			a.ServoID, a.CurrentTick, a.CurrentAngleDeg, a.Load, a.TemperatureC,
+		fmt.Printf("    servo %-3d tick %-5d angle %8.3f deg  %s  load %6d  %3d C  %s%s\n",
+			a.ServoID, a.CurrentTick, a.CurrentAngleDeg, centreWord(a),
+			a.Load, a.TemperatureC,
 			feedbackWord(a.FeedbackState), errorSuffix(a.FeedbackError))
 	}
 }
@@ -551,14 +552,29 @@ func printTelemetryTo(w *bufio.Writer, tel domain.PicoTelemetry, fresh bool) {
 		marker, tel.GondolaHeadingDeg, tel.TargetHeadingDeg,
 		imuState(tel.IMUPresent), onOff(tel.Heater1State), onOff(tel.Heater2State))
 	for _, a := range tel.Axes {
-		fmt.Fprintf(w, "    servo %-3d tick %-5d angle %8.3f load %6d %3dC %s%s\n",
-			a.ServoID, a.CurrentTick, a.CurrentAngleDeg, a.Load, a.TemperatureC,
+		fmt.Fprintf(w, "    servo %-3d tick %-5d angle %8.3f %s load %6d %3dC %s%s\n",
+			a.ServoID, a.CurrentTick, a.CurrentAngleDeg, centreWord(a),
+			a.Load, a.TemperatureC,
 			feedbackWord(a.FeedbackState), errorSuffix(a.FeedbackError))
 	}
 	w.Flush()
 }
 
 // feedbackWord is the whole point of principle 3: a word, never a bare number.
+// centreWord reports the centre tick and whether it was ever established.
+//
+// This is the bench tool, so it is the one place an operator looks while
+// diagnosing a `zero` -- and it was the only consumer of domain.Axis that dropped
+// center_zeroed. An untaught axis reports the same 2048 as a centred one, so
+// without this the two are indistinguishable here while gs_cli and the console
+// both distinguish them.
+func centreWord(a domain.Axis) string {
+	if a.CenterZeroed {
+		return fmt.Sprintf("centre %-5d", a.CenterTick)
+	}
+	return fmt.Sprintf("UNTAUGHT(%d)", a.CenterTick)
+}
+
 func feedbackWord(s domain.FeedbackState) string {
 	switch s {
 	case domain.FeedbackMeasured:

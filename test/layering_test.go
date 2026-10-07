@@ -527,15 +527,6 @@ func isAllowed(rule forbiddenRule, path string) bool {
 	return false
 }
 
-func anyPackageContains(pkgs map[string]bool, substr string) bool {
-	for p := range pkgs {
-		if strings.Contains(strings.ToLower(p), substr) {
-			return true
-		}
-	}
-	return false
-}
-
 func keysOf(m map[string]bool) []string {
 	out := make([]string, 0, len(m))
 	for k := range m {
@@ -543,8 +534,6 @@ func keysOf(m map[string]bool) []string {
 	}
 	return out
 }
-
-func join(m map[string]bool) string { return strings.Join(keysOf(m), ", ") }
 
 func goFilesIn(t *testing.T, dir string) []string {
 	t.Helper()
@@ -591,8 +580,7 @@ func rel(t *testing.T, root, path string) string {
 	return r
 }
 
-// declaredInterfaces returns the interface names declared in a package's files.
-// declaredInterfaces returns the names of the INTERFACES declared in a package.
+// declaredInterfaces returns the names of the interfaces declared in a package.
 //
 // Only interfaces. The package also declares structs -- Fix, Photo, PicoTelemetry
 // and the rest -- and treating those as ports would demand a mock for a data
@@ -617,32 +605,6 @@ func declaredInterfaces(t *testing.T, dir string) []string {
 					continue
 				}
 				if _, isIface := ts.Type.(*ast.InterfaceType); isIface {
-					out = append(out, ts.Name.Name)
-				}
-			}
-		}
-	}
-	return out
-}
-
-// concreteTypeNames returns the names of struct types declared in a file, which
-// are the candidate implementations.
-func concreteTypeNames(t *testing.T, file string) []string {
-	t.Helper()
-	fset := token.NewFileSet()
-	pf, err := parser.ParseFile(fset, file, nil, 0)
-	if err != nil {
-		t.Fatalf("parsing %s: %v", file, err)
-	}
-	var out []string
-	for _, d := range pf.Decls {
-		gd, ok := d.(*ast.GenDecl)
-		if !ok {
-			continue
-		}
-		for _, spec := range gd.Specs {
-			if ts, ok := spec.(*ast.TypeSpec); ok && ts.Name != nil {
-				if _, isIface := ts.Type.(*ast.InterfaceType); !isIface {
 					out = append(out, ts.Name.Name)
 				}
 			}

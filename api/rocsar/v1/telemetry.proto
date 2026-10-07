@@ -47,6 +47,23 @@ message GnssReceiverStatus {
 
   uint64 packets_accepted = 11;
   uint64 packets_rejected = 12;
+
+  // Climbrate in metres per second, positive up, fitted over a window rather than
+  // differenced.
+  //
+  // Optional, and absent for the first minute of a flight. Absent means "not yet
+  // derivable" -- too few fixes, or the window has not spanned long enough. It is
+  // emphatically NOT zero: a balloon at float genuinely reports ~0, and a client
+  // that cannot tell that from "no data yet" will eventually call the first minute
+  // of every ascent a stall. Same rule as last_output_file and load: absence is
+  // absent, never a number that looks like a measurement.
+  //
+  // Derived on the OBC rather than on the receiver because the frozen 142-byte
+  // GNSS wire carries only Height and must not be changed without the vendored
+  // Read_uB. See internal/gnss/climb.go for why a windowed least-squares fit and
+  // not a difference: GNSS altitude noise is metres, and differencing a 5 m/s
+  // ascent one second at a time produces +/-3 m/s of noise.
+  optional double vertical_rate_mps = 13;
 }
 
 message SdrStatus {

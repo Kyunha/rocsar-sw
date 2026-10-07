@@ -427,6 +427,54 @@ and includes no Arduino headers, so `firmware/tests/` compiles it on the host.
 `calibration.h` is split the same way from `calibration_store.h`: the record's
 format is host-testable, only the EEPROM that holds it is not.
 
+### What the IMU is reporting
+
+The BNO055 is an NDOF fusion sensor that can deliver fifteen or so quantities.
+The firmware reads two of them: one `VECTOR_EULER` read, of which it originally
+used one of the three angles, and one die temperature. The rest were discarded on
+every tick.
+
+That is the right shape for a **stratospheric balloon**, and the wrong shape for a
+launch vehicle. There is no boost phase here, so accelerations are gravity plus
+pendulum sway and streaming raw 6-axis buys nothing while costing the frame budget
+that the fields below need. What a multi-hour flight cannot answer without is
+what now goes down:
+
+- **`gondola_roll_deg` / `gondola_pitch_deg`** — the two Euler angles that were
+  already arriving and being dropped. Their job is not attitude. It is to be a
+  *confidence signal on the heading*: the BNO055 tilt-compensates its fusion using
+  its accelerometer, and a gondola on a 10–40 m tether swings at roughly 0.1 Hz,
+  so sway corrupts the estimate the heading correction depends on. Erratic tilt is
+  the tell that the bearing has degraded.
+- **`imu_calibration`** — register `0x35` verbatim: two bits per sensor, system
+  first, each 0 uncalibrated to 3 fully. `imu_present` only ever said a sensor
+  answered, which an uncalibrated one does just as readily. Over 2–24 hours with a
+  night-to-day temperature swing at altitude this is the difference between a
+  heading you trust and one you do not. The console unpacks it and names the
+  magnetometer, which is the one that decides.
+- **`imu_peak_accel_ms2` + `imu_peak_accel_event`** — the largest *linear*
+  acceleration seen since boot (gravity already removed by the sensor), and a
+  counter that increments once per sample that raised it. The events worth
+  catching are rare and transient: balloon rupture into free-fall until the chute
+  deploys, the valve transition, recovery shock. A 20 ms sample stream would miss
+  most of them; a held maximum costs a fixed 18 bytes and catches the whole
+  transient. One shock is one event even though it moves all three axes.
+
+Plus `vertical_rate_mps` on each GNSS receiver, derived on the OBC from altitude
+with a 60 s least-squares fit. Differencing two fixes a second apart does not work
+here — GNSS altitude noise is metres, so it produces ±3 m/s of noise on a 5 m/s
+ascent — and the noise of a windowed fit falls as `√(12/N³)`. It is **absent,
+not zero**, for the first minute of a flight, which the console renders as
+`no rate yet` rather than `0.00 m/s`. A balloon genuinely at float reports a small
+number from the same formatter.
+
+**The heading filter passes the gondola pendulum through unattenuated, by
+design.** `IMU_ALPHA 0.15` at 50 Hz is a 1.29 Hz cutoff against a swing of
+0.08–0.16 Hz, so the reported bearing wanders through the swing for the whole
+flight. That is correct — the antenna should point where the gondola actually
+points, not where it would hang at rest — and it is written down here so nobody
+spends a flight chasing it.
+
 ### Zeroing a servo
 
 `zero <servo>` teaches the ST3215 its own centre by writing a position offset
@@ -515,7 +563,6 @@ explicit flag  >  ROCSAR_* environment  >  rocsar.toml  >  code default
 | `camera.device` | `/dev/video0` | The node `fswebcam` reads. |
 | `sdr.program` | `third_party/sdr-ettus-b200mini` | Directory holding `parameters/` and `Data/` — **not** the `connect` binary, which is found on `PATH`. Must be named `sdr-ettus-b200mini`; see below. |
 | `telemetry.interval` | `1s` | Frame rate. |
-| `qos.bulk_rate_bps` | `8192` | Artefact download ceiling. `0` = unbounded. |
 | `require_hardware` | `false` | Missing hardware is fatal instead of degraded. |
 
 Every key has an environment form: uppercase, dots to underscores, `ROCSAR_` prefix.
@@ -578,7 +625,7 @@ Two things about that value, both of which look like pedantry and are not:
 | `./scripts/deploy.sh <ip> [user]` | Cross-compile for arm64, rsync, restart the systemd unit. |
 | `./scripts/lint.sh` | `go vet`, `ruff`, `buf lint`. |
 | `./scripts/clean.sh` | Remove `bin/`, generated protobuf, `__pycache__`, tool caches. |
-| `./scripts/flash-firmware.sh` | `arduino-cli compile` + `upload` to the RP2040. |
+| `./scripts/flash-firmware.sh` | `arduino-cli compile`, then `picotool load` of the UF2, falling back to a copy onto the boot volume. |
 | `./scripts/proto-check.sh` | Regenerate, then `git diff --exit-code` the generated tree. |
 | `./scripts/generate.sh` | Regenerate all three protobuf targets and verify them. |
 
@@ -654,13 +701,21 @@ documents disagree, the code is wrong.
 - **Nothing is simulated unless asked, and mocks are named on the wire.** A system
   that fabricated a reading because a device was not found is the worst failure
   mode this project has; hiding it in a log nobody has open is not disclosure.
-- **Link shaping caps the link but does not classify it.** The HTB hierarchy works
-  — measured on the target at a 41 kbit/s floor with a 115 kbit/s ceiling — but the
-  `tc flower` filter that was meant to steer artefact downloads into a bulk class
-  never worked, after three separate fixes. Bulk downloads are bounded in-process
-  by `qos.bulk_rate_bps` instead. Proper per-class constraint is deferred to its
-  own module rather than declared finished. Read `internal/qos/shaper.go` before
-  re-adding a filter.
+- **The link cap is the kernel's, it is the only limiter, and it does not
+  classify.** One HTB class at `link.rate_kbps` (115 kbit/s, measured on the
+  target) bounds every flow on the device — including the operator's own SSH. The
+  `tc flower` filter that was meant to give telemetry a floor while artefacts used
+  the rest never worked, after three separate fixes, so telemetry and downloads
+  share the one class. That is affordable: a 1 Hz frame is 3.2 kbit/s against 115.
+  The cap is adjustable at runtime with `set_link_limit` and cannot be set below
+  `qos.MinimumRateKbps()` (17 kbit/s, one worst-case frame per second). Proper
+  per-class constraint is deferred to its own module rather than declared
+  finished. Read `internal/qos/shaper.go` before re-adding a filter.
+- **`CAP_NET_ADMIN` is a deployment requirement.** Link shaping needs it, and with
+  the in-process limiter deleted there is no fallback: an OBC without the
+  capability runs an **unbounded** link. It still starts and still serves
+  telemetry, logging at ERROR and reporting `shaping_active = false` with the
+  reason, and it re-tries every 10 s in case the capability appears.
 - **DEALER, not REQ.** The OBC's ROUTER sends `[identity, payload]` with no empty
   delimiter; REQ always inserts one, so the reply arrives a frame late. The Go
   test client hand-rolled the REQ envelope for a while, so the tests passed and the

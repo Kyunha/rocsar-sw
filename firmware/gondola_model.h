@@ -224,6 +224,17 @@ inline size_t buildServoPacket(uint8_t id, int32_t position, uint8_t* out,
                             payload, sizeof(payload), out, outLen);
 }
 
+// The ST3215 checksum: ones' complement of bytes 2 through len-2. The two 0xFF
+// header bytes are excluded, which is the part that is easy to get wrong --
+// including them yields a checksum that validates nothing.
+inline uint8_t servoChecksum(const uint8_t* frame, size_t len) {
+  uint16_t sum = 0;
+  for (size_t i = 2; i + 1 < len; i++) {
+    sum += frame[i];
+  }
+  return (uint8_t)(~sum & 0xFF);
+}
+
 // How far a target tick must move before it is worth waking the servo bus for.
 // One tick is 0.088 degrees, so re-sending every 20 ms would put 50 identical
 // frames/s on a 115200 bus for no mechanical gain.
@@ -246,9 +257,11 @@ inline bool shouldSendServoTick(uint16_t lastSent, uint16_t target) {
 // driven, and the same "logic in hardware, no coverage" shape is what let the
 // uninitialised-IMU defect survive a green suite.
 //
-// Framing, from `tools/ST3215_Configure/ST3215_Configure.ino` on the bench
-// (2026-10-02): INST_READ (0x02) on register 0x38 for 8 bytes, answered by a
-// 14-byte frame carrying the status block.
+// Framing, from `docs/ST3215_Configure/ST3215_Configure.ino` on the bench
+// (2026-10-02), and confirmed by the vendor memory table's entries for 0x38
+// (current location, 2 bytes), 0x3A (current speed), 0x3C (current load), 0x3E
+// (current voltage) and 0x3F (current temperature): INST_READ (0x02) on register
+// 0x38 for 8 bytes, answered by a 14-byte frame carrying that block.
 //
 //     FF FF | ID | LEN | ERR | POS_L POS_H | SPD_L SPD_H | LOAD_L LOAD_H | VOLT | TEMP | CHK
 //            0    1    2    3    4         5-6         7-8          9-10       11    12    13
@@ -271,6 +284,35 @@ inline bool shouldSendServoTick(uint16_t lastSent, uint16_t target) {
 #define SERVO_STATUS_REPLY_LEN 14
 #define SERVO_STATUS_REPLY_LEN_FIELD 0x0A
 #define SERVO_STATUS_PARAM_LEN 8
+
+// Builds a register-read request for one servo into `out`, returning its length.
+//
+// The mirror of `buildServoPacket()`, and for the same reason: the sketch cannot
+// be unit tested, and a status request with a wrong length byte reads back
+// whatever the servo felt like sending. `buildServoRegisterRead()` is the generic
+// form; this is the one call site that reads the telemetry block, pinned so the
+// address and length of that read live next to the scanner that parses its reply.
+inline size_t buildServoRegisterRead(uint8_t id, uint8_t reg, uint8_t count,
+                                     uint8_t* out, size_t outLen) {
+  if (out == nullptr || outLen < SERVO_STATUS_REQUEST_LEN || count == 0) {
+    return 0;
+  }
+  out[0] = 0xFF;
+  out[1] = 0xFF;
+  out[2] = id;
+  out[3] = 0x04;
+  out[4] = SERVO_INST_READ;
+  out[5] = reg;
+  out[6] = count;
+  out[7] = servoChecksum(out, SERVO_STATUS_REQUEST_LEN);
+  return SERVO_STATUS_REQUEST_LEN;
+}
+
+inline size_t buildServoStatusRequest(uint8_t id, uint8_t* out, size_t outLen) {
+  return buildServoRegisterRead(id, SERVO_REG_TELEMETRY, SERVO_STATUS_PARAM_LEN,
+                                out, outLen);
+}
+
 
 // How long the sketch waits for a status reply before giving up on this poll,
 // and how much RX it will hold while waiting.
@@ -317,17 +359,348 @@ inline bool shouldSendServoTick(uint16_t lastSent, uint16_t target) {
 #define SERVO_RX_TEMP 12
 #define SERVO_RX_CHECKSUM 13
 
-// Load: the status register is a signed 16-bit count over +/-1000, scaled here
-// to percent of rated torque.
+// Load: register 0x3C, "Current load", two bytes, divided by
+// SERVO_LOAD_PERCENT_SCALE to reach percent of rated torque.
 //
-// UNVERIFIED, and the reason is worth recording rather than burying. The manual
-// this was supposed to come from is not in the tree: Docs/ST3215_ProtocolManual.pdf
-// is a 5-page Joy-IT RB-Heatsink5 cooling-unit manual for a Raspberry Pi 5 and
-// does not mention servos. This is the widely-published STS3215 control-table
-// value. The bench settles it in one step -- READ <id> at rest (expect ~0) and
-// against a mechanical stop (expect the rail, +/-100) -- and if it disagrees,
-// this constant is the only thing that changes.
+// The vendor's memory table
+// (docs/Smart  Bus Servo Communication Protocol Manua/sts3215_memory_table.xlsx)
+// documents the torque datum this scaling rests on, at register 0x10 "Maximum
+// torque": "set 1000 = 100% * locked torque", range 0..1000, unit 0.001. So a
+// load reading of 1000 is 100 percent and /10 is the scale.
+//
+// This comment used to say the opposite -- that the manual was not in the tree,
+// and that a Docs/ST3215_ProtocolManual.pdf had turned out to be a Raspberry Pi
+// cooling-unit manual. The real manual and the memory table have been checked in
+// since 2025-01-06, under docs/ with a space in the directory name, so both
+// halves of that were wrong and the reasoning for doubting the constant was
+// never sound. It is still worth one bench step, because the table documents the
+// *torque* datum and does not spell out whether 0x3C reports current as the same
+// fraction of that limit: READ <id> at rest (expect ~0) and against a mechanical
+// stop (expect the rail, +/-100).
 #define SERVO_LOAD_PERCENT_SCALE 10.0f
+
+// ============================================================================
+// ST3215 EEPROM: TEACHING A SERVO ITS OWN CENTRE
+// ============================================================================
+// The centre tick used to be a firmware variable that `zero` overwrote with the
+// current reading. That was lost on every power cycle, and it could be set from
+// a position that had never been measured. The servo has its own centre instead.
+//
+// Register numbers come from two sources that are both in the tree and both
+// agree: the vendor's own configure sketch
+// (docs/ST3215_Configure/ST3215_Configure.ino, which writes 0x05 for the ID,
+// 0x06 for the baud rate, 0x37 for the EEPROM lock and 0x2A for goal position)
+// and the vendor's memory table
+// (docs/Smart  Bus Servo Communication Protocol Manua/sts3215_memory_table.xlsx,
+// "STS3215 Analysis of memory table parameters -V3.6"). This header used to
+// carry a comment claiming the servo manual was not in the tree at all, and
+// citing a Docs/ST3215_ProtocolManual.pdf that has never existed here. Both
+// were wrong; the manual was checked in since 2025-01-06.
+#define REG_ST3215_ANGULAR_RESOLUTION 0x1E  // 1 byte, EEPROM. Tick multiplier.
+#define REG_ST3215_POSITION_CORRECTION 0x1F // 2 bytes, EEPROM. -2047..+2047.
+#define REG_ST3215_MODE 0x21                // 1 byte, EEPROM. 0 = position mode.
+#define REG_ST3215_TORQUE_SWITCH 0x28       // 1 byte, SRAM. See the 128 command.
+#define REG_ST3215_EEPROM_LOCK 0x37         // 1 byte, SRAM. 0 = EEPROM writable.
+
+#define ST3215_EEPROM_UNLOCKED 0x00
+#define ST3215_EEPROM_LOCKED 0x01
+
+// The documented way to teach a centre, and the reason it is the primary path.
+//
+// The memory table's entry for the Torque switch (0x28) reads, in full:
+//
+//     Write 0: turn off torque output;
+//     write 1: turn on torque output;
+//     write 128: current position correction is 2048
+//
+// One byte, and the servo computes the correction from its own encoder. That is
+// worth a great deal over doing the arithmetic here, because the register the
+// arithmetic would write -- 0x1F, Position correction -- is documented as a
+// *signed* value in -2047..+2047 with bit 11 as the direction bit, and the wire
+// encoding of a negative value is not stated. Two encodings are consistent with
+// that description and they disagree: bit-11-as-sign puts -1952 at 0x87A0,
+// two's complement puts it at 0xF860. Guessing wrong is an antenna pointing
+// somewhere plausible.
+//
+// So the primary path asks the servo to do the sum. It is also almost certainly
+// what Waveshare's own "Set Middle Position" button sends, which is the strongest
+// evidence available that this revision supports it -- and their UI makes the
+// operator "Release to unlock" first, which is why this path still takes the
+// EEPROM lock dance: the correction is written through to 0x1F, which is EEPROM.
+//
+// Note what this is NOT: 128 is not a torque value. It is a third command on a
+// register whose other two values turn torque off and on. The firmware never
+// writes 0 or 1 here, so the axis never goes limp mid-teach -- which is the whole
+// reason 0x28 was left alone in the first place.
+#define ST3215_CORRECT_POSITION_COMMAND 128
+
+// Byte offsets in the status reply. Named because every one of these was
+// previously a bare literal, and the ERR index in particular was the byte the
+// reference sketches parsed past.
+#define SERVO_RX_ID 2
+#define SERVO_RX_LEN 3
+#define SERVO_RX_ERR 4
+#define SERVO_RX_POS_LO 5
+#define SERVO_RX_POS_HI 6
+#define SERVO_RX_LOAD_LO 9
+#define SERVO_RX_LOAD_HI 10
+#define SERVO_RX_TEMP 12
+#define SERVO_RX_CHECKSUM 13
+
+// Bytes read back in one go after a teach, starting at 0x1E.
+//
+// Four bytes, not the two the offset needs, and that is deliberate. A read
+// reply carries ERR + data + checksum, so a 2-byte read comes back with
+// LEN=0x04 and a frame of 8 bytes -- which is exactly the shape of the echo of
+// our own request, the thing scanServoStatus above exists to skip. Reading four
+// gives LEN=0x06 and a 10-byte frame, which collides with neither the 8-byte
+// echo nor the 14-byte status reply. A read-back that cannot be confused with an
+// echo is worth two wasted bytes.
+//
+// It carries Angular Resolution (0x1E) and Operation mode (0x21) alongside the
+// two correction bytes. Angular Resolution earns its place: it must still be 1,
+// or TICKS_PER_DEGREE above is no longer the scale the encoder reports, and
+// judgeServoZero() refuses the teach if it is not. Mode is parsed and reported
+// but not asserted on -- a servo in constant-speed mode would fail the position
+// read-back anyway, and adding a separate check for it would be a second way to
+// say the same thing.
+#define ST3215_CALIB_READ_LEN 4
+#define ST3215_CALIB_READ_REPLY_LEN_FIELD 0x06
+#define ST3215_CALIB_READ_REPLY_LEN 10
+
+// The delay the vendor's own tool puts either side of an EEPROM register write
+// (ST3215_Configure.ino changeServoID). Copied rather than invented: this is the
+// one sequence here that the vendor documents, and the numbers in it are theirs.
+#define ST3215_EEPROM_SETTLE_MS 20
+
+// How far the reported position may sit from ST3215_SERVO_CENTRE_TICK after a
+// teach and still count as having taken.
+//
+// One tick, not zero. The offset is an integer and the encoder is a 12-bit
+// magnetic sensor behind a 5:1 gear train, so an exact match is not something
+// to demand; a teach that lands two ticks out has not taught a centre. One tick
+// is 0.088 degrees at the servo.
+#define ST3215_ZERO_TOLERANCE_TICKS 1
+
+// The largest correction 0x1F can hold, per the memory table.
+#define ST3215_CORRECTION_MAX 2047
+
+// The correction that makes `raw` report as `desired`, for the fallback path.
+//
+// Signed, and bounded, because the register is documented as -2047..+2047. An
+// earlier version of this computed `(desired + 4096 - raw) & 0xFFF` on the
+// reasoning that masking into [0, 4095] would work whether the servo read the
+// register signed or unsigned. That was wrong: for a register whose bit 11 is
+// the direction bit, masking a negative correction into [0, 4095] does not
+// produce a valid encoding at all -- it lands in the undocumented hole between
+// +2047 and -2048. It put an out-of-spec value on the wire for every servo
+// sitting above the centre tick, which is half of all positions.
+//
+// The fallback is still worth keeping -- it is the only path if a board's
+// firmware revision does not implement the 0x28 command -- but it now returns
+// the signed correction and reports when one cannot be represented, instead of
+// quietly writing something the register does not document.
+//
+// The one case that cannot be encoded is a correction of +2048, i.e. a servo
+// sitting at exactly tick 0. That is reported rather than clamped, because a
+// clamped correction teaches the wrong centre and the read-back would then
+// disagree with what was asked for, which is the one failure mode this whole
+// mechanism exists to make impossible.
+inline int32_t servoZeroCorrection(uint16_t rawPosition, uint16_t desiredCentre,
+                                   bool& representable) {
+  int32_t delta = (int32_t)desiredCentre - (int32_t)rawPosition;
+  representable = delta >= -ST3215_CORRECTION_MAX && delta <= ST3215_CORRECTION_MAX;
+  return delta;
+}
+
+// Distance between two ticks on a ring, so "close to" means close either way.
+inline int32_t servoTickDelta(uint16_t a, uint16_t b) {
+  int32_t d = (int32_t)a - (int32_t)b;
+  if (d < 0) d = -d;
+  if (d > 2048) d = 4096 - d;
+  return d;
+}
+
+inline size_t buildServoWrite8(uint8_t id, uint8_t reg, uint8_t value,
+                               uint8_t* out, size_t outLen) {
+  return buildServoPacketEx(id, SERVO_INST_WRITE, reg, &value, 1, out, outLen);
+}
+
+inline size_t buildServoWrite16(uint8_t id, uint8_t reg, uint16_t value,
+                                uint8_t* out, size_t outLen) {
+  uint8_t data[2] = {(uint8_t)(value & 0xFF), (uint8_t)((value >> 8) & 0xFF)};
+  return buildServoPacketEx(id, SERVO_INST_WRITE, reg, data, 2, out, outLen);
+}
+
+// The four bytes of a calibration read reply, in the order they were requested:
+// 0x1E resolution, 0x1F offset low, 0x20 offset high, 0x21 mode.
+//
+// SERVO_CALIB_RX_CHECKSUM is its own constant rather than SERVO_RX_CHECKSUM. That
+// one is 13, which is correct for the 14-byte status reply and points eight bytes
+// past the end of this one -- so reusing it validated whatever happened to be on
+// the stack and rejected every good reply. Same wire, same scanner, different
+// frame, different offsets.
+#define SERVO_CALIB_RX_RESOLUTION 5
+#define SERVO_CALIB_RX_OFFSET_LO 6
+#define SERVO_CALIB_RX_OFFSET_HI 7
+#define SERVO_CALIB_RX_MODE 8
+#define SERVO_CALIB_RX_CHECKSUM 9
+
+// What one `scanServoCalibRead()` call did. Mirrors ServoScan above, for the
+// same reason: the caller advances by `consumed` unconditionally, so a frame it
+// rejects can never wedge it.
+struct ServoCalibRead {
+  size_t consumed;
+  bool matched;
+  uint8_t angularResolution;
+  uint16_t positionOffset;
+  uint8_t mode;
+};
+
+inline ServoCalibRead scanServoCalibRead(const uint8_t* buf, size_t len,
+                                         uint8_t expectedId) {
+  ServoCalibRead out;
+  out.consumed = 0;
+  out.matched = false;
+  out.angularResolution = 0;
+  out.positionOffset = 0;
+  out.mode = 0;
+
+  if (buf == nullptr) return out;
+
+  size_t i = 0;
+  while (i < len) {
+    if (buf[i] != 0xFF || (i + 1) >= len || buf[i + 1] != 0xFF) {
+      i++;
+      continue;
+    }
+    if (i + 4 > len) {
+      out.consumed = i;
+      return out;
+    }
+
+    uint8_t declared = buf[i + SERVO_RX_LEN];
+    if (declared != ST3215_CALIB_READ_REPLY_LEN_FIELD) {
+      size_t frameLen = (size_t)declared + SERVO_FRAME_OVERHEAD;
+      if (frameLen > SERVO_MAX_FRAME_LEN) {
+        i++;
+        continue;
+      }
+      if (i + frameLen > len) {
+        out.consumed = i;
+        return out;
+      }
+      i += frameLen;
+      continue;
+    }
+
+    if (len - i < ST3215_CALIB_READ_REPLY_LEN) {
+      out.consumed = i;
+      return out;
+    }
+
+    if (buf[i + SERVO_CALIB_RX_CHECKSUM] !=
+        servoChecksum(buf + i, ST3215_CALIB_READ_REPLY_LEN)) {
+      i += 2;
+      continue;
+    }
+
+    uint8_t id = buf[i + SERVO_RX_ID];
+    if (id != expectedId) {
+      i += ST3215_CALIB_READ_REPLY_LEN;
+      continue;
+    }
+
+    out.matched = true;
+    out.angularResolution = buf[i + SERVO_CALIB_RX_RESOLUTION];
+    out.positionOffset =
+        (uint16_t)(buf[i + SERVO_CALIB_RX_OFFSET_LO] |
+                   (buf[i + SERVO_CALIB_RX_OFFSET_HI] << 8));
+    out.mode = buf[i + SERVO_CALIB_RX_MODE];
+    out.consumed = i + ST3215_CALIB_READ_REPLY_LEN;
+    return out;
+  }
+
+  out.consumed = len;
+  return out;
+}
+
+// How a teach attempt ended.
+//
+// Every failure is distinguishable on purpose, because they call for different
+// responses. ZERO_NO_SERVO_REPLY means nothing was written and the servo is
+// untouched. ZERO_NOT_PERSISTENT is the one that did not exist before this had
+// two paths: the encoder reads centre, so the teach worked, but 0x1F reads zero,
+// so it landed somewhere volatile and will be gone at the next power cycle. A
+// centre that silently evaporates is worse than no centre, because the axis
+// looks centred until the reboot.
+enum ServoZeroOutcome {
+  ZERO_OK = 0,
+  ZERO_NO_SERVO_REPLY = 1,    // the servo never answered; nothing was written
+  ZERO_CORRECTION_MISMATCH = 2, // 0x1F did not read back what the fallback wrote
+  ZERO_POSITION_MISMATCH = 3, // the correction is absent, but the servo is not at centre
+  ZERO_ANGULAR_RESOLUTION = 4,  // tick scale changed under us; TICKS_PER_DEGREE lies
+  ZERO_NOT_PERSISTENT = 5,    // encoder is centred but 0x1F reads zero: volatile
+  ZERO_UNREPRESENTABLE = 6,   // the correction does not fit 0x1F's documented range
+};
+
+// Decides whether a teach took.
+//
+// Pure, so every branch is reachable from a host test without a servo on a bus.
+//
+// `expectCorrection` distinguishes the two paths, and it is the only reason this
+// function needs to know which one ran:
+//
+//   false -- the 0x28 command. The servo computed the correction itself, so the
+//            firmware does not know what 0x1F should read and cannot check it.
+//            Only the encoder's answer can be trusted, which is fine because that
+//            is the thing that actually matters.
+//   true  -- the 0x1F fallback. The firmware chose the value, so it can require
+//            the register to read back exactly that, and a mismatch means the
+//            write was lost even if the position happened to land right.
+//
+// The order is deliberate: scale first, because a changed resolution makes every
+// other reading meaningless. Then position, because that is the claim being
+// verified. Then persistence, which is only meaningful once the position has
+// passed. Reporting an upstream cause as a downstream one sends whoever is
+// debugging this to the wrong register.
+inline ServoZeroOutcome judgeServoZero(bool expectCorrection,
+                                       uint16_t wroteCorrection,
+                                       uint16_t readBackCorrection,
+                                       uint8_t angularResolution,
+                                       uint16_t afterPosition) {
+  if (angularResolution != 1) {
+    return ZERO_ANGULAR_RESOLUTION;
+  }
+  if (servoTickDelta(afterPosition, ST3215_SERVO_CENTRE_TICK) >
+      ST3215_ZERO_TOLERANCE_TICKS) {
+    return ZERO_POSITION_MISMATCH;
+  }
+  if (expectCorrection && readBackCorrection != wroteCorrection) {
+    return ZERO_CORRECTION_MISMATCH;
+  }
+  // Centred, but nothing stored. On the 0x28 path this is the servo computing a
+  // zero correction -- possible when the axis happened to be sitting at centre
+  // already, and harmless -- so only the fallback can conclude persistence here.
+  if (readBackCorrection == 0) {
+    return ZERO_NOT_PERSISTENT;
+  }
+  return ZERO_OK;
+}
+
+// The reply the firmware sends for each outcome. Split out from
+// handleZeroCommand() so the mapping is one table rather than a switch the
+// reader has to hold in their head.
+//
+// ZERO_NO_SERVO_REPLY is the only one that maps to ERROR_HARDWARE_FAULT: nothing
+// was written, so there is nothing in doubt about the servo. Everything else
+// means it may now hold a correction we cannot vouch for, which is precisely what
+// ERROR_CALIBRATION_FAILED was taken off the reservation to say.
+inline rocsar_v1_ErrorCode servoZeroErrorCode(ServoZeroOutcome outcome) {
+  return outcome == ZERO_NO_SERVO_REPLY
+             ? rocsar_v1_ErrorCode_ERROR_HARDWARE_FAULT
+             : rocsar_v1_ErrorCode_ERROR_CALIBRATION_FAILED;
+}
 
 // One parsed status reply.
 struct ServoStatus {
@@ -336,45 +709,6 @@ struct ServoStatus {
   int32_t temperatureC;
   uint8_t error;
 };
-
-// The ST3215 checksum: ones' complement of bytes 2 through len-2. The two 0xFF
-// header bytes are excluded, which is the part that is easy to get wrong --
-// including them yields a checksum that validates nothing.
-inline uint8_t servoChecksum(const uint8_t* frame, size_t len) {
-  uint16_t sum = 0;
-  for (size_t i = 2; i + 1 < len; i++) {
-    sum += frame[i];
-  }
-  return (uint8_t)(~sum & 0xFF);
-}
-
-// Builds a register-read request for one servo into `out`, returning its length.
-//
-// The mirror of `buildServoPacket()`, and for the same reason: the sketch cannot
-// be unit tested, and a status request with a wrong length byte reads back
-// whatever the servo felt like sending. `buildServoRegisterRead()` is the generic
-// form; this is the one call site that reads the telemetry block, pinned so the
-// address and length of that read live next to the scanner that parses its reply.
-inline size_t buildServoRegisterRead(uint8_t id, uint8_t reg, uint8_t count,
-                                     uint8_t* out, size_t outLen) {
-  if (out == nullptr || outLen < SERVO_STATUS_REQUEST_LEN || count == 0) {
-    return 0;
-  }
-  out[0] = 0xFF;
-  out[1] = 0xFF;
-  out[2] = id;
-  out[3] = 0x04;
-  out[4] = SERVO_INST_READ;
-  out[5] = reg;
-  out[6] = count;
-  out[7] = servoChecksum(out, SERVO_STATUS_REQUEST_LEN);
-  return SERVO_STATUS_REQUEST_LEN;
-}
-
-inline size_t buildServoStatusRequest(uint8_t id, uint8_t* out, size_t outLen) {
-  return buildServoRegisterRead(id, SERVO_REG_TELEMETRY, SERVO_STATUS_PARAM_LEN,
-                                out, outLen);
-}
 
 // What one `scanServoStatus()` call did.
 struct ServoScan {
@@ -502,247 +836,6 @@ inline ServoScan scanServoStatus(const uint8_t* buf, size_t len,
   return scan;
 }
 
-
-// ============================================================================
-// ST3215 EEPROM: TEACHING A SERVO ITS OWN CENTRE
-// ============================================================================
-// The centre tick used to be a firmware variable that `zero` overwrote with the
-// current reading. That was lost on every power cycle, and it could be set from
-// a position that had never been measured. The servo has its own centre instead:
-// register 0x1F is a position offset in EEPROM, and teaching it means writing
-// that register so the encoder reports ST3215_SERVO_CENTRE_TICK at whatever
-// angle the axis is currently sitting at.
-//
-// Register numbers are cross-checked against two independent sources: the
-// vendor's own configure sketch (docs/ST3215_Configure/ST3215_Configure.ino,
-// which writes 0x05 for the ID, 0x06 for the baud rate, 0x37 for the EEPROM
-// lock and 0x2A for goal position) and the published memory map. Note that
-// path was cited as tools/ST3215_Configure/... for a while and the file was not
-// in the tree at all, so nothing in this firmware had a checked-in authority for
-// the bus it drives. It does now.
-#define REG_ST3215_ANGULAR_RESOLUTION 0x1E  // 1 byte, EEPROM. Tick multiplier.
-#define REG_ST3215_POSITION_OFFSET 0x1F     // 2 bytes, EEPROM. The centre.
-#define REG_ST3215_MODE 0x21                // 1 byte, EEPROM. 0 = position mode.
-#define REG_ST3215_EEPROM_LOCK 0x37         // 1 byte, RAM. 0 = EEPROM writable.
-
-#define ST3215_EEPROM_UNLOCKED 0x00
-#define ST3215_EEPROM_LOCKED 0x01
-
-// Bytes read back in one go after a teach, starting at 0x1E.
-//
-// Four bytes, not the two the offset needs, and that is deliberate. A read
-// reply carries ERR + data + checksum, so a 2-byte read comes back with
-// LEN=0x04 and a frame of 8 bytes -- which is exactly the shape of the echo of
-// our own request, the thing scanServoStatus above exists to skip. Reading four
-// gives LEN=0x06 and a 10-byte frame, which collides with neither the 8-byte
-// echo nor the 14-byte status reply. A read-back that cannot be confused with an
-// echo is worth two wasted bytes.
-//
-// It also picks up two sanity checks for free: Angular Resolution must still be
-// 1, or TICKS_PER_DEGREE above is no longer the scale the encoder reports, and
-// Mode must still be position mode.
-#define ST3215_CALIB_READ_LEN 4
-#define ST3215_CALIB_READ_REPLY_LEN_FIELD 0x06
-#define ST3215_CALIB_READ_REPLY_LEN 10
-
-// The delay the vendor's own tool puts either side of an EEPROM register write
-// (ST3215_Configure.ino changeServoID). Copied rather than invented: this is the
-// one sequence here that the vendor documents, and the numbers in it are theirs.
-#define ST3215_EEPROM_SETTLE_MS 20
-
-// How far the reported position may sit from ST3215_SERVO_CENTRE_TICK after a
-// teach and still count as having taken.
-//
-// One tick, not zero. The offset is an integer and the encoder is a 12-bit
-// magnetic sensor behind a 5:1 gear train, so an exact match is not something
-// to demand; a teach that lands two ticks out has not taught a centre. One tick
-// is 0.088 degrees at the servo.
-#define ST3215_ZERO_TOLERANCE_TICKS 1
-
-// How close the stored offset has to be to the one we wrote. Exact: this is a
-// 16-bit integer register that is either the value we sent or it is not, so
-// anything else means the write was lost or the register is not what we think.
-#define ST3215_OFFSET_TOLERANCE 0
-
-// The offset that makes `raw` report as `desired`.
-//
-// Modulo 4096 rather than signed arithmetic, and that is the whole point. It is
-// not documented whether register 0x1F is read as signed or unsigned, and the
-// two disagree across the wrap: teaching an axis sitting at 4000 needs -1952,
-// which is 63584 unsigned -- and if the servo adds that as unsigned and wraps,
-// the result is wrong by a whole number of turns. Masking into [0, 4095] first
-// makes the answer correct either way, because any value in that range is
-// non-negative when read as an int16 and the servo's addition is mod 4096
-// regardless of how it gets there.
-//
-// The alternative -- write a signed offset and hope -- is untestable from here,
-// because the failure mode is a servo pointing somewhere plausible.
-inline uint16_t servoZeroOffset(uint16_t rawPosition, uint16_t desiredCentre) {
-  return (uint16_t)((desiredCentre + 4096u - rawPosition) & 0x0FFFu);
-}
-
-// Distance between two ticks on a ring, so "close to" means close either way.
-inline int32_t servoTickDelta(uint16_t a, uint16_t b) {
-  int32_t d = (int32_t)a - (int32_t)b;
-  if (d < 0) d = -d;
-  if (d > 2048) d = 4096 - d;
-  return d;
-}
-
-inline size_t buildServoWrite8(uint8_t id, uint8_t reg, uint8_t value,
-                               uint8_t* out, size_t outLen) {
-  return buildServoPacketEx(id, SERVO_INST_WRITE, reg, &value, 1, out, outLen);
-}
-
-inline size_t buildServoWrite16(uint8_t id, uint8_t reg, uint16_t value,
-                                uint8_t* out, size_t outLen) {
-  uint8_t data[2] = {(uint8_t)(value & 0xFF), (uint8_t)((value >> 8) & 0xFF)};
-  return buildServoPacketEx(id, SERVO_INST_WRITE, reg, data, 2, out, outLen);
-}
-
-// The four bytes of a calibration read reply, in the order they were requested:
-// 0x1E resolution, 0x1F offset low, 0x20 offset high, 0x21 mode.
-//
-// SERVO_CALIB_RX_CHECKSUM is its own constant rather than SERVO_RX_CHECKSUM. That
-// one is 13, which is correct for the 14-byte status reply and points eight bytes
-// past the end of this one -- so reusing it validated whatever happened to be on
-// the stack and rejected every good reply. Same wire, same scanner, different
-// frame, different offsets.
-#define SERVO_CALIB_RX_RESOLUTION 5
-#define SERVO_CALIB_RX_OFFSET_LO 6
-#define SERVO_CALIB_RX_OFFSET_HI 7
-#define SERVO_CALIB_RX_MODE 8
-#define SERVO_CALIB_RX_CHECKSUM 9
-
-// What one `scanServoCalibRead()` call did. Mirrors ServoScan above, for the
-// same reason: the caller advances by `consumed` unconditionally, so a frame it
-// rejects can never wedge it.
-struct ServoCalibRead {
-  size_t consumed;
-  bool matched;
-  uint8_t angularResolution;
-  uint16_t positionOffset;
-  uint8_t mode;
-};
-
-inline ServoCalibRead scanServoCalibRead(const uint8_t* buf, size_t len,
-                                         uint8_t expectedId) {
-  ServoCalibRead out;
-  out.consumed = 0;
-  out.matched = false;
-  out.angularResolution = 0;
-  out.positionOffset = 0;
-  out.mode = 0;
-
-  if (buf == nullptr) return out;
-
-  size_t i = 0;
-  while (i < len) {
-    if (buf[i] != 0xFF || (i + 1) >= len || buf[i + 1] != 0xFF) {
-      i++;
-      continue;
-    }
-    if (i + 4 > len) {
-      out.consumed = i;
-      return out;
-    }
-
-    uint8_t declared = buf[i + SERVO_RX_LEN];
-    if (declared != ST3215_CALIB_READ_REPLY_LEN_FIELD) {
-      size_t frameLen = (size_t)declared + SERVO_FRAME_OVERHEAD;
-      if (frameLen > SERVO_MAX_FRAME_LEN) {
-        i++;
-        continue;
-      }
-      if (i + frameLen > len) {
-        out.consumed = i;
-        return out;
-      }
-      i += frameLen;
-      continue;
-    }
-
-    if (len - i < ST3215_CALIB_READ_REPLY_LEN) {
-      out.consumed = i;
-      return out;
-    }
-
-    if (buf[i + SERVO_CALIB_RX_CHECKSUM] !=
-        servoChecksum(buf + i, ST3215_CALIB_READ_REPLY_LEN)) {
-      i += 2;
-      continue;
-    }
-
-    uint8_t id = buf[i + SERVO_RX_ID];
-    if (id != expectedId) {
-      i += ST3215_CALIB_READ_REPLY_LEN;
-      continue;
-    }
-
-    out.matched = true;
-    out.angularResolution = buf[i + SERVO_CALIB_RX_RESOLUTION];
-    out.positionOffset =
-        (uint16_t)(buf[i + SERVO_CALIB_RX_OFFSET_LO] |
-                   (buf[i + SERVO_CALIB_RX_OFFSET_HI] << 8));
-    out.mode = buf[i + SERVO_CALIB_RX_MODE];
-    out.consumed = i + ST3215_CALIB_READ_REPLY_LEN;
-    return out;
-  }
-
-  out.consumed = len;
-  return out;
-}
-
-// How a teach attempt ended.
-//
-// Every failure here is distinguishable on purpose, because they call for
-// different responses: ZERO_NO_SERVO_REPLY means nothing was written and the
-// servo is untouched, while the other two mean it may now hold a partial change.
-enum ServoZeroOutcome {
-  ZERO_OK = 0,
-  ZERO_NO_SERVO_REPLY = 1,   // the servo never answered; nothing was written
-  ZERO_OFFSET_MISMATCH = 2,  // register 0x1F did not read back what we wrote
-  ZERO_POSITION_MISMATCH = 3,// offset took, but the encoder is not at centre
-  ZERO_ANGULAR_RESOLUTION = 4,  // tick scale changed under us; TICKS_PER_DEGREE lies
-};
-
-// Decides whether a teach took.
-//
-// Pure, so every branch is reachable from a host test without a servo on a bus --
-// which matters, because ZERO_POSITION_MISMATCH is the one that tells us the
-// register does not do what the Waveshare tool implies. If that is ever the
-// case this is where it surfaces, rather than as an antenna pointing somewhere
-// plausible.
-//
-// The order is deliberate. Scale before offset before position: a changed
-// resolution makes every other reading meaningless, and an offset that did not
-// store makes the position reading meaningless, so neither should be reported as
-// the cause when it is downstream of the real one.
-inline ServoZeroOutcome judgeServoZero(uint16_t wroteOffset,
-                                       uint16_t readBackOffset,
-                                       uint8_t angularResolution,
-                                       uint16_t beforePosition,
-                                       uint16_t afterPosition) {
-  if (angularResolution != 1) {
-    return ZERO_ANGULAR_RESOLUTION;
-  }
-  if (readBackOffset > 0xFFFFu - ST3215_OFFSET_TOLERANCE) {
-    // Unreachable by construction -- readBackOffset is a uint16 and the
-    // tolerance is zero. Kept as an explicit branch so that raising
-    // ST3215_OFFSET_TOLERANCE above 0 does not silently turn the comparison into
-    // an unsigned wrap.
-    return ZERO_OFFSET_MISMATCH;
-  }
-  if (readBackOffset != wroteOffset) {
-    return ZERO_OFFSET_MISMATCH;
-  }
-  if (servoTickDelta(afterPosition, ST3215_SERVO_CENTRE_TICK) >
-      ST3215_ZERO_TOLERANCE_TICKS) {
-    return ZERO_POSITION_MISMATCH;
-  }
-  (void)beforePosition;  // part of the call, not of the decision
-  return ZERO_OK;
-}
 
 // Whether an axis's reported position/load/temperature are a measurement is
 // rocsar_v1_FeedbackState, from common.pb.h -- not a local enum.
@@ -983,6 +1076,31 @@ struct GondolaState {
   // on a miss would be the same lie as zeroing a servo reading, and the wire
   // carries it next to imu_present so the operator reads the two together.
   float imuTemperatureC;
+
+  // Tilt, from the same Euler read as the heading. Held on absence and rejected
+  // on a non-finite sample, exactly as the bearing is -- see applyImuAttitude().
+  float gondolaRollDeg;
+  float gondolaPitchDeg;
+
+  // The sensor's calibration status, verbatim from register 0x35: two bits per
+  // sensor, most significant first (system, gyroscope, accelerometer,
+  // magnetometer), each 0 uncalibrated to 3 fully. Carried as the raw byte
+  // because it already is one, and packed on the wire as a single uint32 so the
+  // four sensors do not cost four tags.
+  //
+  // Kept even when the sensor is absent, deliberately: unlike a reading, the
+  // calibration status of a sensor that has stopped answering is still the last
+  // thing it told us, and it is what tells an operator why.
+  uint8_t imuCalibration;
+
+  // The largest linear acceleration seen since boot, per axis, gravity already
+  // removed by the sensor (VECTOR_LINEARACCEL). Monotonic by construction: see
+  // noteImuPeakAccel().
+  float peakAccelMs2[3];
+
+  // Increments once per sample in which noteImuPeakAccel() set a new maximum.
+  // Not once per axis -- one shock usually sets all three and is one event.
+  uint32_t peakAccelEvent;
 };
 
 // Projects the model onto the wire message. The whole mapping lives here so the
@@ -1008,6 +1126,25 @@ inline void fillTelemetryMessage(const GondolaState& state,
   // quiet, measured when it answers.
   out.imu_present = state.imuPresent;
   out.imu_temperature_c = state.imuTemperatureC;
+
+  // Tilt, and it travels next to imu_present for the same reason the temperature
+  // does: both are held rather than zeroed when the sensor is silent, so a
+  // consumer that reads either without reading the presence bit is describing a
+  // held value as a measurement.
+  out.gondola_roll_deg = state.gondolaRollDeg;
+  out.gondola_pitch_deg = state.gondolaPitchDeg;
+
+  // The calibration register verbatim, widened to the wire's uint32. Carried
+  // whether or not the sensor is present -- see setImuCalibration().
+  out.imu_calibration = (uint32_t)state.imuCalibration;
+
+  // The peak-hold, and its event counter beside it. The peak never decreases, so
+  // the pair together say whether anything happened since the last frame -- which
+  // is the only question a 1 Hz link can answer about a millisecond transient.
+  out.imu_peak_accel_x_ms2 = state.peakAccelMs2[0];
+  out.imu_peak_accel_y_ms2 = state.peakAccelMs2[1];
+  out.imu_peak_accel_z_ms2 = state.peakAccelMs2[2];
+  out.imu_peak_accel_event = state.peakAccelEvent;
 
   out.antennas_count = NUM_ANTENNAS;
   for (int i = 0; i < NUM_ANTENNAS; i++) {
@@ -1071,6 +1208,16 @@ inline void initGondolaState(GondolaState& state) {
   state.imuPresent = false;
   state.imuMissCount = 0;
   state.imuTemperatureC = 0.0f;
+  // Level, not zeroed-at-boot-as-a-measurement: a horizon is what a level
+  // gondola reports, and applyImuAttitude() overwrites both on the first sample
+  // anyway. It is the same posture as imuTemperatureC and for the same reason.
+  state.gondolaRollDeg = 0.0f;
+  state.gondolaPitchDeg = 0.0f;
+  state.imuCalibration = 0;
+  for (int i = 0; i < 3; i++) {
+    state.peakAccelMs2[i] = 0.0f;
+  }
+  state.peakAccelEvent = 0;
 }
 
 // Folds one heading sample into the model and reports what it did.
@@ -1109,6 +1256,98 @@ inline ImuSample applyImuHeading(GondolaState& state, float sampleDeg, bool sens
   float deltaHeading = wrap180(sampleDeg - state.gondolaHeading);
   state.gondolaHeading = wrap360(state.gondolaHeading + (deltaHeading * IMU_ALPHA));
   return IMU_SAMPLE_APPLIED;
+}
+
+// Folds tilt into the model and reports whether it was usable.
+//
+// Separate from applyImuHeading() rather than folded into it, because the two
+// have different jobs. The heading is the number the antennas track, so it is
+// filtered (IMU_ALPHA). Tilt is not used to compute anything -- it is read as a
+// confidence signal on the heading -- so filtering it would only delay the
+// evidence that the heading has gone bad.
+//
+// The same three rules as the heading, for the same three reasons: hold when
+// there is no sensor, reject a non-finite sample rather than integrating it, and
+// never write zero for "no reading". A gondola that is merely level and a
+// gondola whose sensor has died are both 0/0, and the second is the one that
+// matters.
+inline ImuSample applyImuAttitude(GondolaState& state, float rollDeg,
+                                  float pitchDeg, bool sensorPresent) {
+  if (!sensorPresent) {
+    return IMU_SAMPLE_NO_SENSOR;
+  }
+  if (!isfinite(rollDeg) || !isfinite(pitchDeg)) {
+    return IMU_SAMPLE_REJECTED;
+  }
+
+  // Raw, not corrected for the heading datum. The datum says which way the
+  // gondola is *pointing*; it says nothing about which way is *up*, and folding
+  // one into the other would make the tilt move when an operator sets a bearing.
+  state.gondolaRollDeg = rollDeg;
+  state.gondolaPitchDeg = pitchDeg;
+  return IMU_SAMPLE_APPLIED;
+}
+
+// Records the sensor's calibration status.
+//
+// A plain store, not a policy. There is nothing to decide here -- the firmware
+// does not recalibrate, cannot meaningfully gate pointing on this, and must not
+// pretend to by treating an uncalibrated sensor as absent. What it does is stop
+// discarding the register, so an operator can see why a bearing is drifting.
+//
+// Note it is stored even when the sensor is absent, unlike every reading here.
+// "This is how calibrated it was when it last answered" is the useful fact; "no
+// reading" would tell nobody anything.
+inline void setImuCalibration(GondolaState& state, uint8_t calibration) {
+  state.imuCalibration = calibration;
+}
+
+// Records the calibration status from its four components.
+//
+// The wire carries register 0x35 verbatim and so does this -- Adafruit's
+// getCalibration() hands back the four unpacked 2-bit fields, and the packet
+// register they came from is bit-identical to repacking them. The function exists
+// so that repacking is not written a second time somewhere else.
+inline uint8_t packImuCalibration(uint8_t system, uint8_t gyroscope,
+                                  uint8_t accelerometer, uint8_t magnetometer) {
+  return (uint8_t)(((system & 0x03u) << 6) | ((gyroscope & 0x03u) << 4) |
+                   ((accelerometer & 0x03u) << 2) | (magnetometer & 0x03u));
+}
+
+// Folds one linear-acceleration sample into the peak-hold, and reports whether
+// this sample set a new maximum.
+//
+// Monotonic, per axis, on magnitude. Gravity-free already: the sensor strips it,
+// so a level gondola reads ~0 and a peak is genuinely an event rather than a
+// re-reporting of 1 g.
+//
+// Returns true when at least one axis moved, which is what drives
+// peakAccelEvent. One sample that sets all three axes is one event, not three --
+// a parachute deployment is a single shock, and a counter that ticked three times
+// for it would read as three events on a 1 Hz link.
+//
+// A non-finite sample is ignored rather than compared. NaN compares false against
+// everything, so a naive maximum would keep the previous peak and look like a
+// quiet sample instead of a broken sensor.
+inline bool noteImuPeakAccel(GondolaState& state, float x, float y, float z) {
+  const float sample[3] = {x, y, z};
+  bool raised = false;
+
+  for (int i = 0; i < 3; i++) {
+    if (!isfinite(sample[i])) {
+      continue;
+    }
+    float magnitude = fabsf(sample[i]);
+    if (magnitude > state.peakAccelMs2[i]) {
+      state.peakAccelMs2[i] = magnitude;
+      raised = true;
+    }
+  }
+
+  if (raised) {
+    state.peakAccelEvent++;
+  }
+  return raised;
 }
 
 // One getEvent() failure from a sensor still believed present.

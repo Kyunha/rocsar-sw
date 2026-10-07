@@ -172,7 +172,7 @@ func Lookup(name string) (Key, bool) {
 
 // RequiredNames lists every key load_config() will throw without, in the order
 // they appear in config.hpp. Used by tools/sdr_bench validate and by
-// test/RequiredKeysArePresent.
+// TestRequiredKeysMatchTheVendoredConfigHeader.
 func RequiredNames() []string {
 	var out []string
 	for _, k := range Keys {

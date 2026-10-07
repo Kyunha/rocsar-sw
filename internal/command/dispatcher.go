@@ -18,7 +18,6 @@ import (
 	rocsarv1 "github.com/rocsar/obc/api/rocsar/v1"
 	"github.com/rocsar/obc/internal/domain"
 	"github.com/rocsar/obc/internal/gnss"
-	"github.com/rocsar/obc/internal/qos"
 )
 
 // Dispatcher routes commands.
@@ -476,14 +475,15 @@ func (d *Dispatcher) linkSetLimit(ctx context.Context, requestID string, cmd *ro
 			"rate_kbps must be greater than zero")
 	}
 
-	// Re-validated here because the operator's number goes straight into tc, and
-	// a rate below the priority floor leaves telemetry with no guaranteed
-	// bandwidth at all -- which is the opposite of what "limit the link" means.
-	if prio := qos.PriorityKbps(rate); prio == 0 {
-		return fail(requestID, rocsarv1.ErrorCode_ERROR_INVALID_PARAMETER,
-			fmt.Sprintf("a limit of %d kbit/s leaves no priority bandwidth for telemetry", rate))
-	}
-
+	// No floor check here. There used to be one, and it was both too weak and in
+	// the wrong place: it asked whether the priority class rounded to zero, which
+	// admitted 3 kbit/s, and it protected only this path, so link.rate_kbps in the
+	// configuration could still install a cap no telemetry frame would fit into.
+	//
+	// The floor now lives in qos.Shaper.Apply, so it binds every caller: this
+	// command, the startup configuration, and any future one. A request below it
+	// is CLAMPED there and the reason comes back here verbatim, which is what the
+	// operator is told.
 	device := d.link.Status().Device
 	if device == "" {
 		device = defaultDevice

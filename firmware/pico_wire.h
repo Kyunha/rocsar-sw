@@ -25,8 +25,17 @@
 #define PICO_TX_FRAME_MAX (COBS_MAX(PICO_TX_BUFFER) + 1)
 
 // nanopb publishes the worst-case encoded size of every message it generates.
-// It is currently 198 bytes: two antennas at 89 each, plus the PicoMessage
-// header. PICO_TX_BUFFER is 256, so there is 58 bytes of headroom.
+// It is currently 244 bytes: two antennas at 81 each, the IMU channels
+// (attitude, calibration, peak-hold acceleration) at 37, plus the PicoMessage
+// header. PICO_TX_BUFFER is 256, so there is 12 bytes of headroom.
+//
+// That number was wrong twice before this comment caught up -- it said 198 with
+// 58 spare, from before AntennaTelemetry lost its optional fields and gained
+// center_zeroed, and the drift was invisible because the static_assert below
+// compares against the real constant rather than against this paragraph. It is
+// recorded here because the assert protects the build and nothing protected the
+// prose, and a stale budget is how the next person decides there is room for a
+// 20-byte field that there is not.
 //
 // This is asserted rather than assumed, because the failure without it is
 // silent and total: pb_encode() returns false when the message does not fit,

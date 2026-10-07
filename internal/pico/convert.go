@@ -32,8 +32,19 @@ func telemetryToDomain(m *rocsarv1.PicoTelemetry, now time.Time) domain.PicoTele
 		Heater2State:      m.GetHeater2State(),
 		IMUPresent:        m.GetImuPresent(),
 		ImuTemperatureC:   float64(m.GetImuTemperatureC()),
+		GondolaRollDeg:    float64(m.GetGondolaRollDeg()),
+		GondolaPitchDeg:   float64(m.GetGondolaPitchDeg()),
+		IMUCalibration:    uint32(m.GetImuCalibration()),
+		IMUPeakAccelEvent: uint32(m.GetImuPeakAccelEvent()),
 		ObservedAt:        now,
 	}
+	// Copied rather than assigned by index: a future fourth axis would silently
+	// shift a hand-rolled loop onto the wrong channel.
+	copy(d.IMUPeakAccelMs2[:], []float64{
+		float64(m.GetImuPeakAccelXMs2()),
+		float64(m.GetImuPeakAccelYMs2()),
+		float64(m.GetImuPeakAccelZMs2()),
+	})
 
 	if n := len(m.GetAntennas()); n > 0 {
 		d.Axes = make([]domain.Axis, 0, n)
@@ -95,10 +106,4 @@ func ackToDomain(a *rocsarv1.PicoAck, now time.Time) *domain.Ack {
 		Error:           domain.ErrorCode(a.GetError()),
 		At:              now,
 	}
-}
-
-// errorCodeToWire converts a domain error back to the wire enum, for the tools
-// that build synthetic ACKs.
-func errorCodeToWire(e domain.ErrorCode) rocsarv1.ErrorCode {
-	return rocsarv1.ErrorCode(e)
 }

@@ -101,6 +101,13 @@ func EncodeTelemetry(s telemetry.Snapshot) *rocsarv1.TelemetryFrame {
 			// which is different from "age zero" and is not collapsed.
 			g.FixAgeS = r.FixAge.Seconds()
 		}
+		// The climb rate crosses only if the estimator produced one. Not a zero
+		// and not a defaulted value: the first minute of a flight has no rate,
+		// and a frame that carried 0.0 there would be read as "balloon at float",
+		// which is a very different claim.
+		if v := r.Fix.VerticalRateMP; v != nil {
+			g.VerticalRateMps = proto.Float64(*v)
+		}
 		f.Gnss = append(f.Gnss, g)
 	}
 
@@ -133,6 +140,13 @@ func picoTelemetry(p domain.PicoTelemetry) *rocsarv1.PicoTelemetry {
 		Heater2State:      p.Heater2State,
 		ImuPresent:        p.IMUPresent,
 		ImuTemperatureC:   float32(p.ImuTemperatureC),
+		GondolaRollDeg:    float32(p.GondolaRollDeg),
+		GondolaPitchDeg:   float32(p.GondolaPitchDeg),
+		ImuCalibration:    uint32(p.IMUCalibration),
+		ImuPeakAccelEvent: uint32(p.IMUPeakAccelEvent),
+		ImuPeakAccelXMs2:  float32(p.IMUPeakAccelMs2[0]),
+		ImuPeakAccelYMs2:  float32(p.IMUPeakAccelMs2[1]),
+		ImuPeakAccelZMs2:  float32(p.IMUPeakAccelMs2[2]),
 	}
 	for _, a := range p.Axes {
 		t.Antennas = append(t.Antennas, &rocsarv1.AntennaTelemetry{
@@ -257,6 +271,19 @@ func DecodeTelemetry(f *rocsarv1.TelemetryFrame) telemetry.Snapshot {
 				GroundSpeedMP: g.GetGroundSpeedMps(),
 				CourseDeg:     g.GetCourseDeg(),
 			}
+			// Inside this block on purpose. r.Fix is assigned wholesale just
+			// above, so setting the rate before it is silently overwritten -- which
+			// is exactly what happened the first time, and what the round-trip test
+			// now catches. A rate without a fix is meaningless anyway, so gating it
+			// on having one is the honest placement as well as the working one.
+			//
+			// Optional on the wire, so absence survives as absence. A plain double
+			// would decode an underived rate to 0.0 and every consumer downstream
+			// would read "not climbing" for the first minute of every flight.
+			if v := g.VerticalRateMps; v != nil {
+				rate := *v
+				r.Fix.VerticalRateMP = &rate
+			}
 		}
 		s.GNSS = append(s.GNSS, r)
 	}
@@ -270,7 +297,15 @@ func DecodeTelemetry(f *rocsarv1.TelemetryFrame) telemetry.Snapshot {
 			Heater2State:      p.GetHeater2State(),
 			IMUPresent:        p.GetImuPresent(),
 			ImuTemperatureC:   float64(p.GetImuTemperatureC()),
-		}
+			GondolaRollDeg:    float64(p.GetGondolaRollDeg()),
+			GondolaPitchDeg:   float64(p.GetGondolaPitchDeg()),
+			IMUCalibration:    uint32(p.GetImuCalibration()),
+			IMUPeakAccelEvent: uint32(p.GetImuPeakAccelEvent()),
+			IMUPeakAccelMs2: [3]float64{
+				float64(p.GetImuPeakAccelXMs2()),
+				float64(p.GetImuPeakAccelYMs2()),
+				float64(p.GetImuPeakAccelZMs2()),
+			}}
 		for _, a := range p.GetAntennas() {
 			s.Pico.Axes = append(s.Pico.Axes, domain.Axis{
 				ServoID:         a.GetServoId(),

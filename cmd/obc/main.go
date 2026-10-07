@@ -197,9 +197,24 @@ func run() error {
 
 	// ---------------------------------------------------------------------
 	// Link shaping
+	//
+	// This is now the ONLY limiter. The token bucket that used to pace the
+	// artefact HTTP path inside this process is gone, so if the kernel tree is not
+	// on the device the link is unbounded and nothing else here would know.
+	// That is why the verify loop below exists rather than being a nicety.
 	// ---------------------------------------------------------------------
 	var shaper domain.LinkShaper = qos.NewNullShaper("link shaping disabled by configuration")
-	if cfg.Link.Shaping {
+	if !cfg.Link.Shaping {
+		// Still tell it what the cap would have been, so telemetry and the Ground
+		// Station can show the operator what this link is meant to be limited to
+		// rather than reporting a rate of zero.
+		if null, ok := shaper.(*qos.NullShaper); ok {
+			null.Configure(cfg.Link.Device, cfg.Link.RateKbps)
+		}
+		log.Error("link shaping is OFF in configuration, so the link is not limited at all",
+			"device", cfg.Link.Device, "would_have_been_kbps", cfg.Link.RateKbps,
+			"note", "nothing else in this program bounds the link now; the in-process limiter was removed")
+	} else {
 		tc := qos.NewShaper(log, nil)
 		applied, reason := tc.Apply(ctx, cfg.Link.Device, cfg.Link.RateKbps)
 		if applied {
@@ -208,10 +223,18 @@ func run() error {
 				log.Warn("link shaping applied with a caveat", "reason", reason)
 			}
 		} else {
-			// Reported, not fatal. tc fails for dozens of reasons unrelated to
-			// our logic and none of them justify taking down a telemetry server.
-			log.Warn("link shaping unavailable; continuing unshaped", "reason", reason)
+			// Reported, not fatal -- ARCHITECTURE.md 8 says never refuse to serve
+			// telemetry. But this used to mean "artefact bytes unbounded" and now
+			// means "the link is unbounded", so it is an error and says so.
+			log.Error("link shaping could not be installed; THE LINK IS UNBOUNDED",
+				"reason", reason, "device", cfg.Link.Device,
+				"note", "traffic control needs CAP_NET_ADMIN; grant it to the obc unit")
+			// Keep the shaper so the verify loop can try again: a capability
+			// granted while the OBC is running, or a device that appears later, is
+			// then recoverable without a restart.
+			shaper = tc
 		}
+		go verifyShaping(ctx, shaper, log)
 	}
 
 	// ---------------------------------------------------------------------
@@ -287,7 +310,7 @@ func run() error {
 	}
 	defer zmq.Stop()
 
-	files := transport.NewHTTP(cfg.HTTP.Addr, store, log, cfg.QOS.BulkRateBps)
+	files := transport.NewHTTP(cfg.HTTP.Addr, store, log)
 	if err := files.Start(ctx); err != nil {
 		return err
 	}
@@ -449,4 +472,45 @@ func cpuTemperature() float64 {
 		return 0
 	}
 	return float64(milli) / 1000
+}
+
+// verifyShapingInterval is how often the kernel is asked whether the cap is still
+// on the device.
+//
+// Slow on purpose. The failure it detects -- NetworkManager, systemd-networkd, a
+// DHCP renewal or a hand-run tc replacing the root qdisc -- takes seconds to
+// matter and is not high frequency, while every read is a netlink round trip on
+// the same box that is trying to fly an aircraft. Ten seconds is well inside the
+// time telemetry itself goes stale at, so an unbounded window is never longer
+// than the window in which the console is already warning the operator.
+const verifyShapingInterval = 10 * time.Second
+
+// verifyShaping re-reads the traffic control state and repairs it if it is gone.
+//
+// This is not defensive bookkeeping; with the in-process limiter removed it is
+// the difference between a capped link and an uncapped one. Active and Status
+// answer from flags written when the tree was installed, so without this a
+// qdisc replaced by anything else would leave telemetry reporting
+// shaping_active = true over a link nothing is limiting.
+//
+// It also covers a start that failed. An OBC without CAP_NET_ADMIN reports
+// itself unshaped and keeps serving telemetry, and if the capability is granted
+// while it is running -- or the device appears, or the rate was clamped -- the
+// next tick installs it without a restart.
+func verifyShaping(ctx context.Context, shaper domain.LinkShaper, log *slog.Logger) {
+	ticker := time.NewTicker(verifyShapingInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			active, reason := shaper.Verify(ctx)
+			if !active {
+				log.Error("the link is NOT being limited", "reason", reason,
+					"note", "telemetry, commands and artefact downloads are all unbounded")
+			}
+		}
+	}
 }

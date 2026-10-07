@@ -110,6 +110,65 @@ typedef struct _rocsar_v1_PicoTelemetry {
  absence discipline as gondola_heading_deg. A field number is the wire;
  do not renumber these fields. */
     float imu_temperature_c;
+    /* Tilt, in degrees. The Euler read returns all three angles and the firmware
+ was using only the first.
+
+ The value is as a confidence signal on the heading, not as attitude for its
+ own sake. The BNO055 tilt-compensates its fusion *using its accelerometer*,
+ and a gondola on a 10-40 m tether swings at roughly 0.08-0.16 Hz -- so sway
+ corrupts the tilt estimate that the heading correction depends on. Erratic
+ tilt is the tell that the bearing has degraded.
+
+ Held, not zeroed, when the sensor is absent, exactly as the heading is. And
+ note that the heading filter passes that pendulum swing through
+ unattenuated by design (IMU_ALPHA 0.15 at 50 Hz is a 1.29 Hz cutoff), so a
+ bearing that wanders through the swing over a long flight is correct
+ behaviour and not a fault. */
+    float gondola_roll_deg;
+    float gondola_pitch_deg;
+    /* The BNO055's calibration status, carried verbatim.
+
+ Register 0x35 (CALIB_STAT) in one byte, two bits per sensor, most
+ significant first:
+
+   bits 7-6  system     0=uncalibrated, 3=fully calibrated
+   bits 5-4  gyroscope
+   bits 3-2  accelerometer
+   bits 1-0  magnetometer
+
+ Carried as one uint32 rather than four fields because it is one register and
+ four separate fields would cost four tags. A consumer unpacks it; nothing in
+ this codebase should need to, since 3 (fully calibrated) in all four is the
+ only value that makes a heading trustworthy.
+
+ Why it matters here and not more broadly: a strapospheric flight is 2-24
+ hours with a large night-to-day temperature swing at altitude, over which the
+ sensor's fusion degrades and wants recalibrating. imu_present says only that
+ a sensor answered; this says whether the answer means anything. */
+    uint32_t imu_calibration;
+    /* The largest linear acceleration seen since boot, per axis, in m/s^2.
+
+ Gravity-free by construction: this is VECTOR_LINEARACCEL, which the sensor
+ has already had gravity removed from, so there is no subtraction to get wrong
+ and no attitude-dependent error in the peak.
+
+ Monotonic rather than a stream, and that is the design. The events worth
+ catching are rare and transient -- balloon rupture into free-fall until the
+ chute deploys, the valve transition at the float, recovery shock -- and a
+ 20 ms sample stream would miss most of them while costing the frame budget
+ that attitude and calibration need. A held maximum costs a fixed 18 bytes and
+ catches the whole transient. */
+    float imu_peak_accel_x_ms2;
+    float imu_peak_accel_y_ms2;
+    float imu_peak_accel_z_ms2;
+    /* Increments once each time imu_peak_accel_* sets a new maximum.
+
+ Once per *sample*, not once per axis: a single shock usually sets all three
+ and that is one event, not three. It exists so a consumer can detect "this
+ is new" without keeping the history itself -- the peak never decreases, so a
+ changed counter means something happened, and an unchanged one means it did
+ not, which is all a 1 Hz telemetry link can carry. */
+    uint32_t imu_peak_accel_event;
 } rocsar_v1_PicoTelemetry;
 
 typedef struct _rocsar_v1_PicoMessage {
@@ -138,7 +197,7 @@ extern "C" {
 #define rocsar_v1_StatusRequestCommand_init_default {0}
 #define rocsar_v1_PicoCommand_init_default       {0, 0, {rocsar_v1_SetTargetCommand_init_default}}
 #define rocsar_v1_PicoAck_init_default           {0, 0, _rocsar_v1_ErrorCode_MIN}
-#define rocsar_v1_PicoTelemetry_init_default     {0, 0, 0, 0, 0, {rocsar_v1_AntennaTelemetry_init_default, rocsar_v1_AntennaTelemetry_init_default}, 0, 0}
+#define rocsar_v1_PicoTelemetry_init_default     {0, 0, 0, 0, 0, {rocsar_v1_AntennaTelemetry_init_default, rocsar_v1_AntennaTelemetry_init_default}, 0, 0, 0, 0, 0, 0, 0, 0, 0}
 #define rocsar_v1_PicoMessage_init_default       {0, 0, 0, {rocsar_v1_PicoAck_init_default}}
 #define rocsar_v1_SetTargetCommand_init_zero     {0}
 #define rocsar_v1_JogCommand_init_zero           {0, 0}
@@ -150,7 +209,7 @@ extern "C" {
 #define rocsar_v1_StatusRequestCommand_init_zero {0}
 #define rocsar_v1_PicoCommand_init_zero          {0, 0, {rocsar_v1_SetTargetCommand_init_zero}}
 #define rocsar_v1_PicoAck_init_zero              {0, 0, _rocsar_v1_ErrorCode_MIN}
-#define rocsar_v1_PicoTelemetry_init_zero        {0, 0, 0, 0, 0, {rocsar_v1_AntennaTelemetry_init_zero, rocsar_v1_AntennaTelemetry_init_zero}, 0, 0}
+#define rocsar_v1_PicoTelemetry_init_zero        {0, 0, 0, 0, 0, {rocsar_v1_AntennaTelemetry_init_zero, rocsar_v1_AntennaTelemetry_init_zero}, 0, 0, 0, 0, 0, 0, 0, 0, 0}
 #define rocsar_v1_PicoMessage_init_zero          {0, 0, 0, {rocsar_v1_PicoAck_init_zero}}
 
 /* Field tags (for use in manual encoding/decoding) */
@@ -184,6 +243,13 @@ extern "C" {
 #define rocsar_v1_PicoTelemetry_antennas_tag     5
 #define rocsar_v1_PicoTelemetry_imu_present_tag  6
 #define rocsar_v1_PicoTelemetry_imu_temperature_c_tag 7
+#define rocsar_v1_PicoTelemetry_gondola_roll_deg_tag 8
+#define rocsar_v1_PicoTelemetry_gondola_pitch_deg_tag 9
+#define rocsar_v1_PicoTelemetry_imu_calibration_tag 10
+#define rocsar_v1_PicoTelemetry_imu_peak_accel_x_ms2_tag 11
+#define rocsar_v1_PicoTelemetry_imu_peak_accel_y_ms2_tag 12
+#define rocsar_v1_PicoTelemetry_imu_peak_accel_z_ms2_tag 13
+#define rocsar_v1_PicoTelemetry_imu_peak_accel_event_tag 14
 #define rocsar_v1_PicoMessage_sequence_tag       1
 #define rocsar_v1_PicoMessage_timestamp_us_tag   2
 #define rocsar_v1_PicoMessage_ack_tag            3
@@ -269,7 +335,14 @@ X(a, STATIC,   SINGULAR, BOOL,     heater1_state,     3) \
 X(a, STATIC,   SINGULAR, BOOL,     heater2_state,     4) \
 X(a, STATIC,   REPEATED, MESSAGE,  antennas,          5) \
 X(a, STATIC,   SINGULAR, BOOL,     imu_present,       6) \
-X(a, STATIC,   SINGULAR, FLOAT,    imu_temperature_c,   7)
+X(a, STATIC,   SINGULAR, FLOAT,    imu_temperature_c,   7) \
+X(a, STATIC,   SINGULAR, FLOAT,    gondola_roll_deg,   8) \
+X(a, STATIC,   SINGULAR, FLOAT,    gondola_pitch_deg,   9) \
+X(a, STATIC,   SINGULAR, UINT32,   imu_calibration,  10) \
+X(a, STATIC,   SINGULAR, FLOAT,    imu_peak_accel_x_ms2,  11) \
+X(a, STATIC,   SINGULAR, FLOAT,    imu_peak_accel_y_ms2,  12) \
+X(a, STATIC,   SINGULAR, FLOAT,    imu_peak_accel_z_ms2,  13) \
+X(a, STATIC,   SINGULAR, UINT32,   imu_peak_accel_event,  14)
 #define rocsar_v1_PicoTelemetry_CALLBACK NULL
 #define rocsar_v1_PicoTelemetry_DEFAULT NULL
 #define rocsar_v1_PicoTelemetry_antennas_MSGTYPE rocsar_v1_AntennaTelemetry
@@ -319,8 +392,8 @@ extern const pb_msgdesc_t rocsar_v1_PicoMessage_msg;
 #define rocsar_v1_MountCommand_size              11
 #define rocsar_v1_PicoAck_size                   10
 #define rocsar_v1_PicoCommand_size               20
-#define rocsar_v1_PicoMessage_size               207
-#define rocsar_v1_PicoTelemetry_size             187
+#define rocsar_v1_PicoMessage_size               244
+#define rocsar_v1_PicoTelemetry_size             224
 #define rocsar_v1_SetTargetCommand_size          5
 #define rocsar_v1_StatusRequestCommand_size      0
 #define rocsar_v1_StopCommand_size               6

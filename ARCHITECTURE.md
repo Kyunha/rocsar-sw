@@ -390,6 +390,53 @@ sketch calls it at the right moments; the policy itself is host-testable, which
 is why every rule below has a test in `firmware/tests/` rather than a note in a
 commit (§12).
 
+**The IMU is read once and most of what it returns was being thrown away.** One
+`VECTOR_EULER` read filled three angles and the firmware used one; one `getTemp()`
+gave the die temperature. Everything else — the other two angles, the calibration
+register, the gravity-free acceleration — was discarded on every tick.
+
+The mission decides what to do about that. This is a stratospheric balloon, not a
+launch vehicle: there is no boost phase, so accelerations are gravity plus pendulum
+sway and a 6-axis stream buys nothing while costing the frame budget that the
+fields below need. Three went in, 37 bytes of the 49 that were spare.
+
+**Roll and pitch** are a confidence signal on the heading, not attitude. The
+BNO055 tilt-compensates its fusion *using its accelerometer*, and a gondola on a
+10-40 m tether swings at 0.08-0.16 Hz, so sway corrupts the estimate the heading
+correction depends on. They are deliberately **not** filtered: the heading is
+filtered because the antennas track it, and tilt is read as evidence about the
+heading, so filtering the evidence would only delay it.
+
+**Calibration status** is register `0x35` carried verbatim. It is stored even
+when the sensor is absent, unlike every reading — the calibration of a sensor that
+has stopped answering is still the last thing it told us, and it is what tells an
+operator why.
+
+**Peak-hold acceleration** is monotonic and paired with an event counter that
+increments once per *sample*, not once per axis. A chute deployment moves all three
+axes and is one event; a counter that ticked three times for it would read as
+three events on a 1 Hz link. Two things about the read are load-bearing and are
+asserted in `firmware/tests/test_firmware_imu_channels.py`: it must be a **second
+`getEvent()`**, because the sensor fills the `sensors_event_t` union with one
+vector per call, and it must be guarded on `event->type`, because
+`VECTOR_LINEARACCEL`, `VECTOR_ACCELEROMETER` and `VECTOR_GRAVITY` all fill the
+*same* union member and are distinguished only by the type — so asking for the
+wrong one yields plausible accelerations with gravity still in them, and a
+peak-hold that would sit at 1 g forever and never mean a shock.
+
+**Vertical rate is derived on the OBC, not the receiver and not the console.**
+The frozen 142-byte GNSS wire carries only `Height`, so a rate cannot come from
+the receiver without changing the vendored `Read_uB`. The console is not the right
+place either: the OBC decimates the GS link to 1 Hz, so the console sees at most
+one fix a second, the OBC owns fix freshness (`stale_after`, `ObservedAt`,
+`Satellites`) and is the only place that can refuse a rate fitted across a
+dropout, and the estimator needs a history buffer that the console destroys on
+every reconnect. The estimator is a least-squares slope rather than a difference
+because `sigma_slope ≈ sigma_alt·√(12/N³)` and `sigma_alt` is metres: at N=60 that
+is 0.02 m/s, where differencing gives ±3 m/s. It returns **nil** until the window
+is worth fitting, and nil crosses the wire as absent — never as 0.0, which would
+say "at float" during the first minute of every ascent.
+
 **The servo holds its own centre, and `zero` writes it.** The centre tick used to
 be a firmware variable that `zero` overwrote with the axis's current reading. Two
 things were wrong with that. It was lost on every power cycle. And it could be
@@ -420,7 +467,8 @@ Three consequences, each recorded where it is enforced:
 - **The centre survives a reflash, so the firmware records only that it was
   taught.** An axis taught while sitting at exactly 2048 stores an offset of
   zero, which is indistinguishable from one never taught. That fact lives in the
-  Pico’s own EEPROM (`calibration.h`, 14 bytes, CRC’d) and rides the wire as
+  Pico’s own EEPROM (14 bytes, CRC’d — `calibration.h` is the format,
+`calibration_store.h` is the EEPROM holding it) and rides the wire as
   `AntennaTelemetry.center_zeroed`. Without it, a fresh servo and a centred one
   report the same 2048 and the console cannot tell them apart.
 - **Register `0x28` (torque) is never written.** A third-party table claims
@@ -621,19 +669,96 @@ commands.
 
 ### 6.6 QoS and link shaping
 
-**One layer today: the kernel.** An HTB hierarchy on the link device:
+**One layer today: the kernel, and it is the ONLY one.** An HTB tree on the link
+device with a single class:
 
 ```
 root htb
-├── 1:10  priority   rate 41.4kbit  ceil <link_rate>   ← telemetry, commands
-└── 1:20  bulk       rate <link_rate - 41.4>bit        ← artefacts, HTTP
+└── 1:a  shaped   rate = ceil = <link.rate_kbps>        ← everything
 ```
 
-The root's default class is **1:10**, so a device with no classifier still gives
-telemetry a floor rather than dumping everything into the class named "bulk".
-Handles are fixed (`1:`, `1:10`, `1:20`, `110:`, `120:`) so that telemetry can name
-them the way an operator reads them out of `tc qdisc show`; `HandleString` formats
-them the same way rather than as decimal.
+`link.rate_kbps` **is** the cap. The Ground Station sets it at runtime with
+`set_link_limit`, and the OBC will not install anything below
+`qos.MinimumRateKbps()`. Handles are fixed (`1:`, `1:a`, `110:`) so that telemetry
+can name them the way an operator reads them out of `tc qdisc show`;
+`HandleString` formats them the same way rather than as decimal.
+
+#### The in-process limiter is deleted
+
+There was a second limiter, a `x/time/rate` token bucket on the artefact HTTP copy
+path, configured by `qos.bulk_rate_bps` (default 8 KiB/s). **It is gone, and the
+key with it.**
+
+It existed because the tree below could not tell a download from telemetry, so
+nothing stopped a photo fetch from eating the link. The kernel tree does not
+classify either, so the same objection applies — but the answer changed. What the
+cap has to do is bound *the device*, and only the kernel can do that: the bucket
+could not see the SDR, a system service, or the operator's own `scp`, and it
+back-pressured rather than prevented.
+
+Three consequences, recorded because each is a reduction as well as a gain:
+
+- **The bucket needed no capability; the tree needs `CAP_NET_ADMIN`.** An OBC
+  without it now runs an **unbounded** link rather than an unbounded artefact
+  download. That makes the capability a deployment requirement. The OBC still
+  starts and still serves telemetry (§8), logs at ERROR, and reports
+  `shaping_active = false` with the reason; it is no longer a tuning knob.
+- **The bucket spared the operator's SSH; the tree does not.** Everything on
+  `eth0` is capped, including interactive sessions. That is the requirement it is
+  kept for, and it is a real cost on a link where `scp`-ing something is exactly
+  what the operator wants to be fast.
+- **`golang.org/x/time` leaves `go.mod`**, `internal/transport/limiter.go` and its
+  six tests with it. What replaced their coverage is `Range`/`206` correctness and
+  traversal, now pinned in `internal/transport/writedeadline_test.go`.
+
+#### A floor, derived and not configurable
+
+`qos.MinimumRateKbps()` is the lowest cap that will be installed: enough for one
+worst-case telemetry frame per interval, `ceil(2048 * 8 / 1s) = 17 kbit/s`. It is
+derived from `telemetry.FrameBudgetBytes` rather than configured, and a test
+asserts the two agree, because a floor that drifts from the frame it protects is a
+number nobody can check.
+
+It lives in `Shaper.Apply` and not in the command handler, so the startup
+configuration and `set_link_limit` are both covered by it; it used to protect only
+the command path, which is how `link.rate_kbps = 5` could install a cap no
+telemetry frame would fit into.
+
+A request below the floor is **clamped up**, with the reason reported and both
+numbers shown. The alternative — refuse and leave the device alone — turns one
+typo in a TOML line into an unbounded link, which is the failure the deleted
+bucket existed to prevent.
+
+#### The cap is verified, not assumed
+
+`Shaper.Verify` re-reads the device every 10 s (`cmd/obc/main.go`,
+`verifyShapingInterval`). This is not defensive bookkeeping: with the bucket gone,
+if the qdisc is not on the device **nothing in this program limits the link**.
+
+`Active` and `Status` answer from flags written when the tree was installed, so
+without the read-back a qdisc replaced by NetworkManager, `systemd-networkd`, a
+DHCP renewal or a hand-run `tc` would leave telemetry reporting
+`shaping_active = true` over an unbounded link. `Verify` marks it inactive, says
+so in telemetry, and re-installs. The two failure directions are kept apart: a
+read that *fails* is not evidence the qdisc is gone and must not flap the
+operator's view, and a qdisc we did not install is reported as such rather than
+claimed.
+
+#### No write deadline on the artefact server
+
+`http.Server.WriteTimeout` was 5 minutes and is **removed**. A write deadline is a
+wall clock on the whole response, set when the request header is read and not
+reset per chunk, so it truncates any transfer slower than `size/deadline`. The
+link is rate-limited and a real capture is not a web page: from the shipped
+`params.json`, a burst is 200 µs at 31.251 MS/s, so a one-second session at PRF
+2750 is about 66 MiB, and at the old in-process rate the five-minute deadline
+bought 2.3 MiB. It failed quietly — a short read reported as an ordinary transfer
+error, leaving a plausibly-sized file on disk.
+
+What bounds a transfer now is the cap. The residual cost is a client that stops
+reading holding a goroutine and a socket until the OBC restarts;
+`TestTheArtefactServerHasNoWriteDeadline` pins both the removal and the two
+timeouts that remain, which are about a stalled peer rather than a slow transfer.
 
 #### No classifier ships
 
@@ -663,24 +788,16 @@ The rate cap is kept because it works, and is measured working: 41 kbit/s floor,
 traffic is NOT classified"* so that `shaping_active` is never mistaken for a
 priority class that does something.
 
-**What replaced it for the minimal system:** artefact downloads are bounded
-**in-process**, by a `golang.org/x/time/rate` limiter on the HTTP copy path
-(`internal/transport/limiter.go`, driven by `qos.bulk_rate_bps`). That is the
-traffic which was actually starving telemetry. It is not link shaping — it cannot
-constrain the SDR, a system service, or anything else on the box, and it
-back-pressures rather than prevents.
+**What replaced it for the minimal system, and then replaced it in turn.** An
+in-process `x/time/rate` limiter on the artefact HTTP copy path, configured by
+`qos.bulk_rate_bps`. It covered the traffic that was actually starving telemetry,
+and it was not link shaping: it could not constrain the SDR, a system service, or
+anything else on the box, and it back-pressured rather than prevented.
 
-This limiter is a hand-rolled token bucket no longer: it delegates to
-`x/time/rate`, a maintained library, rather than reimplementing arithmetic that is
-easy to get subtly wrong. It keeps two behaviours the library does not give for
-free: reads are granted in `quantum`-sized chunks so the HTTP path is not woken
-once per buffer, and a grant is capped at `min(len(p), quantum, burst)`.
-
-That cap is a bug fix, not an optimisation. The old bucket computed its wait from
-`burst` and `rate` and then handed the reader `burst` bytes regardless of how many
-were asked for. Below 512 B/s the quantum exceeded the burst, so the bucket
-granted more than it had and the reader blocked forever. The low-rate case is now
-covered by a test that exercises a rate the old code could not survive.
+**That limiter is now deleted too** — see *The in-process limiter is deleted*
+above. What is left is the flat kernel cap, which is a weaker guarantee about
+*which* traffic yields and a much stronger one about everything else on the box
+yielding. The trade is recorded there.
 
 **Deferred to its own module.** Per-class link constraint needs a classifier that
 demonstrably matches on this interface. Candidates, none yet proven here: `u32`
@@ -987,10 +1104,9 @@ becomes a second home for a fact, and two homes drift.
 | `[camera]` | `device` | `/dev/video0` |
 | `[sdr]` | `program` | `third_party/sdr-ettus-b200mini` |
 | `[telemetry]` | `interval` | `1s` |
-| `[qos]` | `bulk_rate_bps` | `8192` |
 | *(top level)* | `require_hardware` | `false` |
 
-`gnss.stale_after`, `qos.bulk_rate_bps` and `require_hardware` were missing from
+`gnss.stale_after` and `require_hardware` were missing from
 this table in earlier revisions although all three are parsed. `[link] shaping`
 defaulted to `true` here; the code default is `false` (§6.6 — an unshaped link is
 the safe default, and `rocsar.toml` ships `false` with the reasoning inline).
@@ -1009,10 +1125,10 @@ Ground Station console's own settings; none of them are read by the OBC, and
 and downloads joined the priority class. There is no filter now, and
 `config.BulkPort` is gone with it.
 
-The in-process limiter bounds the artefact handler wholesale rather than matching
-a port, which is one less concept and cannot be defeated by changing the port.
-`Validate` no longer refuses a mismatched pair, because nothing mismatches any
-more: a wrong port used to be a silent starvation, and now it is a different
+Nothing matches on a port at all any more — not the filter, and not the
+in-process limiter that replaced it — so there is no port-dependent behaviour left
+to get wrong. `Validate` no longer refuses a mismatched pair, because nothing
+mismatches: a wrong port used to be a silent starvation, and now it is a different
 number.
 
 ---
@@ -1126,13 +1242,24 @@ Known limits, stated so nobody mistakes silence for coverage:
   was killed, with no resurrection on restart). A bench session is not
   automation; none of it runs unattended.
 - **Link shaping is verified by reading back the qdisc, not by measuring
-  throughput under load.** `internal/qos/netlink_test.go` installs the hierarchy in
-  a real network namespace and asserts the rates the kernel reports back, and
-  `test/qos_test.go` asserts the intended hierarchy against a fake `KernelOps`. The
-  41/74/115 kbit/s figures in §6.6 come from `tc qdisc show` output on a
-  development interface. What is **not** established is achieved throughput on the
-  real radio link with a real receiver attached. Both the measurement and the
-  classifier remain open.
+  throughput under load.** `internal/qos/netlink_test.go` installs the tree in a
+  real network namespace and asserts the rates the kernel reports back, and
+  `test/qos_test.go` asserts the intended shape against a fake `KernelOps`. The
+  115 kbit/s figure in §6.6 comes from `tc qdisc show` output on a development
+  interface. What is **not** established is achieved throughput on the real radio
+  link with a real receiver attached. Both the measurement and the classifier
+  remain open.
+- **The cap has never been verified against the flight it protects.** The floor is
+  derived from `telemetry.FrameBudgetBytes` and the 1 Hz design point, which is
+  arithmetic, not measurement: nobody has observed that telemetry survives at
+  17 kbit/s on the real link. If the frame budget is wrong, the floor is wrong
+  with it, and the floor is what stops an operator from capping the link below
+  what telemetry needs (§6.6).
+- **The floor assumes a 1 Hz pipeline and does not read `[telemetry] interval`.**
+  `qos.MinimumRateKbps()` uses a constant, because a config key that silently
+  invalidated the floor would be worse than one that is not offered. A faster
+  interval would double the demand, and nothing currently stops that being
+  configured.
 - `internal/qos` leaves are `fq_codel`, not plain `pfifo limit`. The netlink
   binding used here cannot express a `pfifo` byte limit, so leaves get fair
   queueing with no explicit queue length. See §6.6.

@@ -179,7 +179,6 @@ func TestEveryKeyHasAWorkingEnvironmentForm(t *testing.T) {
 		{"camera.device", "/dev/video9"},
 		{"sdr.program", "/opt/sdr"},
 		{"telemetry.interval", "5s"},
-		{"qos.bulk_rate_bps", "4096"},
 		{"require_hardware", "true"},
 	}
 
@@ -282,10 +281,6 @@ func assertEnvApplied(t *testing.T, cfg config.Config, key, value string) {
 	case "telemetry.interval":
 		if cfg.Telemetry.Interval.String() != value {
 			t.Errorf("got %s, want %s", cfg.Telemetry.Interval, value)
-		}
-	case "qos.bulk_rate_bps":
-		if cfg.QOS.BulkRateBps != 4096 {
-			t.Errorf("got %d, want 4096", cfg.QOS.BulkRateBps)
 		}
 	case "require_hardware":
 		if !cfg.RequireHardware {
