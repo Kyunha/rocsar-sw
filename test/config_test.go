@@ -169,6 +169,7 @@ func TestEveryKeyHasAWorkingEnvironmentForm(t *testing.T) {
 		{"client.http_endpoint", "http://10.0.0.9:6003"},
 		{"http.addr", ":6003"},
 		{"http.root", "/tmp/rocsar-env-root"},
+		{"http.device", "b82c5820-9183-45ba-bf2f-a956f6dec4ce"},
 		{"link.device", "eth9"},
 		{"link.rate_kbps", "256"},
 		{"link.shaping", "true"},
@@ -179,6 +180,7 @@ func TestEveryKeyHasAWorkingEnvironmentForm(t *testing.T) {
 		{"gnss.stale_after", "7s"},
 		{"camera.device", "/dev/video9"},
 		{"sdr.program", "/opt/sdr"},
+		{"sdr.data_dir", "/opt/sdr-data"},
 		{"telemetry.interval", "5s"},
 		{"require_hardware", "true"},
 	}
@@ -243,6 +245,10 @@ func assertEnvApplied(t *testing.T, cfg config.Config, key, value string) {
 		if cfg.HTTP.Root != value {
 			t.Errorf("got %q, want %q", cfg.HTTP.Root, value)
 		}
+	case "http.device":
+		if cfg.HTTP.Device != value {
+			t.Errorf("got %q, want %q", cfg.HTTP.Device, value)
+		}
 	case "link.device":
 		if cfg.Link.Device != value {
 			t.Errorf("got %q, want %q", cfg.Link.Device, value)
@@ -282,6 +288,10 @@ func assertEnvApplied(t *testing.T, cfg config.Config, key, value string) {
 	case "sdr.program":
 		if cfg.SDR.Program != value {
 			t.Errorf("got %q, want %q", cfg.SDR.Program, value)
+		}
+	case "sdr.data_dir":
+		if cfg.SDR.DataDir != value {
+			t.Errorf("got %q, want %q", cfg.SDR.DataDir, value)
 		}
 	case "telemetry.interval":
 		if cfg.Telemetry.Interval.String() != value {

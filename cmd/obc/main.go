@@ -144,7 +144,7 @@ func run() error {
 	// failure. Everything written under it is flight data, and losing it
 	// silently is worse than not starting. See ARCHITECTURE.md 8.
 	// ---------------------------------------------------------------------
-	store := storage.New(cfg.HTTP.Root)
+	store := storage.New(cfg.HTTP.Root, cfg.HTTP.Device)
 	if err := store.Check(); err != nil {
 		return fmt.Errorf("data directory: %w", err)
 	}
@@ -192,7 +192,7 @@ func run() error {
 	if mocked["sdr"] {
 		log.Warn("using a simulated SDR")
 	} else {
-		sdrPort = sdr.NewService(cfg.SDR.Program, store.Root(), log)
+		sdrPort = sdr.NewService(cfg.SDR.Program, store.Root(), cfg.SDR.DataDir, log)
 	}
 
 	// ---------------------------------------------------------------------
@@ -291,30 +291,10 @@ func run() error {
 	// heater on across the seconds between one operator command and the next.
 	heaterKeeper := command.NewHeaterKeeper(picoPort, log, command.HeaterRefreshInterval)
 
-	dispatcher := command.New(command.Deps{
-		Pico:    picoPort,
-		GNSS:    gnssBank,
-		Camera:  cam,
-		SDR:     sdrPort,
-		Link:    shaper,
-		Heaters: heaterKeeper,
-		Log:     log,
-	})
-	go dispatcher.Run(ctx)
-
+	var dispatcher *command.Dispatcher
 	zmq := transport.NewZMQ(log, func(req *rocsarv1.CommandRequest) *rocsarv1.CommandResponse {
 		return dispatcher.Handle(ctx, req)
 	})
-	if err := zmq.Start(ctx, cfg.Server.ControlEndpoint, cfg.Server.TelemetryEndpoint); err != nil {
-		return err
-	}
-	defer zmq.Stop()
-
-	files := transport.NewHTTP(cfg.HTTP.Addr, store, log)
-	if err := files.Start(ctx); err != nil {
-		return err
-	}
-	defer files.Stop()
 
 	pipeline := telemetry.NewPipeline(engine, cfg.Telemetry.Interval, func(snap telemetry.Snapshot) {
 		frame := transport.EncodeTelemetry(snap)
@@ -325,6 +305,29 @@ func run() error {
 		}
 		zmq.Publish(qos.TopicTelemetry, body)
 	}, log)
+
+	dispatcher = command.New(command.Deps{
+		Pico:                 picoPort,
+		GNSS:                 gnssBank,
+		Camera:               cam,
+		SDR:                  sdrPort,
+		Link:                 shaper,
+		Heaters:              heaterKeeper,
+		Log:                  log,
+		SetTelemetryInterval: pipeline.SetInterval,
+	})
+	go dispatcher.Run(ctx)
+
+	if err := zmq.Start(ctx, cfg.Server.ControlEndpoint, cfg.Server.TelemetryEndpoint); err != nil {
+		return err
+	}
+	defer zmq.Stop()
+
+	files := transport.NewHTTP(cfg.HTTP.Addr, store, log)
+	if err := files.Start(ctx); err != nil {
+		return err
+	}
+	defer files.Stop()
 
 	go pipeline.Run(ctx)
 

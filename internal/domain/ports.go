@@ -55,12 +55,92 @@ type Ack struct {
 
 // Camera is the USB camera.
 type Camera interface {
-	// Capture grabs one full-resolution JPEG and writes it to the data
-	// directory. The write is atomic, so a Photo returned here is complete.
+	// Capture grabs one JPEG at the parameters in force and writes it to the
+	// data directory. The write is atomic, so a Photo returned here is
+	// complete.
+	//
+	// "full-resolution" used to be the word in this comment and it was not
+	// true: with no resolution requested, fswebcam asks the device for
+	// 384x288 (its own default), so every photograph this system ever took was
+	// a quarter-megapixel one. The Photo returned now carries the DECODED
+	// dimensions of what was actually written, which is the only figure that
+	// describes a file on disk.
 	Capture(ctx context.Context) (*Photo, error)
 	State() SubsystemState
 	Device() string
 	PhotosTaken() uint64
+
+	// Params reads the capture settings in force.
+	Params(ctx context.Context) (CameraParams, error)
+	// SetParams applies a partial update. Absent fields are left alone, so a
+	// caller changing the JPEG factor does not also reset the resolution. The
+	// update is validated before it is stored, and it outlives the process:
+	// the settings are on the SSD, not in a struct that a restart empties.
+	SetParams(ctx context.Context, p CameraParamsPatch) error
+}
+
+// CameraParams is the full set of capture settings.
+//
+// A contract with fswebcam, which is found on PATH on the aircraft and is not
+// vendored here -- so unlike SdrParams there is no source file in this
+// repository to check a bound against, and internal/camera/params_contract.go
+// cites the fswebcam man page for every one of them instead.
+//
+// The shipped defaults are fswebcam's OWN defaults, spelled out: taking a
+// photograph with these values produces byte-for-byte the capture this system
+// took before any of them existed. That is deliberate. A default chosen for this
+// project would be a resolution nobody asked the hardware for, on a camera none
+// of us can see.
+type CameraParams struct {
+	// JPEGQuality is fswebcam's `--jpeg <factor>`, 0..95.
+	//
+	// Zero means automatic, which is what fswebcam's own -1 means, and it is
+	// NOT "quality zero" -- libjpeg at factor 0 produces a file too small to
+	// be a photograph. Automatic is carried in the zero and 0 is never handed
+	// to the program.
+	JPEGQuality uint32 `json:"jpeg_quality"`
+
+	// Resolution is the requested capture size as `WxH`.
+	//
+	// It is a REQUEST. fswebcam's man page: "the actual resolution used may
+	// differ if the source or device cannot capture at the specified
+	// resolution". What a photograph really is comes back decoded from the
+	// JPEG, on domain.Photo.
+	Resolution string `json:"resolution"`
+
+	// Frames is how many frames to average into the output, fswebcam's `-F`.
+	// More frames is less noise and more blur on a moving gondola; see
+	// params_contract.go for why the ceiling is 8.
+	Frames uint32 `json:"frames"`
+
+	// Skip is how many frames to capture and throw away first, fswebcam's
+	// `-S`. It exists because a USB camera's first frames after opening are
+	// dark or corrupt, which is the defect it hides.
+	Skip uint32 `json:"skip"`
+
+	// DelayMs is the settle time between opening the device and capturing,
+	// fswebcam's `-D`, in milliseconds. Milliseconds rather than the seconds
+	// fswebcam itself takes, because "let the image settle" is a sub-second
+	// wait and a float on the wire is a number with two spellings.
+	DelayMs uint32 `json:"delay_ms"`
+}
+
+// CameraParamsPatch is a partial update. A nil pointer means "leave it alone".
+//
+// The distinction from CameraParams is the whole reason the fields are pointers,
+// exactly as it is for SdrParamsPatch: a JPEG quality of zero means "automatic"
+// and must be expressible, and a width without a height is not a state a device
+// can be in. Neither survives a plain value.
+type CameraParamsPatch struct {
+	JPEGQuality *uint32
+	// Resolution is a `WxH` string rather than a width/height pair, because
+	// the pair is not a thing: one V4L2 format is one setting, and half of one
+	// would be clamped by the driver into something neither the operator nor
+	// this code chose.
+	Resolution *string
+	Frames     *uint32
+	Skip       *uint32
+	DelayMs    *uint32
 }
 
 // Sdr is the Ettus B200mini acquisition program.

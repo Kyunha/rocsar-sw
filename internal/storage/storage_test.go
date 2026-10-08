@@ -16,7 +16,7 @@ func TestResolveRefusesToEscapeTheRoot(t *testing.T) {
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	s := New(root)
+	s := New(root, "")
 
 	for _, name := range []string{
 		"../etc/passwd",
@@ -46,7 +46,7 @@ func TestResolveRefusesToEscapeTheRoot(t *testing.T) {
 // The atomic write is the property that matters: a reader sees the file complete
 // or not at all.
 func TestWriteFileAtomicLeavesNoPartialFile(t *testing.T) {
-	s := New(t.TempDir())
+	s := New(t.TempDir(), "")
 
 	body := make([]byte, 1<<20)
 	for i := range body {
@@ -82,7 +82,7 @@ func TestWriteFileAtomicLeavesNoPartialFile(t *testing.T) {
 }
 
 func TestWriteFileAtomicRefusesEscapingNames(t *testing.T) {
-	s := New(t.TempDir())
+	s := New(t.TempDir(), "")
 	if err := s.WriteFileAtomic("../escape.txt", []byte("x"), 0o644); err == nil {
 		t.Fatal("a write escaped the data directory")
 	}
@@ -127,7 +127,7 @@ func TestArtefactNamesSortChronologically(t *testing.T) {
 
 // The listing must not show the debris of an interrupted write.
 func TestListHidesTemporaryFiles(t *testing.T) {
-	s := New(t.TempDir())
+	s := New(t.TempDir(), "")
 	if err := s.WriteFileAtomic("cam-1.jpg", []byte("a"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -154,17 +154,17 @@ func TestListHidesTemporaryFiles(t *testing.T) {
 
 // An unwritable data directory is fatal at startup, unlike a missing device.
 func TestCheckRejectsAMissingDirectory(t *testing.T) {
-	s := New(filepath.Join(t.TempDir(), "does-not-exist"))
+	s := New(filepath.Join(t.TempDir(), "does-not-exist"), "")
 	if err := s.Check(); err == nil {
 		t.Fatal("Check passed for a directory that does not exist")
 	}
-	if err := New(t.TempDir()).Check(); err != nil {
+	if err := New(t.TempDir(), "").Check(); err != nil {
 		t.Fatalf("Check failed for a writable directory: %v", err)
 	}
 }
 
 func TestFreeSpaceReportsSomethingPlausible(t *testing.T) {
-	s := New(t.TempDir())
+	s := New(t.TempDir(), "")
 	free, err := s.FreeSpace()
 	if err != nil {
 		t.Fatalf("FreeSpace: %v", err)

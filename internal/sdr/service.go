@@ -48,13 +48,25 @@ var (
 	ErrAlreadyRunning = errors.New("sdr: an acquisition is already running")
 	ErrNoProgram      = errors.New("sdr: acquisition program not found")
 	ErrInvalidParams  = errors.New("sdr: parameter out of range")
+
+	// ErrNoDataDir is returned when the directory the program writes captures to
+	// cannot be used. Distinct from ErrInvalidParams because the operator did
+	// nothing wrong to the radio; the disk is wrong.
+	ErrNoDataDir = errors.New("sdr: capture directory is not usable")
+
+	// ErrNoSpace is returned when a destination has less free space than the
+	// capture the configured parameters will produce.
+	ErrNoSpace = errors.New("sdr: not enough free space for the capture")
 )
 
 // Service manages the acquisition program.
 type Service struct {
 	programDir string
 	logDir     string
-	log        *slog.Logger
+	// dataDir is where the program writes its capture, from the program's own
+	// SSD_PATH. Checked before every acquisition. See programCaptureRelPath.
+	dataDir string
+	log     *slog.Logger
 
 	// runner is injected so the whole service is testable without a USB device.
 	runner func(ctx context.Context, dir, name string, args []string) (stdout string, err error)
@@ -77,20 +89,39 @@ type Service struct {
 var _ domain.Sdr = (*Service)(nil)
 
 // NewService returns a service driving the program at programDir, writing logs
-// under logDir (a subdirectory of the data directory).
-func NewService(programDir, logDir string, log *slog.Logger) *Service {
+// under logDir (a subdirectory of the data directory) and captures to dataDir
+// (the program's own SSD_PATH).
+func NewService(programDir, logDir, dataDir string, log *slog.Logger) *Service {
 	if log == nil {
 		log = slog.Default()
 	}
 	return &Service{
 		programDir: programDir,
 		logDir:     logDir,
+		dataDir:    dataDir,
 		log:        log,
 		runner:     runCommand,
 		start:      startDetached,
 		state:      domain.SubsystemDisconnected,
 	}
 }
+
+// programCaptureRelPath is where the program writes a second copy of the
+// capture, relative to its working directory.
+//
+// Taken verbatim from connect.cpp, which writes the SSD copy first and then this
+// one unconditionally:
+//
+//	std::string filename = "./../sdr-ettus-b200mini/Data/raw_data/rx_data_" + ...
+//
+// The SSD copy is wrapped in a try/catch that logs and continues; this one is
+// not, and write_buffer_to_disk throws when the directory is absent. The
+// exception escapes the RX thread and calls std::terminate, so a missing
+// Data/raw_data/ aborts the process *after* a successful session -- which
+// watchExit reports as a failed acquisition. Both destinations are therefore
+// checked before the child starts, and the existence of this one is what makes
+// "keep a second copy on the SD card" an option rather than a crash.
+const programCaptureRelPath = "Data/raw_data"
 
 // programName is the acquisition binary's own name, and the string looked up on
 // PATH. The deployed system installs it there (a symlink into
@@ -106,9 +137,8 @@ const programName = "connect"
 //
 // That line is a hardcoded relative path in C++ this repository does not
 // maintain, so it -- not paramsPath() below -- decides which file a capture
-// actually uses. TestConfigPathIsHardcodedRelativeToCWD pins both copies to
-// connect.cpp: if that line changes, that test fails rather than this constant
-// quietly going stale.
+// actually uses. Both copies of that fact live in C++ and here; see
+// programCaptureRelPath for the sibling arrangement and for what it costs.
 const programConfigRelPath = "../sdr-ettus-b200mini/parameters/params.json"
 
 // programPath is the acquisition binary, looked up on PATH.
@@ -388,7 +418,7 @@ func (s *Service) SetParams(ctx context.Context, patch domain.SdrParamsPatch) er
 		return err
 	}
 
-	store := storage.New(filepath.Dir(s.paramsPath()))
+	store := storage.New(filepath.Dir(s.paramsPath()), "")
 	if err := store.WriteFileAtomic("params.json", body, 0o644); err != nil {
 		return fmt.Errorf("sdr: %w", err)
 	}
@@ -427,7 +457,17 @@ func (s *Service) Connect(ctx context.Context) error {
 		return err
 	}
 
-	logDir, err := storage.New(s.logDir).Sub("sdr")
+	// Both places the capture goes are checked before the child starts, not
+	// after it exits. Every failure here is one the program handles silently or
+	// fatally: an unwritable SSD directory is swallowed by a try/catch and the
+	// session is reported as a success, and a missing Data/raw_data/ throws out
+	// of the RX thread and aborts a session that had already collected its data.
+	// Neither is worth discovering at the end of a run.
+	if err := s.checkCaptureDestinations(ctx); err != nil {
+		return err
+	}
+
+	logDir, err := storage.New(s.logDir, "").Sub("sdr")
 	if err != nil {
 		return err
 	}
@@ -441,11 +481,16 @@ func (s *Service) Connect(ctx context.Context) error {
 	}
 
 	// The child is started with the program's own directory as its working
-	// directory. The vendored C++ resolves its configuration against CWD
-	// (programConfigRelPath) and writes its capture relative to it
-	// (Data/rx_data_<time>.bin), so the directory is load-bearing even though
-	// the binary itself now comes from PATH. Inheriting the OBC's own directory
-	// would put every capture somewhere the HTTP listing does not serve.
+	// directory. The program's C++ resolves its configuration against CWD
+	// (programConfigRelPath) and its second capture copy against CWD too
+	// (programCaptureRelPath), so the directory is load-bearing even though the
+	// binary itself comes from PATH. Inheriting the OBC's own directory would
+	// put that copy somewhere the HTTP listing does not serve.
+	//
+	// The primary copy does NOT depend on this: SSD_PATH is absolute, and it is
+	// the one that reaches the disk the operator intends. That is why the
+	// working directory matters for two of the program's three paths rather than
+	// all of them, which was not true when this comment was written.
 	pid, exited, err := s.start(ctx, s.programDir, program, nil, f)
 	if err != nil {
 		_ = f.Close()

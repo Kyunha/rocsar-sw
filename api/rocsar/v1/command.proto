@@ -91,6 +91,95 @@ message SdrGetParamsCommand {}
 // Camera
 // ---------------------------------------------------------------------------
 
+// Partial update of the capture settings. Every field is optional: absent means
+// "leave it alone". A JPEG quality of 0 is a real value meaning "automatic",
+// and that is exactly why this cannot be a plain uint32 -- see the field.
+//
+// # Why these exist
+//
+// Until they existed, nothing could set the resolution, quality, frame count or
+// settle time of a photograph: NewCapture took a quality argument that it stored
+// and never read, so the one "quality" input in the system was a control that
+// did nothing. Worse, every photograph was taken at whatever mode fswebcam asks
+// for when given no -r, which its man page puts at 384x288 -- so the port's own
+// "one full-resolution JPEG" claim was not true either. Both are fixed here, and
+// internal/camera/params_contract.go carries the bounds with the man-page line
+// each one came from.
+//
+// # The resolution is one string, not two numbers
+//
+// A V4L2 format is a single setting. `width` without `height` is not a state the
+// device can be in, it is a request the driver clamps to something arbitrary,
+// and we would report back a resolution the operator never asked for. One
+// "WxH" field maps one-to-one onto the `-r` argument, which is the other reason
+// it is not two fields.
+message CameraParams {
+  // JPEG compression factor, fswebcam's `--jpeg <factor>`, 0..95.
+  //
+  // Zero means automatic, which is fswebcam's own default of -1 -- NOT "quality
+  // zero". libjpeg/GD at factor 0 produces a file so small it is not a usable
+  // photograph, so the automatic case is carried in the zero and 0 is never
+  // passed to the program. That is also why it is `optional`: absent is "leave
+  // it alone", present-and-zero is "go back to automatic", and a plain uint32
+  // cannot tell those apart.
+  optional uint32 jpeg_quality = 1;
+
+  // Capture resolution as `WxH`, passed through to fswebcam's `-r`.
+  //
+  // The man page is explicit that "the actual resolution used may differ if the
+  // source or device cannot capture at the specified resolution", so this is a
+  // REQUEST and never a report. What the camera actually delivered is decoded
+  // out of the JPEG and reported on the artefact, because a console that
+  // displays the requested resolution is displaying a number no device ever
+  // agreed to.
+  //
+  // Empty is rejected rather than taken as "the device default": 384x288 is
+  // fswebcam's default, not the camera's, and silently capturing at a size
+  // neither the operator nor the hardware chose is the failure this file exists
+  // to end. Send no field to leave the setting alone.
+  optional string resolution = 2;
+
+  // Frames to average into the output, fswebcam's `-F <number>`, 1..8.
+  //
+  // The man page: "More frames mean less noise in the final image, however
+  // capture times will be longer and moving objects may appear blurred." Both
+  // halves are why the ceiling is 8 and not 30: this is a camera on a moving
+  // gondola, where a long average smears the horizon.
+  optional uint32 frames = 3;
+
+  // Frames to capture and discard before the real one, fswebcam's `-S <number>`.
+  //
+  // The man page's reason, which is the reason this is offered at all: "use
+  // this option if your camera sends some bad or corrupt frames when it first
+  // starts capturing." That is the behaviour of the USB camera on the aircraft.
+  optional uint32 skip = 4;
+
+  // Settle time after the device is opened and before capture begins,
+  // fswebcam's `-D <delay>`. Milliseconds here, because a sub-second wait is
+  // what "let the image settle" means and float seconds on the wire is a value
+  // that has to be parsed and reported back.
+  //
+  // The man page: "Some devices need this delay to let the image settle after a
+  // setting has changed."
+  optional uint32 delay_ms = 5;
+}
+
+message CameraSetParamsCommand {
+  CameraParams params = 1;
+}
+
+// Reads the capture settings in force, as JSON. The read side of
+// camera_set_params: the GUI shows current values as placeholder hints while
+// blank inputs keep meaning "leave alone", and a read that fails is surfaced,
+// never guessed. Same contract and same failure mode as SdrGetParamsCommand.
+message CameraGetParamsCommand {}
+
+// The photograph is taken with whatever parameters are in force at the moment
+// the command arrives. It carries none of them on the wire: the response
+// reports the ARTEFACT that came out -- its name, size and decoded dimensions --
+// and the settings themselves are readable with camera_get_params. A command
+// that both set and captured would make the settings that produced a given
+// photograph unrecoverable after the fact.
 message TakePhotoCommand {}
 
 // ---------------------------------------------------------------------------
@@ -110,6 +199,14 @@ message GnssSelectCommand {
 
 message LinkSetLimitCommand {
   uint32 rate_kbps = 1;
+}
+
+// ---------------------------------------------------------------------------
+// Telemetry rate
+// ---------------------------------------------------------------------------
+
+message TelemetrySetRateCommand {
+  uint32 interval_ms = 1;
 }
 
 // ---------------------------------------------------------------------------
@@ -148,6 +245,9 @@ message CommandRequest {
     LinkSetLimitCommand link_set_limit = 9;
     SystemResetCommand system_reset = 10;
     QueryStatusCommand query_status = 11;
+    TelemetrySetRateCommand telemetry_set_rate = 13;
+    CameraSetParamsCommand camera_set_params = 14;
+    CameraGetParamsCommand camera_get_params = 15;
   }
 }
 

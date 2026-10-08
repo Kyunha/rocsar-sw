@@ -384,6 +384,20 @@ type Photo struct {
 	SizeBytes uint64
 	Kind      string
 	Path      string
+
+	// Width and Height are the DECODED pixel dimensions of the file at Path,
+	// read out of the JPEG's own header.
+	//
+	// They are not the resolution that was asked for. That distinction is the
+	// entire reason these fields exist: fswebcam's man page says "the actual
+	// resolution used may differ if the source or device cannot capture at the
+	// specified resolution", so a request of 1920x1080 on a device that cannot
+	// do it yields a 640x480 file, and a console showing the request would be
+	// reporting a number no hardware agreed to.
+	//
+	// Zero means "not decoded": a header this code could not read, which is a
+	// different fact from a photograph that is 0x0.
+	Width, Height uint32
 }
 
 // LinkStatus describes the traffic shaper.

@@ -634,7 +634,7 @@ The shape `obc_rocsar/sdr_service.go` described, cleaned up:
   `sdr.program` is therefore **not** the executable. It is the directory
   holding `parameters/` and `Data/`, and it is still the working directory the
   child is started in, because the C++ resolves both its configuration and its
-  capture paths against `CWD`. That directory must be named
+  second capture copy against `CWD`. That directory must be named
   `sdr-ettus-b200mini`: `connect.cpp` hardcodes
   `load_config("./../sdr-ettus-b200mini/parameters/params.json")`, which only
   reaches `<sdr.program>/parameters/params.json` for a directory with that
@@ -642,6 +642,35 @@ The shape `obc_rocsar/sdr_service.go` described, cleaned up:
   and refuses a mismatch, because otherwise `sdr_set_params` would report a
   successful write to a file the program never reads — an operator's gain and
   PRF changes appearing to save and doing nothing.
+
+  **Where the capture goes, and the pre-flight that checks it.** The program
+  writes every capture twice, and treats the two copies differently:
+
+  | Copy | Path | Failure mode |
+  | :--- | :--- | :--- |
+  | primary | `<sdr.data_dir>/rx_data_<time>.bin` — its `SSD_PATH`, absolute | wrapped in `try`/`catch`: logs `[RX] SSD write failed` to stderr and continues |
+  | second | `<sdr.program>/Data/raw_data/rx_data_<time>.bin` — relative to `CWD` | bare. `write_buffer_to_disk` throws, the exception escapes the RX thread, and the process calls `std::terminate` |
+
+  The second row is why the copy is kept at all: it is the redundancy that
+  survives the primary failing, and it is also why a missing `Data/raw_data/`
+  aborts a session whose data was already collected. `Connect` therefore checks
+  both directories before starting the child, and refuses on either being
+  absent, unwritable, or short of space.
+
+  The space check is exact rather than estimated, and it uses the program's own
+  arithmetic — `total_pulses × window_samps × sizeof(complex<int16_t>)`, with
+  `window_samps` truncated to a whole number as the C++ does. Against the
+  aircraft's parameters that reproduces the observed file sizes exactly: 2750
+  pulses × 3125 samples × 4 bytes is 34,375,000 bytes, which is every
+  1-second capture on the Pi, and the 2- and 25-second ones are 2× and 25×.
+  Computing it before the radio is touched is the point: a disk with 30 MB free
+  fails a 1-second capture *after* the acquisition has been paid for in flight
+  time, and the failure surfaces as an aborted child rather than as a refusal.
+
+  That check is also the answer to "we will fill the SD card". The second copy is
+  a real safety net precisely because it is on a different disk — which it was
+  not, while `/mnt/rocsar_ssd` was an ordinary directory on the SD card, so the
+  two copies were the same data in two places eating twice the space.
 - `sdr_reset_usb` shells out to `uhubctl` for a power cycle.
 - `sdr_probe` returns `uhd_usrp_probe` output verbatim.
 - `sdr_get_params` reads `parameters/params.json` and returns it as JSON in
@@ -1032,7 +1061,9 @@ tells them everything.
 | `tc` unavailable | `LinkShaper` reports `ok=false` with the reason. Telemetry is unaffected. |
 | `tc` hangs | 5-second timeout per command. |
 | Data directory unwritable | Startup fails loudly — unlike a missing device, this one silently loses everything. |
-| `/mnt/ssd` not mounted | Asserted at startup, with the reason. Continuing would write ephemerides to the root filesystem and fill it. |
+| SSD not mounted | Startup fails loudly, naming the disk it wanted and the one it found. A dropped mount leaves a writable directory behind, which every writability check passes — this is the one that catches it. |
+| SSD too small for the requested capture | `sdr_connect` refuses, with the space needed and the space there. The size is computed from `params.json` before the radio is touched. |
+| `Data/raw_data/` absent | `sdr_connect` refuses. The program's second copy has no fallback and its absence aborts the process after a successful session. |
 
 `--require-hardware` inverts the policy for bench and CI work: it makes the
 server exit non-zero if a device is missing, instead of degrading. The default is
@@ -1040,6 +1071,20 @@ degrade; the flag exists because some operators prefer to fail loudly and early.
 
 The one asymmetry: **an unwritable data directory is fatal, a missing camera is
 not.** Data loss is silent and unbounded; a missing camera is visible.
+
+That asymmetry is now carried by identity as well as writability, and the reason
+is worth recording. `storage.Check` originally probed writability only, on the
+reasoning that the interesting cases were a read-only or full filesystem. It
+missed the case that actually happened: the SSD drops off the USB bus — this one
+ended in `Synchronize Cache failed: hostbyte=0x07`, the disk vanishing mid-flush
+— and the mount point does not disappear. It becomes an ordinary directory on the
+root filesystem, still writable, so the probe passed. The OBC started, served
+telemetry, reported the artefact server healthy, and 5.4 GB of captures went to
+the SD card in two copies while the Ground Station listed none — not deleted,
+merely misfiled, which is why the OBC's report of success was entirely accurate
+about what had been written and entirely misleading about where. `[http] device`
+compares what is actually mounted against the disk named in the configuration,
+which makes that fatal instead.
 
 ---
 
@@ -1081,22 +1126,54 @@ implementation behind it changed.** There is not one for the three above either
 
 ---
 
-## 10. Vendored third-party code
+## 10. Third-party code
 
-`third_party/Read_uB` and `third_party/sdr-ettus-b200mini` are vendored
-**unmodified**, with their own makefiles. We did not clean them up and we will
-not, for two reasons: they work, and they are the only things standing between the
-project and an aircraft.
+Two programs run on the aircraft that this repository does not contain:
 
-Consequences we accept:
+| Program | Where it lives | How we consume it |
+| :--- | :--- | :--- |
+| `Read_uB` (GNSS) | `third_party/Read_uB` | `os/exec`, one per receiver |
+| the SDR acquisition program | `/root/rocsar-rpi/sdr-ettus-b200mini` on the Pi | `os/exec`, `internal/sdr` |
+
+**Neither is in git.** `third_party/` is gitignored as vendored upstream, and the
+SDR program was never there at all: it is built and installed on the aircraft by
+other people, and we drive it over `os/exec`. This section used to claim the SDR
+program was "vendored unmodified" in `third_party/`, which sent at least one
+engineer looking for a copy of a program that does not exist in the repository.
+There is nothing to modify here, which is the point: the boundary is a process
+boundary, not a source boundary.
+
+What that costs, and what we accept:
 
 - The 142-byte `UDP_message` is a **frozen contract**. We do not change it and we
   read it correctly; `test/gnss_test.go` decodes the real bytes and
   `TestGNSSDecodesDegreesNotRadians` is the test that exists because getting this
   wrong shipped a broken product.
 - `Read_uB` also sends a 420-byte `NavData` we do not read (§6.1).
-- The SDR program writes its output relative to its own working directory, so the
-  OBC sets the child's CWD explicitly rather than inheriting one.
+- **Three facts about the SDR program are duplicated into Go**, because it decides
+  them and we can only check our copies agree:
+  - `programConfigRelPath` (`internal/sdr/service.go`) — where it reads
+    `params.json`. This one is load-bearing: a directory not named
+    `sdr-ettus-b200mini` makes the program's derivation and ours disagree, and
+    `sdr_set_params` would report a successful write to a file it never reads.
+    `programParamsPath` compares them on every start and refuses a mismatch.
+  - `programCaptureRelPath` (`internal/sdr/capture.go`) — where it writes its
+    second copy. Checked before every acquisition, because that write has no
+    fallback and a missing directory aborts the process *after* a good session.
+  - `sdr.data_dir` in the configuration — its `SSD_PATH`. Checked against
+    `http.root` before every acquisition, for the same reason: an output path the
+    artefact server cannot serve is a capture nobody will ever see.
+- We cannot re-derive any of these from source in CI, because there is no source
+  here. `internal/sdr/params_contract.go`'s table and the aircraft's
+  `params.json` are therefore asserted against each other in
+  `params_contract_test.go` rather than against `config.hpp`. That test used to
+  read `third_party/…/config.hpp` and had been skipping for a long time; a
+  skipped pin is not a pin.
+- The SDR program writes to `/mnt/rocsar_ssd`, so the SSD is mounted there. It is
+  the only name for that filesystem: `http.root`, `sdr.data_dir` and the program's
+  `SSD_PATH` are one string. They were three (`/mnt/ssd`, `/mnt/rocsar_ssd`,
+  `/mnt/rocsar/data`) and the disagreement cost 5.4 GB of captures on the wrong
+  disk before anything noticed.
 
 ---
 
@@ -1130,7 +1207,8 @@ becomes a second home for a fact, and two homes drift.
 | `[client]` | `control_endpoint` | `tcp://127.0.0.1:5555` |
 | `[client]` | `telemetry_endpoint` | `tcp://127.0.0.1:5556` |
 | `[http]` | `addr` | `:5557` |
-| `[http]` | `root` | `/mnt/rocsar/data` |
+| `[http]` | `root` | `/mnt/rocsar_ssd` |
+| `[http]` | `device` | `a82c5820-9183-45ba-bf2f-a956f6dec4cd` |
 | `[link]` | `device` | `eth0` |
 | `[link]` | `rate_kbps` | `115` |
 | `[link]` | `shaping` | `true` |
@@ -1140,7 +1218,8 @@ becomes a second home for a fact, and two homes drift.
 | `[gnss]` | `selected` | `1` |
 | `[gnss]` | `stale_after` | `2s` |
 | `[camera]` | `device` | `/dev/video0` |
-| `[sdr]` | `program` | `third_party/sdr-ettus-b200mini` |
+| `[sdr]` | `program` | `/root/rocsar-rpi/sdr-ettus-b200mini` |
+| `[sdr]` | `data_dir` | `/mnt/rocsar_ssd` |
 | `[telemetry]` | `interval` | `1s` |
 | *(top level)* | `require_hardware` | `false` |
 
@@ -1160,7 +1239,31 @@ cap too low for a telemetry frame.
 `[sdr] program` is the one key whose value is **not** the thing its name
 suggests. It is a directory, not a program, and it is not where `connect` is
 found — that is on `PATH`. It must be named `sdr-ettus-b200mini`, for the
-C++'s hardcoded config path to resolve to the file the OBC edits; see §6.4.
+C++'s hardcoded config path to resolve to the file the OBC edits; see §6.4. Its
+default is an absolute path on the aircraft (`/root/rocsar-rpi/sdr-ettus-b200mini`)
+because the program is not in this repository; the previous default,
+`third_party/sdr-ettus-b200mini`, named a directory that has never existed here.
+
+`[http] root`, `[sdr] data_dir` and the acquisition program's own `#define
+SSD_PATH` must all be the same string, and they are all `/mnt/rocsar_ssd`. This
+is not tidiness. They were three different strings — the program's, `/mnt/ssd`,
+and a code default of `/mnt/rocsar/data` — and the result was 5.4 GB of captures
+written to the SD card in two copies while the Ground Station listed none, with
+no error anywhere: the acquisition's SSD write is wrapped in a `try`/`catch` that
+logs to stderr and continues. Nothing was deleted — the SSD was simply not
+mounted, so `/mnt/rocsar_ssd` was an ordinary directory on the SD card and every
+write succeeded into the wrong disk. `Connect` now checks that both destinations
+exist, are writable, and can hold the capture the configured parameters will
+produce, before the child starts.
+
+`[http] device` is the disk's filesystem UUID, asserted at startup. It exists
+because a USB drive dropping off the bus does not remove its mount point — it
+leaves a writable directory on the SD card, which passes every other check in
+`storage.Check`. This SSD did exactly that, twice. The check reads
+`/proc/self/mountinfo` rather than using `statfs`, because the kernel exposes only
+the first 8 bytes of an ext4 UUID through `struct statfs` and half a UUID cannot
+identify a disk. Set `device = ""` on a laptop, where there is no second
+filesystem to be on.
 
 There is no `[gui]` section and no `gui.*` key. `GUI_ARCHITECTURE.md` describes the
 Ground Station console's own settings; none of them are read by the OBC, and

@@ -21,7 +21,7 @@ func newTestFileServer(t *testing.T) (*httptest.Server, *storage.Store) {
 	t.Helper()
 
 	root := t.TempDir()
-	store := storage.New(root)
+	store := storage.New(root, "")
 	srv := httptest.NewServer(transport.NewFileHandler(store, nil))
 	t.Cleanup(srv.Close)
 	return srv, store
@@ -303,7 +303,7 @@ func bytesEqual(a, b []byte) bool {
 // as a successful capture by every layer above. Only decoding it catches that.
 func TestCameraMockProducesADecodableJPEG(t *testing.T) {
 	dir := t.TempDir()
-	store := storage.New(dir)
+	store := storage.New(dir, "")
 
 	cam := camera.NewMock("/dev/video0", "photos", store)
 

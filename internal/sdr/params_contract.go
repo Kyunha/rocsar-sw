@@ -9,9 +9,12 @@ import (
 //
 // # Why this file exists
 //
-// parameters.json is a frozen contract with C++ we do not maintain
-// (third_party/sdr-ettus-b200mini). Two facts about it dominate everything here,
-// and neither is obvious from reading our own code:
+// parameters.json is a frozen contract with C++ we do not maintain. The program
+// lives on the aircraft at /root/rocsar-rpi/sdr-ettus-b200mini and is NOT in this
+// repository -- third_party/ is gitignored as vendored upstream, so there is no
+// copy here to read and nothing here to modify. Two facts about that program
+// dominate everything in this file, and neither is obvious from reading our own
+// code:
 //
 //  1. THE PROGRAM DOES NO VALIDATION OF ITS OWN. config.hpp's load_config() is
 //     twelve `j.at("KEY").get<T>()` lines and not one range check. There is no
@@ -146,14 +149,21 @@ var Keys = []Key{
 
 // PULSE_DURATION is absent from this table on purpose.
 //
-// third_party/sdr-ettus-b200mini/parameters/config.hpp has:
+// The program's parameters/config.hpp has:
 //
 //	// c.pulse_duration = j.at("PULSE_DURATION").get<double>();
 //
 // Commented out. The program does not read it, so a key we expose as settable is
 // a control that does nothing. It was removed from domain.SdrParamsPatch and from
-// the SdrParams proto message. The key itself stays in the shipped params.json
-// -- harmless, and removing it would be an edit to a vendored file for no gain.
+// the SdrParams proto message. The key itself stays in the aircraft's params.json
+// -- harmless, and removing it would mean editing a file on the aircraft for no
+// gain.
+//
+// This is now a fact we assert rather than one we can re-derive: the program is
+// not in this repository, so there is no config.hpp here to check it against.
+// TestPulseDurationIsReadByNobody guards the Go side. When the program is
+// upgraded on the aircraft, read that line and confirm it is still commented
+// out.
 
 // keysByName indexes Keys.
 var keysByName = func() map[string]Key {

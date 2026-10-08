@@ -180,6 +180,8 @@ func (c *Config) assign(key string, raw any) error {
 		c.HTTP.Addr, err = str()
 	case "http.root":
 		c.HTTP.Root, err = str()
+	case "http.device":
+		c.HTTP.Device, err = str()
 
 	case "link.device":
 		c.Link.Device, err = str()
@@ -208,6 +210,8 @@ func (c *Config) assign(key string, raw any) error {
 		c.Camera.Device, err = str()
 	case "sdr.program":
 		c.SDR.Program, err = str()
+	case "sdr.data_dir":
+		c.SDR.DataDir, err = str()
 	case "telemetry.interval":
 		c.Telemetry.Interval, err = duration()
 	case "require_hardware":

@@ -542,6 +542,11 @@ func (a *App) SetLinkLimit(rateKbps uint32) CommandResult {
 	return a.runCommand("link", strconv.FormatUint(uint64(rateKbps), 10))
 }
 
+// SetTelemetryRate sets the telemetry publish interval in milliseconds.
+func (a *App) SetTelemetryRate(intervalMs uint32) CommandResult {
+	return a.runCommand("telemetry-rate", strconv.FormatUint(uint64(intervalMs), 10))
+}
+
 // ---------------------------------------------------------------------------
 // Artefacts
 // ---------------------------------------------------------------------------
@@ -887,6 +892,12 @@ func (a *App) Dispatch(method string, args []json.RawMessage) (interface{}, erro
 			return nil, err
 		}
 		return a.SetLinkLimit(kbps), nil
+	case "SetTelemetryRate":
+		ms, err := argUint(args, 0)
+		if err != nil {
+			return nil, err
+		}
+		return a.SetTelemetryRate(ms), nil
 
 	// Artefacts
 	case "ListArtefacts":

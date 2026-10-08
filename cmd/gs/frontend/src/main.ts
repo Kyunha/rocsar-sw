@@ -805,6 +805,7 @@ function wireCommands(): void {
     on('b-sdrcon', () => void call<Cmd>('SdrConnect').then((r) => cmdLine('sdr-connect', r)));
     on('b-sdrusb', () => void call<Cmd>('SdrResetUSB').then((r) => cmdLine('sdr-reset-usb', r)));
     on('b-link', () => void call<Cmd>('SetLinkLimit', numArg('in-link')).then((r) => cmdLine('link', r)));
+    on('b-telrate', () => void call<Cmd>('SetTelemetryRate', numArg('in-telrate')).then((r) => cmdLine('telrate', r)));
     on('b-params', () => void (async () => {
         try {
             const r = await call<Cmd>('SetSdrParams', {
@@ -959,7 +960,7 @@ function layout(): void {
         </section>
         <section class="p-csl"><h2>camera · sdr · link</h2><div id="csl"></div>
           <div class="row"><button id="b-photo">photo</button> <button id="b-probe">sdr probe</button> <button id="b-sdrcon">sdr connect</button> <button id="b-sdrusb">sdr reset usb</button></div>
-          <div class="row"><input id="in-link" size="6" value="115"><button id="b-link">set limit kbit</button> <button id="b-query">query</button></div>
+          <div class="row"><input id="in-link" size="6" value="115"><button id="b-link">set limit kbit</button> <input id="in-telrate" size="5" value="1000"><button id="b-telrate">set telemetry ms</button> <button id="b-query">query</button></div>
           <div class="row" id="cmd-result"></div>
           <div class="row"><span>sdr params (blank = leave alone)</span></div>
           <div id="param-rows"></div>

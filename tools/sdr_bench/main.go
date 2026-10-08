@@ -41,10 +41,12 @@ func main() {
 }
 
 func run() error {
-	program := flag.String("program", "third_party/sdr-ettus-b200mini",
+	program := flag.String("program", "/root/rocsar-rpi/sdr-ettus-b200mini",
 		"directory holding parameters/ and Data/ -- NOT the connect binary, which is found on PATH")
-	dataDir := flag.String("data", "/mnt/rocsar/data",
+	dataDir := flag.String("data", "/mnt/rocsar_ssd",
 		"data directory, where SDR logs are written")
+	captureDir := flag.String("capture", "/mnt/rocsar_ssd",
+		"where the acquisition program writes captures (its SSD_PATH); checked before connect")
 	flag.Parse()
 
 	args := flag.Args()
@@ -53,7 +55,7 @@ func run() error {
 		return errors.New("no command given")
 	}
 
-	svc := sdr.NewService(*program, *dataDir, discardLogger())
+	svc := sdr.NewService(*program, *dataDir, *captureDir, discardLogger())
 	ctx := context.Background()
 
 	switch args[0] {

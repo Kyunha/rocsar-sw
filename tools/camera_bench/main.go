@@ -50,7 +50,7 @@ func run() error {
 		return fmt.Errorf("no camera at %s", *device)
 	}
 
-	store := storage.New(*dir)
+	store := storage.New(*dir, "")
 	if err := store.Check(); err != nil {
 		return fmt.Errorf("data directory: %w", err)
 	}

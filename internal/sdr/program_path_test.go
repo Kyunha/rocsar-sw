@@ -102,7 +102,7 @@ func TestProgramAndServiceAgreeOnTheParamsFile(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	s := NewService(prog, dir, discardLogger())
+	s := NewService(prog, dir, dir, discardLogger())
 	got, err := s.programParamsPath()
 	if err != nil {
 		t.Fatalf("a correctly named program directory was rejected: %v", err)
@@ -127,7 +127,7 @@ func TestAMisnamedProgramDirectoryIsRefused(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	s := NewService(prog, dir, discardLogger())
+	s := NewService(prog, dir, dir, discardLogger())
 	err := s.CheckProgramConfig()
 	if err == nil {
 		t.Fatal("a program directory the C++ cannot resolve was accepted; " +
@@ -167,7 +167,7 @@ func TestASymlinkedProgramDirectoryIsAccepted(t *testing.T) {
 
 	// Through the link the C++ reaches the real directory's file; through the
 	// link the service reaches it too, and SameFile settles it.
-	s := NewService(link, dir, discardLogger())
+	s := NewService(link, dir, dir, discardLogger())
 	if _, err := s.programParamsPath(); err != nil {
 		t.Errorf("a symlinked program directory was refused: %v", err)
 	}
@@ -194,7 +194,7 @@ func TestConnectRefusesAMisnamedDirectoryWithoutStarting(t *testing.T) {
 	t.Setenv("PATH", binDir)
 
 	started := false
-	s := NewService(prog, logRoot, discardLogger())
+	s := NewService(prog, logRoot, logRoot, discardLogger())
 	s.start = func(context.Context, string, string, []string, *os.File) (int, <-chan exitInfo, error) {
 		started = true
 		return 0, nil, nil

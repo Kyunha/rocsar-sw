@@ -90,15 +90,20 @@ nix-shell                                  # or install the prerequisites above
 
 `./scripts/dev.sh` starts the OBC with all three subsystems simulated and follows
 it with the console. It overrides the data root to `./data` (gitignored) because
-`rocsar.toml` ships `http.root = "/mnt/ssd"`, which exists only on the Pi, and a
-missing data root is a **fatal** startup error rather than something the OBC
-creates for you. Ctrl-C stops both processes.
+`rocsar.toml` ships `http.root = "/mnt/rocsar_ssd"`, which exists only on the Pi, and
+a missing data root is a **fatal** startup error rather than something the OBC
+creates for you. It also clears `http.device`, because there is no second
+filesystem to be on locally and the device assertion is for the aircraft.
+Ctrl-C stops both processes.
 
 In a second terminal, without the helper:
 
 ```sh
 mkdir -p data
-ROCSAR_HTTP_ROOT="$PWD/data" go run ./cmd/obc --mock-pico --mock-camera --mock-sdr
+# ROCSAR_HTTP_DEVICE="" as well as the root: the shipped value names the
+# aircraft's SSD, and ./data is not mounted on it. See scripts/dev.sh.
+ROCSAR_HTTP_ROOT="$PWD/data" ROCSAR_HTTP_DEVICE="" \
+  go run ./cmd/obc --mock-pico --mock-camera --mock-sdr
 
 go run ./tools/gs_cli \
   -control tcp://127.0.0.1:5555 \
@@ -567,7 +572,8 @@ explicit flag  >  ROCSAR_* environment  >  rocsar.toml  >  code default
 | `client.telemetry_endpoint` | `tcp://127.0.0.1:5556` | GS → OBC telemetry. Read by `cmd/gs`. |
 | `client.http_endpoint` | `http://127.0.0.1:5557` | GS → OBC artefact server. Read by `cmd/gs`. |
 | `http.addr` | `:5557` | Artefact server. |
-| `http.root` | `/mnt/ssd` | Data directory. Must exist. |
+| `http.root` | `/mnt/rocsar_ssd` | The SSD's mount point, and the data directory. Must exist. |
+| `http.device` | `a82c5820-…` | Filesystem UUID the data root must be on. Asserted at startup. `""` on a laptop. |
 | `link.device` | `eth0` | Interface for HTB shaping. |
 | `link.rate_kbps` | `115` | Link cap. A property of the radio, not a knob. |
 | `link.shaping` | `true` | Install the HTB hierarchy. Needs `CAP_NET_ADMIN`. Off means the link is **unbounded**, not merely unshaped. |
@@ -577,7 +583,8 @@ explicit flag  >  ROCSAR_* environment  >  rocsar.toml  >  code default
 | `gnss.selected` | `1` | Trusted receiver, by 1-based position in `ports`. |
 | `gnss.stale_after` | `2s` | Fix age past which `fix_ok` goes false. |
 | `camera.device` | `/dev/video0` | The node `fswebcam` reads. |
-| `sdr.program` | `third_party/sdr-ettus-b200mini` | Directory holding `parameters/` and `Data/` — **not** the `connect` binary, which is found on `PATH`. Must be named `sdr-ettus-b200mini`; see below. |
+| `sdr.program` | `/root/rocsar-rpi/sdr-ettus-b200mini` | Directory holding `parameters/` and `Data/` — **not** the `connect` binary, which is found on `PATH`. Must be named `sdr-ettus-b200mini`; see below. |
+| `sdr.data_dir` | `/mnt/rocsar_ssd` | Where the program writes captures (its `SSD_PATH`). Must equal `http.root`. |
 | `telemetry.interval` | `1s` | Frame rate. |
 | `require_hardware` | `false` | Missing hardware is fatal instead of degraded. |
 
@@ -628,6 +635,45 @@ Two things about that value, both of which look like pedantry and are not:
   old values. The OBC refuses to start an acquisition in that case rather than
   flying a silent mismatch, and `sdr_bench validate` says the same thing on the
   bench.
+
+The program is **not in this repository**. `third_party/` is gitignored as
+vendored upstream, and the acquisition program was never there — it is built and
+installed on the aircraft, and the OBC drives it over `os/exec`. That is why
+`sdr.program`'s default is an absolute path on the Pi rather than something
+relative to a checkout. ARCHITECTURE.md §10 records the three facts about the
+program we duplicate into Go, and why each has to be.
+
+### The SSD on the Pi
+
+One filesystem, one name: `/mnt/rocsar_ssd`. That is simultaneously the mount
+point, the acquisition program's `#define SSD_PATH`, `http.root`, and
+`sdr.data_dir`.
+
+It used to be three names — the program's `/mnt/rocsar_ssd`, `rocsar.toml`'s
+`/mnt/ssd`, and a code default of `/mnt/rocsar/data` — and 5.4 GB of captures went
+to the SD card in duplicate while the Ground Station listed none. Nothing was
+deleted; with the SSD unmounted, `/mnt/rocsar_ssd` was an ordinary directory on
+the card and every write succeeded into the wrong disk. Nothing reported an error,
+because the program's SSD write is wrapped in a `try`/`catch` that logs to stderr
+and carries on, and because a dropped USB drive leaves its mount point behind as
+an ordinary writable directory.
+
+Two settings exist because of that:
+
+- **`http.device`** names the disk's filesystem UUID and is asserted at startup
+  against `/proc/self/mountinfo`. A USB drive that drops off the bus does not
+  remove its mount point, so a writability probe cannot tell the SSD from the
+  directory that used to be it. This is the check that turns that failure into a
+  refusal to start.
+- **`sdr.data_dir`** is checked before every acquisition, along with
+  `<sdr.program>/Data/raw_data/`, the program's second copy — which has no
+  fallback and whose absence aborts the process *after* a successful session. The
+  required space is computed from `params.json` with the program's own
+  arithmetic, so an acquisition that cannot fit is refused before the radio is
+  touched rather than partway through.
+
+On the Pi, set `http.device = ""` only if the SSD is genuinely not the data
+disk — the check is the point. On a laptop, clear both, as `scripts/dev.sh` does.
 
 ---
 

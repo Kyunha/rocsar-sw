@@ -105,7 +105,7 @@ func TestAServerWriteDeadlineTruncatesAPacedTransfer(t *testing.T) {
 // in ARCHITECTURE.md 6.6; IdleTimeout still reaps idle keep-alives.
 func TestTheArtefactServerHasNoWriteDeadline(t *testing.T) {
 	dir := t.TempDir()
-	store := storage.New(dir)
+	store := storage.New(dir, "")
 	if err := store.WriteFileAtomic("a.bin", []byte("seed"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -140,7 +140,7 @@ func TestTheArtefactServerHasNoWriteDeadline(t *testing.T) {
 // be asserted alongside pacing tests; the pacing is gone and these are not.
 func TestRangeStillReturnsTheRightSliceUnpaced(t *testing.T) {
 	dir := t.TempDir()
-	store := storage.New(dir)
+	store := storage.New(dir, "")
 	body := strings.Repeat("0123456789", 400) // 4000 bytes
 	if err := store.WriteFileAtomic("slice.bin", []byte(body), 0o644); err != nil {
 		t.Fatal(err)
@@ -176,7 +176,7 @@ func TestRangeStillReturnsTheRightSliceUnpaced(t *testing.T) {
 // the same file and is worth keeping explicitly pinned.
 func TestTraversalIsStillRefused(t *testing.T) {
 	root := t.TempDir()
-	store := storage.New(root)
+	store := storage.New(root, "")
 	if err := store.WriteFileAtomic("inside.txt", []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}

@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -26,11 +27,22 @@ var (
 	// outside the root after cleaning is a bug or an attack, and quietly
 	// clamping it to the root would turn either into a wrong-but-successful read.
 	ErrEscapesRoot = errors.New("storage: path escapes the data directory")
+
+	// ErrWrongDevice is returned when the data root is not on the filesystem the
+	// configuration named. It is separate from ErrNoRoot because the failure
+	// modes are opposite: ErrNoRoot says nothing is there, ErrWrongDevice says
+	// something is there and it is the wrong thing. A caller that collapses them
+	// into one message tells an operator with a missing mount to go looking for
+	// a missing directory.
+	ErrWrongDevice = errors.New("storage: data directory is on the wrong filesystem")
 )
 
 // Store is the data directory.
 type Store struct {
 	root string
+	// device is the filesystem identity the root is expected to have, as a UUID
+	// or a label. Empty asserts nothing. See Check.
+	device string
 }
 
 // New returns a store rooted at dir.
@@ -39,16 +51,41 @@ type Store struct {
 // separate step because an unwritable data directory is the one failure that is
 // fatal at startup while every other missing device merely degrades -- see
 // ARCHITECTURE.md 8.
-func New(dir string) *Store { return &Store{root: dir} }
+//
+// device is the filesystem the root is expected to be, as a UUID or a label, and
+// may be empty to assert nothing. See Check for why that distinction is the
+// whole point.
+func New(dir, device string) *Store { return &Store{root: dir, device: device} }
 
 // Root returns the data directory.
 func (s *Store) Root() string { return s.root }
 
-// Check verifies the directory exists and is writable.
+// Check verifies the directory exists, is writable, and is on the filesystem the
+// operator named.
 //
 // Called once at startup and its failure is fatal. Everything written here is
 // flight data: a SAR capture, a photograph, an SDR log. Losing it silently is
 // worse than not starting, because the operator finds out at landing.
+//
+// # Why the device check exists
+//
+// Writability is not identity. When the SSD drops off the USB bus -- and it did,
+// twice, both times ending in "Synchronize Cache failed: hostbyte=0x07", which
+// is the drive vanishing mid-flush -- the mount point does not disappear. It
+// becomes an ordinary directory on the root filesystem, still there, still
+// writable, and every writability probe passes. So the OBC started, served
+// telemetry, reported the artefact server healthy, and listed an empty
+// directory while the acquisition program wrote 59 captures and 2.8 GB to the
+// SD card next to it. The operator's only sign was that the Ground Station showed
+// nothing, which reads as a bug in the console.
+//
+// That failure is now fatal here rather than silent, and it says which
+// filesystem it found instead of the one that was wanted.
+//
+// An empty device asserts nothing. That is the laptop case: a development
+// checkout points http.root at a directory under the working tree and there is no
+// second filesystem to be on, so asking for one would fail every bench run. The
+// aircraft names the device; the bench does not.
 func (s *Store) Check() error {
 	info, err := os.Stat(s.root)
 	if err != nil {
@@ -56,6 +93,10 @@ func (s *Store) Check() error {
 	}
 	if !info.IsDir() {
 		return fmt.Errorf("%w: %s is not a directory", ErrNoRoot, s.root)
+	}
+
+	if err := s.checkDevice(); err != nil {
+		return err
 	}
 
 	// Writability is probed rather than inferred from the mode bits, because the
@@ -71,6 +112,159 @@ func (s *Store) Check() error {
 		return fmt.Errorf("%w: could not clean up the probe file: %s", ErrNoRoot, err)
 	}
 	return nil
+}
+
+// checkDevice confirms that the filesystem under the root is the one the
+// operator named.
+//
+// # Why not statfs
+//
+// The first version used statfs, and it could not work: Linux exposes only the
+// first 8 bytes of an ext4 UUID through struct statfs (f_type is the superblock
+// magic and f_fsid is the high and low halves of the UUID), so a 16-byte
+// filesystem UUID is not recoverable from it on a 64-bit kernel. Half a UUID
+// would have been a check that could not distinguish the aircraft's disk from
+// another disk sharing a UUID prefix, which is precisely the confusion this
+// exists to end.
+//
+// mountinfo is the interface that answers the question properly. It is a
+// documented, stable kernel interface, readable without any capability, and it
+// states what is mounted where in full -- including the device, which is then
+// compared against the symlink the configured UUID resolves to.
+//
+// The device must be attached AND mounted. A drive that is absent is a different
+// failure from one that is present and unmounted, and they are reported
+// differently: the first means cable, power or a dead disk, the second means
+// fstab did not do its job. Both refuse, because the operator cannot tell them
+// apart from the symptom.
+func (s *Store) checkDevice() error {
+	if s.device == "" {
+		return nil
+	}
+
+	want, err := filepath.EvalSymlinks(filepath.Join(diskByUUIDDir, s.device))
+	if err != nil {
+		return fmt.Errorf("%w: the disk %q is not attached to this system (%s is missing).\n"+
+			"  The data root cannot be checked because there is nothing to check it against.\n"+
+			"  Check the cable, the hub's power, and `lsblk` before anything else.",
+			ErrWrongDevice, s.device, filepath.Join(diskByUUIDDir, s.device))
+	}
+
+	mounted, err := filesystemAt(s.root)
+	if err != nil {
+		return fmt.Errorf("%w: cannot read mountinfo: %s", ErrWrongDevice, err)
+	}
+	if mounted == nil {
+		return fmt.Errorf("%w: no filesystem is mounted at %s.\n"+
+			"  The directory exists, which is why every writability check passed, but\n"+
+			"  it is an ordinary directory on the root filesystem. Anything written there\n"+
+			"  would go to the wrong disk. Check `mount` and /etc/fstab.",
+			ErrWrongDevice, s.root)
+	}
+
+	got, err := filepath.EvalSymlinks(mounted.source)
+	if err != nil {
+		// A source that is not a path we can resolve -- a network or overlay
+		// mount -- is reported as itself rather than being treated as a match.
+		got = mounted.source
+	}
+
+	if got != want {
+		return fmt.Errorf("%w: %s is on %s (%s) but %q was configured, which is %s.\n"+
+			"  Either the disk was not mounted, or a different one is. Refusing rather\n"+
+			"  than starting: flight data written now would land on the wrong disk and\n"+
+			"  be reported as saved.",
+			ErrWrongDevice, s.root, mounted.source, mounted.fstype, s.device, want)
+	}
+	return nil
+}
+
+// diskByUUIDDir is where udev publishes filesystem UUIDs as symlinks.
+const diskByUUIDDir = "/dev/disk/by-uuid"
+
+// filesystemAt reports the filesystem mounted at or above path, or nil if none is.
+//
+// The longest matching mount point wins, so a root inside a mounted filesystem
+// resolves to that filesystem rather than to "/" -- which is what makes the
+// check meaningful, since /mnt/rocsar_ssd is not itself a mount point when the
+// SSD is missing but the mount table still lists "/" as covering it.
+func filesystemAt(path string) (*mount, error) {
+	body, err := os.ReadFile("/proc/self/mountinfo")
+	if err != nil {
+		return nil, err
+	}
+
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return nil, err
+	}
+
+	var best *mount
+	for _, line := range strings.Split(string(body), "\n") {
+		if line == "" {
+			continue
+		}
+		// id parent maj:min root mountpoint options [optional...] - fstype source superopts
+		pre, post, ok := strings.Cut(line, " - ")
+		if !ok {
+			continue
+		}
+		fields := strings.Fields(pre)
+		if len(fields) < 5 {
+			continue
+		}
+		point := unescapeMount(fields[4])
+		// HasPrefix against point+"/" is wrong for point == "/", where it asks
+		// whether the path begins "//" and the root mount then matches nothing but
+		// itself -- so a data root anywhere on the root filesystem reported no
+		// filesystem at all, which is the one case this exists to detect. The
+		// root is handled separately and needs no separator.
+		under := point == "/" || strings.HasPrefix(abs, point+"/")
+		if abs != point && !under {
+			continue
+		}
+		rest := strings.Fields(post)
+		if len(rest) < 2 {
+			continue
+		}
+		if best == nil || len(point) > len(best.point) {
+			best = &mount{point: point, fstype: rest[0], source: rest[1]}
+		}
+	}
+	return best, nil
+}
+
+// mount is one line of mountinfo, reduced to what the check compares.
+type mount struct {
+	point  string
+	fstype string
+	source string
+}
+
+// unescapeMount decodes the octal escapes the kernel writes into mount paths.
+//
+// The interface allows space and three others in a mount point, and the kernel
+// escapes them as \040 and friends. Without this, a mount point containing a
+// space would never compare equal to its own path and the check would report a
+// mismatch that does not exist. mountinfo's escaping is octal with exactly three
+// digits.
+func unescapeMount(s string) string {
+	if !strings.Contains(s, `\`) {
+		return s
+	}
+	var b strings.Builder
+	for i := 0; i < len(s); {
+		if s[i] == '\\' && i+3 < len(s) {
+			if v, err := strconv.ParseUint(s[i+1:i+4], 8, 8); err == nil {
+				b.WriteByte(byte(v))
+				i += 4
+				continue
+			}
+		}
+		b.WriteByte(s[i])
+		i++
+	}
+	return b.String()
 }
 
 // Resolve turns a caller-supplied relative name into an absolute path inside the
@@ -240,10 +434,16 @@ var (
 	// "cam" followed by "era", not by "-". Every photograph the system took was
 	// therefore classified `unknown` and listed as such.
 	cameraName = regexp.MustCompile(`^cam(era)?-.*\.(jpg|jpeg)$`)
-	// The vendored program writes `Data/rx_data_<localtime>.bin`, so the
-	// timestamp is part of the stem and the pattern has to allow for it. An
+	// The acquisition program writes `rx_data_<localtime>.bin` into its SSD_PATH,
+	// so the timestamp is part of the stem and the pattern has to allow for it. An
 	// earlier version anchored `rx_data` directly against the extension and
 	// matched nothing the program actually produces.
+	//
+	// The directory does not appear in the pattern because a listing is relative
+	// to the root. The program's own second copy goes to
+	// <programDir>/Data/raw_data/, which is outside the root and so never listed
+	// here -- deliberately: it is a duplicate of a capture already served, and
+	// showing both would have the operator download the same 34 MB twice.
 	sdrName = regexp.MustCompile(`^(rx_data.*|.*sar.*)\.(bin|dat)$`)
 	logName = regexp.MustCompile(`.*\.(log|txt)$`)
 )

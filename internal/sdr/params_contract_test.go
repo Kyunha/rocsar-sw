@@ -13,38 +13,69 @@ import (
 	"github.com/rocsar/obc/internal/domain"
 )
 
-// paramsPath is the vendored program's own file.
-func paramsPath(t *testing.T) string {
-	t.Helper()
-	return filepath.Join("..", "..", "third_party", "sdr-ettus-b200mini", "parameters", "params.json")
-}
-
-// The shipped params.json must satisfy every constraint the contract table
-// states, and every key the C++ requires must be present.
+// The operating point the aircraft actually flies must satisfy every constraint
+// the contract table states, and contain every key config.hpp reads.
+//
+// # Why this is a literal and not a file
+//
+// It used to read third_party/sdr-ettus-b200mini/parameters/params.json, and
+// skip when that tree was absent -- which it always was, because third_party/ is
+// gitignored as vendored upstream and this repository has never carried the
+// program. The four tests built on that file were permanently skipped and had
+// stopped checking anything without saying so.
+//
+// So the aircraft's parameters are written out here instead: the exact contents
+// of /root/rocsar-rpi/sdr-ettus-b200mini/parameters/params.json as of the
+// bistatic 5.85 GHz operating point. That keeps the guarantee the file-reading
+// test gave -- the shipped values are checked against the real table, so an
+// invented bound fails here -- without a vendored tree to go missing.
+//
+// What this cannot do is notice that the aircraft's file has been edited since.
+// That is a deliberate trade: a check that always runs and pins known-good
+// values is worth more than one that would run only where the program happens to
+// be installed, which is nowhere in CI. Anyone changing the aircraft's
+// parameters.json should update this literal in the same commit, and
+// TestOperatingPointIsValid below is the place to notice.
 //
 // This is the test that stops a bound from being invented. The first version of
 // this file asserted values against numbers nobody had checked; three of the
 // seven turned out to be wrong against the Ettus datasheet (FS was 16x the
-// hardware maximum, TX_FREQ's floor was 70x too low, BW was 18x too high). A
-// test that reads the real file and applies the real table cannot be wrong in
-// the same way twice.
-func TestShippedParamsSatisfyTheContract(t *testing.T) {
-	body, err := os.ReadFile(paramsPath(t))
-	if err != nil {
-		t.Skipf("vendored params.json not present: %v", err)
-	}
+// hardware maximum, TX_FREQ's floor was 70x too low, BW was 18x too high).
+const aircraftParamsJSON = `{
+  "AUTO_CONNECT_ENABLED": 1,
+  "AUTO_CONNECT_INTERVAL": 300,
+  "TEMP_FETCH_INTERVAL": 1,
+  "SERVER_LOG_FILE_ENABLED": 1,
+  "PRF": 2750.0,
+  "FS": 31251000.0,
+  "SESSION_DURATION": 1,
+  "TX_FREQ": 5850000000.0,
+  "NORMALIZED_GAIN_TX": 1,
+  "NORMALIZED_GAIN_RX": 1,
+  "TX_ANTENNA": "TX/RX",
+  "RX_ANTENNA": "RX2",
+  "T_MIN_US": 100,
+  "T_MAX_US": 200,
+  "START_OFFSET_S": 0.1,
+  "CLOCK_SOURCE": "internal",
+  "TIME_SOURCE": "internal",
+  "SYNC_TO_PPS": false,
+  "PULSE_DURATION": 3.64e-05,
+  "BW": 25000000.0
+}`
 
+func TestShippedParamsSatisfyTheContract(t *testing.T) {
 	raw := map[string]any{}
-	if err := json.Unmarshal(body, &raw); err != nil {
-		t.Fatalf("params.json does not parse: %v", err)
+	if err := json.Unmarshal([]byte(aircraftParamsJSON), &raw); err != nil {
+		t.Fatalf("the aircraft's params.json does not parse: %v", err)
 	}
 
 	// 1. Every required key present. j.at() throws on a missing one, from inside
 	//    main(), before any radio is initialised.
 	for _, name := range RequiredNames() {
 		if _, ok := raw[name]; !ok {
-			t.Errorf("params.json is missing %q, which config.hpp reads with j.at(); "+
-				"connect.cpp will throw at startup", name)
+			t.Errorf("the aircraft's params.json is missing %q, which config.hpp reads "+
+				"with j.at(); connect.cpp will throw at startup", name)
 		}
 	}
 
@@ -55,82 +86,24 @@ func TestShippedParamsSatisfyTheContract(t *testing.T) {
 			continue // a string parameter, or absent (covered above)
 		}
 		if err := ValidateValue(k.Name, v); err != nil {
-			t.Errorf("the SHIPPED params.json violates the contract: %v\n"+
+			t.Errorf("the aircraft's params.json violates the contract: %v\n"+
 				"  provenance: %s", err, k.Provenance)
 		}
 	}
 }
 
-// The required set must match config.hpp exactly. If they drift, one of two
-// things is true and both are bad: we reject a working file, or we accept a
-// broken one. The C++ source is the authority, so it is read here.
-func TestRequiredKeysMatchTheVendoredConfigHeader(t *testing.T) {
-	header, err := os.ReadFile(filepath.Join("..", "..", "third_party",
-		"sdr-ettus-b200mini", "parameters", "config.hpp"))
-	if err != nil {
-		t.Skipf("vendored config.hpp not present: %v", err)
-	}
-	src := string(header)
-
-	// j.at("KEY") is a required read. A commented-out one is not, which is the
-	// whole reason PULSE_DURATION is absent from the table.
-	inCode := map[string]bool{}
-	for _, line := range strings.Split(src, "\n") {
-		if !strings.Contains(line, `j.at("`) {
-			continue
-		}
-		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "//") {
-			continue // the PULSE_DURATION case
-		}
-		i := strings.Index(line, `j.at("`)
-		rest := line[i+len(`j.at("`):]
-		j := strings.Index(rest, `"`)
-		if j > 0 {
-			inCode[rest[:j]] = true
-		}
-	}
-
-	if len(inCode) == 0 {
-		t.Fatal("found no j.at() reads in config.hpp; the parse is broken")
-	}
-
-	declared := map[string]bool{}
-	for _, n := range RequiredNames() {
-		declared[n] = true
-	}
-
-	for name := range inCode {
-		if !declared[name] {
-			t.Errorf("config.hpp reads %q with j.at() but the contract does not require it; "+
-				"a file missing it will throw at startup and we would not have noticed", name)
-		}
-	}
-	for _, n := range RequiredNames() {
-		if !inCode[n] {
-			t.Errorf("the contract requires %q but config.hpp does not read it with j.at(); "+
-				"requiring it rejects a file the program would accept", n)
-		}
-	}
-}
-
-// PULSE_DURATION is read by nobody. If a future firmware revision uncomments
-// that line, the contract must gain the key -- and this is what notices.
+// PULSE_DURATION is read by nobody: config.hpp has that line commented out, so
+// exposing it as a control would be a knob that does nothing.
+//
+// The C++ side of this check -- reading config.hpp to see whether the line has
+// been uncommented upstream -- is gone along with the vendored tree. What remains
+// is the half that is still ours to enforce: the key must not be in the contract,
+// because nothing reads it. If a future firmware revision uncomments it, this is
+// the test that has to be revisited, and its failure message says so.
 func TestPulseDurationIsReadByNobody(t *testing.T) {
 	if _, ok := Lookup("PULSE_DURATION"); ok {
 		t.Error("PULSE_DURATION is in the contract; config.hpp may now read it. " +
 			"If it does, re-add it to domain.SdrParamsPatch and the SdrParams proto message.")
-	}
-
-	header, err := os.ReadFile(filepath.Join("..", "..", "third_party",
-		"sdr-ettus-b200mini", "parameters", "config.hpp"))
-	if err != nil {
-		t.Skipf("vendored config.hpp not present: %v", err)
-	}
-	for _, line := range strings.Split(string(header), "\n") {
-		if strings.Contains(line, `j.at("PULSE_DURATION")`) && !strings.HasPrefix(strings.TrimSpace(line), "//") {
-			t.Error("config.hpp now reads PULSE_DURATION uncommented; the contract is stale")
-		}
 	}
 }
 
@@ -245,38 +218,36 @@ func TestUnknownKeyIsNotValidated(t *testing.T) {
 	}
 }
 
-// connect.cpp hardcodes its config path relative to the working directory:
+// programConfigRelPath is a copy of a line of C++ we do not maintain:
 //
 //	const Config cfg = load_config("./../sdr-ettus-b200mini/parameters/params.json");
 //
-// That is the reason the child's CWD is set explicitly, and it is the reason
-// programConfigRelPath had to be copied into Go: the C++ decides which file a
-// capture reads, and the OBC has to check its own derivation against it.
+// It had a test that pinned both sides by reading that C++ file, and the test
+// had been skipping for some time -- third_party/ is gitignored, this repository
+// does not carry the program, so there was never a file there to read. A skipped
+// pin is not a pin.
 //
-// So this test pins BOTH sides. If the C++ line changes, the constant is stale
-// and the check in programParamsPath would be validating against a path the
-// program no longer uses -- silently, because the comparison would still pass.
-// This is the test that makes the duplicated constant safe to keep.
-func TestConfigPathIsHardcodedRelativeToCWD(t *testing.T) {
-	src, err := os.ReadFile(filepath.Join("..", "..", "third_party",
-		"sdr-ettus-b200mini", "connect.cpp"))
-	if err != nil {
-		t.Skipf("vendored connect.cpp not present: %v", err)
-	}
-	const cppPath = "./../sdr-ettus-b200mini/parameters/params.json"
-	if !strings.Contains(string(src), cppPath) {
-		t.Errorf("connect.cpp no longer hardcodes %s.\n"+
-			"  The child's working directory is set to the program directory precisely to\n"+
-			"  satisfy that path. If it changed, re-check how Service.Connect sets cmd.Dir,\n"+
-			"  and update programConfigRelPath to match.", cppPath)
-	}
+// What is checkable without the program is the half that is ours: the constant
+// must resolve, relative to the program directory, to the file the Service edits.
+// If it does not, programParamsPath's comparison is against a path the program
+// never opens, and it would pass while checking nothing -- which is exactly the
+// silent failure programParamsPath exists to prevent.
+//
+// The rest -- that connect.cpp still says what it said -- is a fact about the
+// aircraft, not about this repository. When the program is upgraded there, read
+// the line in connect.cpp and confirm it matches. The refusal is in place either
+// way: programParamsPath compares this constant against paramsPath() on every
+// start, so a program that changed its mind is caught in the air rather than
+// trusted from here.
+func TestTheConfigPathConstantResolvesToTheFileWeEdit(t *testing.T) {
+	s := &Service{programDir: "/opt/vendor/sdr-ettus-b200mini"}
 
-	// The Go copy, compared after stripping the C++'s leading "./", which
-	// filepath.Join would discard anyway.
-	if got, want := programConfigRelPath, strings.TrimPrefix(cppPath, "./"); got != want {
-		t.Errorf("programConfigRelPath = %q but connect.cpp uses %q.\n"+
-			"  These are two homes for one fact. Update the constant, or the\n"+
-			"  programParamsPath check will validate a path the program never reads.",
+	got := filepath.Clean(filepath.Join(s.programDir, programConfigRelPath))
+	want := s.paramsPath()
+	if got != want {
+		t.Errorf("programConfigRelPath resolves to %q but the Service edits %q.\n"+
+			"  programParamsPath compares these on every start, so this mismatch means\n"+
+			"  every check it performs is validating a file the program never reads.",
 			got, want)
 	}
 }
@@ -315,7 +286,7 @@ func TestPartialUpdatePreservesUnmodelledKeys(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	s := NewService(prog, dir, discardLogger())
+	s := NewService(prog, dir, dir, discardLogger())
 	prf := 3000.0
 	if err := s.SetParams(context.Background(), domain.SdrParamsPatch{PRFHz: &prf}); err != nil {
 		t.Fatalf("SetParams: %v", err)
@@ -378,7 +349,7 @@ func TestMissingRequiredKeyIsRefused(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	s := NewService(prog, dir, discardLogger())
+	s := NewService(prog, dir, dir, discardLogger())
 	prf := 3000.0
 	err := s.SetParams(context.Background(), domain.SdrParamsPatch{PRFHz: &prf})
 	if err == nil {

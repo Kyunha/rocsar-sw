@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"time"
 
 	"google.golang.org/protobuf/proto"
 
@@ -42,6 +43,8 @@ type Dispatcher struct {
 	link    domain.LinkShaper
 	heaters *HeaterKeeper
 
+	setTelemetryInterval func(time.Duration)
+
 	log *slog.Logger
 
 	// serial numbers successful responses, so a client can tell a repeat from a
@@ -63,6 +66,10 @@ type Deps struct {
 	Link    domain.LinkShaper
 	Heaters *HeaterKeeper
 	Log     *slog.Logger
+
+	// SetTelemetryInterval changes the telemetry publish interval at runtime.
+	// A nil callback means the rate is fixed (tests, or a pipeline not wired).
+	SetTelemetryInterval func(time.Duration)
 }
 
 // New returns a dispatcher.
@@ -71,14 +78,15 @@ func New(d Deps) *Dispatcher {
 		d.Log = slog.Default()
 	}
 	return &Dispatcher{
-		pico:    d.Pico,
-		gnss:    d.GNSS,
-		camera:  d.Camera,
-		sdr:     d.SDR,
-		link:    d.Link,
-		heaters: d.Heaters,
-		log:     d.Log,
-		seen:    make(map[string]uint64),
+		pico:                 d.Pico,
+		gnss:                 d.GNSS,
+		camera:               d.Camera,
+		sdr:                  d.SDR,
+		link:                 d.Link,
+		heaters:              d.Heaters,
+		setTelemetryInterval: d.SetTelemetryInterval,
+		log:                  d.Log,
+		seen:                 make(map[string]uint64),
 	}
 }
 
@@ -129,6 +137,8 @@ func (d *Dispatcher) Handle(ctx context.Context, req *rocsarv1.CommandRequest) *
 		return d.gnssSelect(req.GetRequestId(), p.GnssSelect)
 	case *rocsarv1.CommandRequest_LinkSetLimit:
 		return d.linkSetLimit(ctx, req.GetRequestId(), p.LinkSetLimit)
+	case *rocsarv1.CommandRequest_TelemetrySetRate:
+		return d.telemetrySetRate(req.GetRequestId(), p.TelemetrySetRate)
 	case *rocsarv1.CommandRequest_QueryStatus:
 		return ok(req.GetRequestId(), "status is reported in the telemetry frame")
 	case *rocsarv1.CommandRequest_SystemReset:
@@ -167,6 +177,8 @@ func commandName(req *rocsarv1.CommandRequest) string {
 		return "gnss.select"
 	case *rocsarv1.CommandRequest_LinkSetLimit:
 		return "link.set_limit"
+	case *rocsarv1.CommandRequest_TelemetrySetRate:
+		return "telemetry.set_rate"
 	case *rocsarv1.CommandRequest_QueryStatus:
 		return "system.query_status"
 	case *rocsarv1.CommandRequest_SystemReset:
@@ -502,6 +514,34 @@ func (d *Dispatcher) linkSetLimit(ctx context.Context, requestID string, cmd *ro
 // defaultDevice is used when the shaper has not been applied yet and therefore
 // does not know its device.
 const defaultDevice = "eth0"
+
+// ---------------------------------------------------------------------------
+// Telemetry rate
+// ---------------------------------------------------------------------------
+
+const (
+	minTelemetryInterval = 100 * time.Millisecond
+	maxTelemetryInterval = 60 * time.Second
+)
+
+func (d *Dispatcher) telemetrySetRate(requestID string, cmd *rocsarv1.TelemetrySetRateCommand) *rocsarv1.CommandResponse {
+	if d.setTelemetryInterval == nil {
+		return fail(requestID, rocsarv1.ErrorCode_ERROR_UNSUPPORTED, "telemetry rate control is not configured")
+	}
+
+	interval := time.Duration(cmd.GetIntervalMs()) * time.Millisecond
+	if interval < minTelemetryInterval {
+		return fail(requestID, rocsarv1.ErrorCode_ERROR_INVALID_PARAMETER,
+			fmt.Sprintf("interval_ms must be at least %d", minTelemetryInterval.Milliseconds()))
+	}
+	if interval > maxTelemetryInterval {
+		return fail(requestID, rocsarv1.ErrorCode_ERROR_INVALID_PARAMETER,
+			fmt.Sprintf("interval_ms must be at most %d", maxTelemetryInterval.Milliseconds()))
+	}
+
+	d.setTelemetryInterval(interval)
+	return ok(requestID, fmt.Sprintf("telemetry interval set to %d ms", interval.Milliseconds()))
+}
 
 // ---------------------------------------------------------------------------
 

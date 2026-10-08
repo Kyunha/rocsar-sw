@@ -35,7 +35,15 @@ func seeded(t *testing.T, body string) *Service {
 	if err := os.WriteFile(filepath.Join(prog, programName), []byte("#!/bin/sh\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	return NewService(prog, t.TempDir(), discardLogger())
+	// Data/raw_data exists on the aircraft and has to: the program writes its
+	// second copy there without a fallback and aborts if the directory is
+	// absent. Connect checks it before starting, so a fixture without it would
+	// make every acquisition test fail for a reason that has nothing to do with
+	// what they assert.
+	if err := os.MkdirAll(filepath.Join(prog, programCaptureRelPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return NewService(prog, t.TempDir(), t.TempDir(), discardLogger())
 }
 
 // validParams is a params.json with every key config.hpp reads.

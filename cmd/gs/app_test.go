@@ -89,7 +89,7 @@ func newHarness(t *testing.T) *harness {
 	}
 
 	h.dir = t.TempDir()
-	store := storage.New(h.dir)
+	store := storage.New(h.dir, "")
 	if err := store.WriteFileAtomic("photos/fake.jpg", []byte("fake-jpeg-bytes"), 0o644); err != nil {
 		t.Fatalf("seed artefact: %v", err)
 	}

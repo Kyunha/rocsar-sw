@@ -82,6 +82,26 @@ message CameraStatus {
   optional string device = 2;
   optional string last_photo_name = 3;
   optional uint64 photos_taken = 4;
+
+  // The DECODED dimensions of the last photograph, in pixels.
+  //
+  // Read out of the JPEG's own header, never from the resolution that was
+  // requested. fswebcam's man page is explicit that "the actual resolution used
+  // may differ if the source or device cannot capture at the specified
+  // resolution", so the requested value is a request and this is the fact.
+  // Reporting the request here would make a driver clamp invisible: the console
+  // would show 1920x1080 next to a 640x480 file and both numbers would be
+  // true of different things.
+  //
+  // optional, and absent means UNKNOWN rather than 0x0 -- 0x0 is not a shape a
+  // decoder can return, so a missing header and a zero size are different
+  // failures and only one of them is "no photograph yet". Both fields are set
+  // together or not at all.
+  //
+  // Two varints against a 2048-byte frame budget that currently serialises to
+  // roughly 400, so this is free; see ARCHITECTURE.md 6.5.
+  optional uint32 last_photo_width = 5;
+  optional uint32 last_photo_height = 6;
 }
 
 message LinkStatus {

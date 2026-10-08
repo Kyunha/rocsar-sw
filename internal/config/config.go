@@ -60,6 +60,39 @@ const LocalFilename = "rocsar.local.toml"
 // PathEnv overrides where the configuration files are looked for.
 const PathEnv = "ROCSAR_CONFIG"
 
+// The aircraft's storage layout, in one place.
+//
+// These three are the values the Pi actually runs. They used to be inline
+// literals, which is how http.root came to be /mnt/rocsar/data -- a path that
+// existed on no machine -- while rocsar.toml said /mnt/ssd and the acquisition
+// program wrote to /mnt/rocsar_ssd. Three names for one disk is the whole bug:
+// the OBC served a directory that had never held a capture, and the Ground
+// Station listed none.
+//
+// They are grouped because they are one fact with three faces: where the disk
+// is mounted, what the vendor program writes to, and what this process serves.
+// Any change to one is a change to all three, and they are meant to be read
+// together.
+const (
+	// sdrDefaultProgram is where the acquisition program lives on the Pi.
+	//
+	// It was "third_party/sdr-ettus-b200mini", a path relative to this repo that
+	// named a directory the repo has never contained -- third_party/ is gitignored
+	// as vendored upstream and is not ours. The program is built and installed on
+	// the aircraft by other people; we drive it, we do not ship it.
+	sdrDefaultProgram = "/root/rocsar-rpi/sdr-ettus-b200mini"
+
+	// sdrDefaultDataDir is the SSD's mount point, and the acquisition program's
+	// SSD_PATH. http.root defaults to the same string for the same reason: one
+	// name for one disk.
+	sdrDefaultDataDir = "/mnt/rocsar_ssd"
+
+	// sdrDefaultDevice is that disk's filesystem UUID, asserted by
+	// storage.Store.Check so a missing mount is fatal at startup rather than
+	// discovered after a flight.
+	sdrDefaultDevice = "a82c5820-9183-45ba-bf2f-a956f6dec4cd"
+)
+
 // Config is the resolved configuration.
 type Config struct {
 	Server struct {
@@ -80,6 +113,26 @@ type Config struct {
 	HTTP struct {
 		Addr string
 		Root string
+		// Device is the filesystem identity the data root must have, as an
+		// ext4 filesystem UUID ("a82c5820-...") or a label ("rocsar_ssd").
+		// Empty means the identity is not asserted.
+		//
+		// This key exists because a vanished mount is indistinguishable from a
+		// writable directory. When the SSD drops off the USB bus -- which it
+		// did, ending in "Synchronize Cache failed: hostbyte=0x07", the disk
+		// vanishing mid-flush -- the mount point survives as an ordinary
+		// directory on the SD card. Store.Check probes for writability, which
+		// such a directory passes, so the OBC started and served telemetry while
+		// 5.4 GB of captures went to the wrong disk in duplicate. Nothing was
+		// lost, which is the quiet part: the OBC reported success and the
+		// Ground Station listed nothing, and neither statement was wrong about
+		// its own subject. Asserting the device closes that: the data root is refused at
+		// startup unless it is the filesystem the operator named.
+		//
+		// Empty on a laptop, where the data root is a directory under the working
+		// tree and there is no second filesystem to be on. That asymmetry is
+		// deliberate: the aircraft names the device, the bench does not.
+		Device string
 	}
 	Link struct {
 		Device   string
@@ -101,6 +154,18 @@ type Config struct {
 	}
 	SDR struct {
 		Program string
+		// DataDir is where the acquisition program writes its capture. On the Pi
+		// it is the SSD, mounted at the vendor program's own SSD_PATH.
+		//
+		// It is a SECOND home for a fact owned by C++ we do not maintain:
+		// connect.cpp carries `#define SSD_PATH "/mnt/rocsar_ssd"` and this is
+		// that literal, restated. Keep it and the pre-flight check in
+		// sdr.Service.Connect can refuse an acquisition whose output this OBC
+		// could never serve. Let the two drift and the check validates a path the
+		// program does not write to -- which is the failure it exists to catch.
+		// See internal/sdr/service.go for the same arrangement on
+		// programConfigRelPath, and for why the name has to stay sdr-ettus-b200mini.
+		DataDir string
 	}
 	Telemetry struct {
 		Interval time.Duration
@@ -134,6 +199,7 @@ var KnownKeys = map[string]bool{
 	"client.http_endpoint":      true,
 	"http.addr":                 true,
 	"http.root":                 true,
+	"http.device":               true,
 	"link.device":               true,
 	"link.rate_kbps":            true,
 	"link.shaping":              true,
@@ -144,6 +210,7 @@ var KnownKeys = map[string]bool{
 	"gnss.stale_after":          true,
 	"camera.device":             true,
 	"sdr.program":               true,
+	"sdr.data_dir":              true,
 	"telemetry.interval":        true,
 	"require_hardware":          true,
 }
@@ -161,7 +228,17 @@ func Defaults() Config {
 	// quickly, and the aircraft address is what rocsar.toml carries.
 	c.Client.HTTPEndpoint = "http://127.0.0.1:5557"
 	c.HTTP.Addr = ":5557"
-	c.HTTP.Root = "/mnt/rocsar/data"
+	// /mnt/rocsar_ssd, and NOT /mnt/ssd. The SSD is mounted at the vendor
+	// program's own SSD_PATH, so the name the C++ writes to and the name this
+	// process serves from are one string and not two that can disagree. The
+	// acquisition program is unmodified third-party code; asking it to write
+	// somewhere else means patching it, and a patched vendor tree is worse than
+	// an inconvenient mount point.
+	c.HTTP.Root = sdrDefaultDataDir
+	// The filesystem identity of the data root on the aircraft, asserted at
+	// startup. Empty on a laptop. See Config.HTTP.Device for why this is the
+	// check that would have caught the captures written to the SD card.
+	c.HTTP.Device = sdrDefaultDevice
 	c.Link.Device = "eth0"
 	c.Link.RateKbps = defaultLinkRateKbps
 	// ON by default, and that changed because the in-process limiter was deleted.
@@ -182,7 +259,8 @@ func Defaults() Config {
 	c.GNSS.Selected = 1
 	c.GNSS.StaleAfter = 2 * time.Second
 	c.Camera.Device = "/dev/video0"
-	c.SDR.Program = "third_party/sdr-ettus-b200mini"
+	c.SDR.Program = sdrDefaultProgram
+	c.SDR.DataDir = sdrDefaultDataDir
 	c.Telemetry.Interval = time.Second
 	// QOS.BulkRateBps is gone. It configured a token bucket inside this process
 	// that paced the artefact HTTP copy path; the limiter that used it has been

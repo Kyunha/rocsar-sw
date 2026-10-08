@@ -5,10 +5,11 @@
 # Two things this has to do that a bare `go run ./cmd/obc` does not:
 #
 #   1. Point the data root somewhere writable on this machine. rocsar.toml
-#      ships root = "/mnt/ssd", which exists on the Pi and nowhere else, and
-#      storage.Check treats a missing root as fatal at startup rather than
+#      ships root = "/mnt/rocsar_ssd", which exists on the Pi and nowhere else,
+#      and storage.Check treats a missing root as fatal at startup rather than
 #      creating one. The environment beats the file, so this is a one-line
-#      override and needs no rocsar.local.toml.
+#      override and needs no rocsar.local.toml. http.device is cleared at the
+#      same time, since ./data is not on the aircraft's SSD.
 #
 #   2. Point the console at 127.0.0.1. Both defaults are the aircraft's
 #      address, so `gs_cli watch` on a laptop otherwise reports a dead OBC.
@@ -34,8 +35,13 @@ trap cleanup EXIT INT TERM
 echo "[dev] data root $DATA_DIR"
 echo "[dev] starting obc (pico, camera and sdr simulated)"
 
+# ROCSAR_HTTP_DEVICE is emptied because http.device names the aircraft's SSD and
+# asserts the data root is mounted on it. ./data is a directory in the working
+# tree, so there is no second filesystem to be on and the assertion would fail
+# every local run. The aircraft asserts it; the bench does not.
+#
 # shellcheck disable=SC2046
-ROCSAR_HTTP_ROOT="$DATA_DIR" go run ./cmd/obc \
+ROCSAR_HTTP_ROOT="$DATA_DIR" ROCSAR_HTTP_DEVICE="" go run ./cmd/obc \
     --mock-pico --mock-camera --mock-sdr &
 OBC_PID=$!
 

@@ -62,15 +62,35 @@ http_endpoint = "http://192.168.1.50:5557"
 
 [http]
 addr = ":5557"
-# The data root is /mnt/ssd itself, not /mnt/ssd/data.
+# The SSD's mount point, and the only name for it.
 #
-# This was wrong and it was not a typo: the target Pi has photos/, raw/, logs/,
-# derived/ and gnss_logs/ sitting directly under /mnt/ssd, holding ~90 real
-# rx_data_*.bin captures from previous runs. Pointing root one level deeper
-# makes all of it invisible and, worse, makes startup fail -- storage.Check
-# refuses a root that does not exist rather than creating one, which is the
-# correct behaviour but turns a wrong path into a system that will not boot.
-root = "/mnt/ssd"
+# It is deliberately the same string as sdr.data_dir below and the same string as
+# the acquisition program's own `#define SSD_PATH`. Three names for one disk is
+# what hid 5.4 GB of captures: the program wrote to /mnt/rocsar_ssd, this file
+# served /mnt/ssd, and the code defaulted to /mnt/rocsar/data.
+#
+# Nothing was deleted -- the captures were always written somewhere, and the
+# program's SSD write is caught and retried onto the SD card. But with the SSD
+# unmounted, /mnt/rocsar_ssd was an ordinary directory on the SD card, so those
+# writes succeeded into the wrong disk in duplicate, the Ground Station listed
+# none of them, and nothing said so.
+#
+# /mnt/ssd was the third name and no longer exists. Do not reintroduce it: two
+# mount points for one filesystem is two things to keep in sync, and only one of
+# them can be the program's SSD_PATH without editing C++ we do not maintain.
+root = "/mnt/rocsar_ssd"
+
+# The disk's filesystem UUID, asserted at startup.
+#
+# A USB drive that drops off the bus -- and this one did, ending in "Synchronize
+# Cache failed: hostbyte=0x07", the disk vanishing mid-flush -- does not remove
+# its mount point. It leaves an ordinary writable directory on the SD card. Every
+# other startup check passes, the OBC serves telemetry, and every capture lands
+# on the wrong disk. This is the check that makes that fatal instead: it compares
+# what is actually mounted here against the disk named below.
+#
+# Set it to "" on a laptop, where there is no second filesystem to be on.
+device = "a82c5820-9183-45ba-bf2f-a956f6dec4cd"
 # The port in `addr` is load-bearing. The kernel's flower filter classifies bulk
 # traffic on `dst_port 5557`, and it is a constant (config.BulkPort), not a key
 # here. If the two disagree the failure is silent: downloads join the priority
@@ -135,7 +155,7 @@ device = "/dev/video0"
 # The directory holding parameters/params.json and Data/ -- NOT the connect
 # binary, which is found on PATH (see README, "The SDR program on the Pi").
 # It is also the working directory the program is started in, because the C++
-# resolves its own config and capture paths against CWD.
+# resolves its own config path and its second capture copy against CWD.
 #
 # The name is load-bearing, not cosmetic: connect.cpp hardcodes
 # "./../sdr-ettus-b200mini/parameters/params.json", so this only reaches the file
@@ -143,6 +163,18 @@ device = "/dev/video0"
 # an acquisition when it does not, rather than writing parameters the program
 # would never read. On the Pi, override with ROCSAR_SDR_PROGRAM instead.
 program = "/root/rocsar-rpi/sdr-ettus-b200mini"
+
+# Where the program writes its capture: the program's own `#define SSD_PATH`.
+#
+# A second home for a fact owned by C++ we do not maintain, which is what makes
+# it worth stating. Connect checks this directory exists, is writable, and has
+# room for the capture the configured parameters will produce -- so an acquisition
+# whose output this OBC could not serve is refused up front instead of written
+# somewhere invisible.
+#
+# It equals http.root above and must stay equal to it. When they diverged, the
+# program wrote to this one and the artefact server served the other.
+data_dir = "/mnt/rocsar_ssd"
 
 [telemetry]
 interval = "1s"
