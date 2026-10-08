@@ -7,6 +7,7 @@ import (
 	"image"
 	"image/color"
 	"image/jpeg"
+	"log/slog"
 	"sync"
 
 	"github.com/rocsar/obc/internal/domain"
@@ -25,19 +26,56 @@ type Mock struct {
 	device string
 	dir    string
 	store  *storage.Store
+	log    *slog.Logger
 
 	mu       sync.Mutex
 	state    domain.SubsystemState
 	shots    uint64
-	last     string
+	last     *domain.Photo
 	failWith error
+	params   domain.CameraParams
 }
 
 var _ domain.Camera = (*Mock)(nil)
 
+// mockWidth and mockHeight are the shape of the synthetic frame.
+//
+// Deliberately not the configured resolution, and that difference is the point.
+// This camera has no sensor, so there is nothing to negotiate a format with, and
+// a mock that drew 1920x1080 because it was asked to would be a mock reporting a
+// resolution no device agreed to -- the exact fabrication the real camera spends
+// its decodable dimensions to avoid. So a mock photograph is 320x240 whatever
+// the settings say, which makes the requested-versus-actual distinction visible
+// in the one place somebody can look at it without an aircraft.
+const (
+	mockWidth  = 320
+	mockHeight = 240
+)
+
 // NewMock returns a mock camera writing into dir.
-func NewMock(device, dir string, store *storage.Store) *Mock {
-	return &Mock{device: device, dir: dir, store: store, state: domain.SubsystemDisconnected}
+//
+// The settings argument is validated and stored exactly as the real camera
+// stores it, so the console's read-modify-write round trip and its version-skew
+// handling are exercised identically under --mock-camera. What the mock does with
+// them is a narrower question, answered in SetParams.
+func NewMock(device, dir string, store *storage.Store, initial domain.CameraParams, log *slog.Logger) *Mock {
+	if log == nil {
+		log = slog.Default()
+	}
+	params := initial
+	if err := Validate(params); err != nil {
+		log.Warn("the configured camera settings are not usable; using the defaults",
+			"err", err, "defaults", Defaults())
+		params = Defaults()
+	}
+	return &Mock{
+		device: device,
+		dir:    dir,
+		store:  store,
+		log:    log,
+		params: params,
+		state:  domain.SubsystemDisconnected,
+	}
 }
 
 // MockFailWith makes every capture fail, to exercise the degraded path.
@@ -59,9 +97,63 @@ func (m *Mock) PhotosTaken() uint64 {
 	return m.shots
 }
 
+// LastPhoto is the most recent photograph, or nil.
+func (m *Mock) LastPhoto() *domain.Photo {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.last == nil {
+		return nil
+	}
+	out := *m.last
+	return &out
+}
+
+func (m *Mock) Params(ctx context.Context) (domain.CameraParams, error) {
+	if err := ctx.Err(); err != nil {
+		return domain.CameraParams{}, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.params, nil
+}
+
+// SetParams stores a partial update, honouring exactly one of the settings.
+//
+// JPEGQuality is applied, because it is the one setting a synthetic frame can
+// genuinely honour: it changes the bytes this mock writes, and an operator
+// watching the file size move knows the control is wired to something.
+//
+// The other four are stored and validated and then deliberately NOT applied.
+// Pretending otherwise would make --mock-camera the one place in this system
+// where a resolution control appears to work, and H5 -- nothing is simulated
+// unless it is labelled -- is not about a mock being honest so much as it is
+// about not being able to mislead.
+//
+// The settings are not persisted to ParamsFileName either. There is one file and
+// it belongs to the real camera; a mock run on a laptop sharing a data directory
+// with an aircraft's settings is not a scenario worth writing a test for.
+func (m *Mock) SetParams(ctx context.Context, patch domain.CameraParamsPatch) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if Empty(patch) {
+		return fmt.Errorf("camera: no settings were given; a partial update must name at least one")
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	next, err := Merge(m.params, patch)
+	if err != nil {
+		return err
+	}
+	m.params = next
+	return nil
+}
+
 func (m *Mock) Capture(ctx context.Context) (*domain.Photo, error) {
 	m.mu.Lock()
 	fail := m.failWith
+	quality := m.params.JPEGQuality
 	m.state = domain.SubsystemBusy
 	m.mu.Unlock()
 
@@ -72,7 +164,7 @@ func (m *Mock) Capture(ctx context.Context) (*domain.Photo, error) {
 		return nil, fail
 	}
 
-	body, err := m.syntheticJPEG()
+	body, err := m.syntheticJPEG(quality)
 	if err != nil {
 		return nil, err
 	}
@@ -90,24 +182,39 @@ func (m *Mock) Capture(ctx context.Context) (*domain.Photo, error) {
 		return nil, err
 	}
 
-	m.mu.Lock()
-	m.state = domain.SubsystemReady
-	m.shots++
-	m.last = name
-	m.mu.Unlock()
+	// Decoded from the bytes just written rather than asserted, so the mock goes
+	// through the same code path the real camera does and cannot drift from it.
+	w, h := jpegSize(body)
 
-	return &domain.Photo{
+	photo := &domain.Photo{
 		Name:      name,
 		SizeBytes: uint64(len(body)),
 		Kind:      storage.KindCamera,
 		Path:      m.dir + "/" + name,
-	}, nil
+		Width:     w,
+		Height:    h,
+	}
+
+	m.mu.Lock()
+	m.state = domain.SubsystemReady
+	m.shots++
+	m.last = photo
+	m.mu.Unlock()
+
+	return photo, nil
 }
 
-// syntheticJPEG draws a small image with a visible frame counter, so an
-// operator can tell at a glance which photograph they are looking at.
-func (m *Mock) syntheticJPEG() ([]byte, error) {
-	const w, h = 160, 120
+// syntheticJPEG draws an image with a visible frame counter, so an operator can
+// tell at a glance which photograph they are looking at.
+//
+// The automatic quality case passes NO options object at all, and that is not a
+// style choice. image/jpeg does not treat a zero factor as "automatic": it
+// clamps anything below 1 UP to 1 (writer.go: "Clip quality to [1, 100]"), so
+// passing Options{Quality: 0} would produce the smallest and ugliest file the
+// encoder can make and call it the default. The automatic case is the absence
+// of an option, which is exactly how fswebcam spells it too -- -1.
+func (m *Mock) syntheticJPEG(quality uint32) ([]byte, error) {
+	w, h := mockWidth, mockHeight
 	img := image.NewRGBA(image.Rect(0, 0, w, h))
 
 	n := 0
@@ -129,8 +236,13 @@ func (m *Mock) syntheticJPEG() ([]byte, error) {
 		}
 	}
 
+	opts := &jpeg.Options{}
+	if quality != DefaultQuality {
+		opts.Quality = int(quality)
+	}
+
 	var out bytes.Buffer
-	if err := jpeg.Encode(&out, img, &jpeg.Options{Quality: 80}); err != nil {
+	if err := jpeg.Encode(&out, img, opts); err != nil {
 		return nil, err
 	}
 	return out.Bytes(), nil

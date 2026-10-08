@@ -114,37 +114,25 @@ const MaxTotalFrames = 120
 // larger than any camera on this aircraft.
 const MaxResolutionPixels = 7680
 
-// DefaultResolution is the resolution in force unless an operator changes it.
+// DefaultResolution and DefaultQuality restate the two defaults this file and
+// fswebcamArgs reason about most, derived from the one function that owns them
+// rather than written out again.
 //
-// It is fswebcam's own default, and that is the whole argument for it. This
-// camera previously passed no resolution at all, which meant fswebcam asked the
-// device for 384x288 -- so every photograph this system has ever taken was a
-// quarter-megapixel one, while the port's comment called it "full-resolution".
-// Spelling the same request out changes no behaviour and makes it visible: the
-// value now appears in the settings file, in telemetry and in the console
-// instead of being an accident of an omitted flag.
-const DefaultResolution = "384x288"
-
-// DefaultQuality is the automatic JPEG factor: fswebcam's default is -1, and
-// automatic is carried here as 0. See Keys[0].Provenance.
-const DefaultQuality uint32 = 0
+// Vars, not consts, because a function call is not a constant expression -- and
+// the alternative, two literals restated in a third package, is exactly the
+// drift this arrangement exists to prevent.
+var (
+	DefaultResolution = domain.DefaultCameraParams().Resolution
+	DefaultQuality    = domain.DefaultCameraParams().JPEGQuality
+)
 
 // Defaults returns the parameters in force before anything is set.
 //
-// Every value is fswebcam's own default, deliberately. Choosing different ones
-// would mean selecting a resolution, a noise budget and a settle time for a
-// camera none of us has seen, and would mean that a plain upgrade changed what
-// photographs look like. What these values buy is visibility, not a different
-// picture.
-func Defaults() domain.CameraParams {
-	return domain.CameraParams{
-		JPEGQuality: DefaultQuality,
-		Resolution:  DefaultResolution,
-		Frames:      1,
-		Skip:        1,
-		DelayMs:     1,
-	}
-}
+// A thin re-export of domain.DefaultCameraParams, kept because every call site
+// in this package reads better as Defaults() than as a qualified call into
+// another package, and because the argument for the values belongs with the
+// values.
+func Defaults() domain.CameraParams { return domain.DefaultCameraParams() }
 
 // keysByName indexes Keys.
 var keysByName = func() map[string]Key {

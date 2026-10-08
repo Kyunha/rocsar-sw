@@ -25,6 +25,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/rocsar/obc/internal/domain"
 )
 
 // The link rate and the GNSS port block are named rather than written inline
@@ -151,6 +153,20 @@ type Config struct {
 	}
 	Camera struct {
 		Device string
+		// Params are the capture settings used before anything has been set at
+		// runtime: the initial value, and nothing more.
+		//
+		// A stored settings file on the SSD wins over these, which is the
+		// designed precedence and not a fallback -- see
+		// internal/camera/params.go. These keys exist so a deployment can bake
+		// in a resolution without a hand edit on the aircraft, which is the
+		// same defect the SDR keys carried for years.
+		//
+		// The defaults are domain.DefaultCameraParams(), not literals here:
+		// internal/config may not import a subsystem, so if the five values
+		// lived in internal/camera this package would have to restate them and
+		// the two copies would drift.
+		Params domain.CameraParams
 	}
 	SDR struct {
 		Program string
@@ -209,6 +225,11 @@ var KnownKeys = map[string]bool{
 	"gnss.selected":             true,
 	"gnss.stale_after":          true,
 	"camera.device":             true,
+	"camera.quality":            true,
+	"camera.resolution":         true,
+	"camera.frames":             true,
+	"camera.skip":               true,
+	"camera.delay_ms":           true,
 	"sdr.program":               true,
 	"sdr.data_dir":              true,
 	"telemetry.interval":        true,
@@ -259,6 +280,9 @@ func Defaults() Config {
 	c.GNSS.Selected = 1
 	c.GNSS.StaleAfter = 2 * time.Second
 	c.Camera.Device = "/dev/video0"
+	// fswebcam's own defaults, spelled out. See domain.DefaultCameraParams for
+	// why they are what they are and why spelling them out is the point.
+	c.Camera.Params = domain.DefaultCameraParams()
 	c.SDR.Program = sdrDefaultProgram
 	c.SDR.DataDir = sdrDefaultDataDir
 	c.Telemetry.Interval = time.Second

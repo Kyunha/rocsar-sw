@@ -70,6 +70,17 @@ type Camera interface {
 	Device() string
 	PhotosTaken() uint64
 
+	// LastPhoto is the most recent photograph, or nil if none has been taken.
+	//
+	// It exists because the field was everywhere and populated nowhere. The
+	// telemetry Snapshot carried a last_photo name, the wire carried it, the
+	// view carried it and the console rendered "last <name>" beside the photo
+	// count -- and the only provider filled the count and returned an empty
+	// string for the name, so the console rendered "last " and nothing. Same
+	// defect internal/domain/ports.go records for Sdr.LastError, in the same
+	// interface file, fixed the same way: give the port a method and fill it.
+	LastPhoto() *Photo
+
 	// Params reads the capture settings in force.
 	Params(ctx context.Context) (CameraParams, error)
 	// SetParams applies a partial update. Absent fields are left alone, so a
@@ -141,6 +152,39 @@ type CameraParamsPatch struct {
 	Frames     *uint32
 	Skip       *uint32
 	DelayMs    *uint32
+}
+
+// DefaultCameraParams is the settings in force before anything is set.
+//
+// It lives here, and not in internal/camera, because two packages need it and
+// only one of them may be imported by the other: internal/config cannot import
+// a subsystem (test/layering_test.go forbids it), and if the defaults lived in
+// internal/camera the config package would have to restate them to type a
+// default field -- a second home for five numbers, which is the drift this
+// repository treats as a defect. The bounds that justify each value are NOT here;
+// they are in internal/camera/params_contract.go, because a bound is the camera
+// package's contract with fswebcam and this package knows nothing about
+// fswebcam.
+//
+// Every value is fswebcam's OWN default, spelled out. That is the point of the
+// whole type. This camera previously passed no resolution at all, which meant
+// fswebcam asked the device for 384x288 -- so every photograph the system has
+// ever taken was a quarter-megapixel one, while the port comment above called it
+// "full-resolution". Spelling the same request out changes no behaviour and
+// makes it visible. Choosing different defaults would mean picking a resolution,
+// a noise budget and a settle time for a camera none of us has seen, and would
+// mean that a plain upgrade changed what photographs look like.
+func DefaultCameraParams() CameraParams {
+	return CameraParams{
+		// Automatic, which fswebcam spells -1. Carried as the zero, and never
+		// passed to the program: see CameraParams.JPEGQuality.
+		JPEGQuality: 0,
+		// fswebcam's own -r default.
+		Resolution: "384x288",
+		Frames:     1,
+		Skip:       1,
+		DelayMs:    0,
+	}
 }
 
 // Sdr is the Ettus B200mini acquisition program.
