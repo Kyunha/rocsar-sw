@@ -1,16 +1,29 @@
 /* ROCSAR Ground Station — Offline Map.
  *
- * Displays GNSS position over an offline basemap built from two committed
- * assets, both rendered by MapLibre GL JS and served locally from the Go binary
+ * Displays GNSS position over an offline basemap built from three committed
+ * assets, all rendered by MapLibre GL JS and served locally from the Go binary
  * (pre-gzipped, see cmd/gs/bridge.go) — zero network at runtime:
  *
  *   - Natural Earth GeoJSON: global ocean, land, mountain ranges and named
  *     summits at 50m, plus lakes and rivers at 10m clipped to the operating
  *     area — the 50m hydrography has only 58 lakes and 34 rivers across all of
  *     Northern Europe (scripts/fetch-basemap.py).
+ *   - Natural Earth cultural GeoJSON: populated places, roads and railroads at
+ *     10m, clipped to the operating area, so the operator has recognisable
+ *     ground to read a position against (scripts/fetch-basemap.py).
  *   - Natural Earth shaded relief: a single cropped, Web-Mercator-projected
  *     image over the operating area, giving the terrain its shape
  *     (scripts/fetch-relief/main.go).
+ *
+ * On top of the basemap the map draws three live overlays, all driven by
+ * telemetry and all absent when their input is (section 7.1):
+ *
+ *   - the position trail;
+ *   - the antenna pointing sector: the bearings an axis can reach, from the
+ *     servo's mechanical limit (firmware/gondola_model.h);
+ *   - the SAR beam footprint: where a 45-degree, 10-degree-FOV beam meets the
+ *     ground, from the altitude and the target bearing. The ground is a flat
+ *     datum: no terrain model is shipped, so the footprint is on sea level.
  *
  * Why GeoJSON and a baked image rather than tiles: GUI_ARCHITECTURE.md 1.2. The
  * map needs regional context, not a street basemap, and Natural Earth is public
@@ -27,6 +40,7 @@
 
 import maplibregl from 'maplibre-gl';
 import { on } from './bridge';
+import { destination, sarFootprint, sectorPolygon } from './geometry';
 import type { FrameEvent, View } from './models';
 
 const GEOJSON = '/geojson';
@@ -50,13 +64,30 @@ const TRAIL_MAX = 30;
 const HEADING_PX = 46; // gondola heading (IMU): which way the platform faces
 const TARGET_PX = 78; // antenna target bearing: where the antennas point
 
+/* The antenna pointing sector. Each ST3215 is a 12-bit encoder (0..4095 ticks,
+ * 4096/360 per degree) geared 5:1 to its axis, and `zero` centres the axis, so
+ * an axis reaches about ±(2048 / 5 / (4096/360)) ≈ ±36° around its base bearing
+ * before clampTick saturates. That mechanical limit is the wedge this draws; it
+ * is the shape of the mount, not of the beam (firmware/gondola_model.h:962).
+ * Drawn at a fixed pixel radius like the bearing lines, so it stays readable at
+ * any zoom. */
+const SECTOR_PX = 92;
+const SECTOR_HALF_DEG = 36;
+const SECTOR_SAMPLES = 24;
+
+/* The SAR beam. The antenna looks 45° below the horizon and illuminates a 10°
+ * cone (full angle; 5° half-angle). Both are the mission geometry, not a
+ * measurement off the wire. */
+const SAR_DOWN_ANGLE_DEG = 45;
+const SAR_FOV_DEG = 10;
+const SAR_SAMPLES = 64;
+
 /* Ground scale at the equator and zoom 0, in metres per pixel. This is the
  * 512-px-tile value (equatorial circumference / 512), because MapLibre's
  * transform uses tileSize = 512 (geo/transform.ts) and worldSize = 512 · 2^zoom.
  * The common 156543.03392 figure is the 256-px-tile convention and would draw
  * these lines twice as long. */
 const EQUATOR_M_PER_PX_Z0 = 78271.51696;
-const EARTH_RADIUS_M = 6371008.8;
 
 /* Empty data for hiding a source. A FeatureCollection, not a zeroed feature:
  * an empty LineString or a Point at [0,0] would otherwise render at Null
@@ -70,15 +101,24 @@ let headingSource: maplibregl.GeoJSONSource | null = null;
 let targetSource: maplibregl.GeoJSONSource | null = null;
 let headingTipSource: maplibregl.GeoJSONSource | null = null;
 let targetTipSource: maplibregl.GeoJSONSource | null = null;
+let sectorSource: maplibregl.GeoJSONSource | null = null;
+let sarSource: maplibregl.GeoJSONSource | null = null;
 const trail: [number, number][] = [];
 let centeredOnFix = false;
 
 /* Latest fix and bearings, kept so the bearing lines can be redrawn when the
  * camera settles. Their length is zoom-dependent, so a zoom would otherwise
- * leave them the wrong geographic length until the next 1 Hz frame. */
+ * leave them the wrong geographic length until the next 1 Hz frame. The sector
+ * is redrawn with them for the same reason; the SAR footprint is geographic,
+ * but it is cheap and shares the redraw. */
 let lastFix: [number, number] | null = null;
+let lastAltM = 0;
 let gondolaHeadingDeg: number | null = null;
 let targetHeadingDeg: number | null = null;
+/* The mount offset the operator gives axis 1, in degrees. The antenna base
+ * bearing is the gondola heading plus this, which is what the pointing sector
+ * is centred on (firmware/gondola_model.h:976). */
+let mountOffsetDeg = 0;
 let gondolaHeld = false;
 
 /* Click-to-point callback. Set by main.ts when the command path is ready.
@@ -105,6 +145,11 @@ export function setMapClickHandler(fn: ((lat: number, lon: number) => void) | nu
  * Anything reordered below those three changes which of them wins. */
 const darkStyle: maplibregl.StyleSpecification = {
     version: 8,
+    /* City labels are SDF text, which MapLibre can only draw from glyph PBFs.
+     * The two Latin ranges the operating area's place names need are committed
+     * under public/fonts (Open Sans, Apache-2.0) and served from the same
+     * origin; there is no glyph server and no network. */
+    glyphs: '/fonts/{fontstack}/{range}.pbf',
     sources: {
         /* Natural Earth 50m/10m shaded relief, cropped and warped to Web
          * Mercator by scripts/fetch-relief. The corners are clockwise from the
@@ -126,7 +171,12 @@ const darkStyle: maplibregl.StyleSpecification = {
         rivers: { type: 'geojson', data: `${GEOJSON}/ne_rivers.json` },
         ranges: { type: 'geojson', data: `${GEOJSON}/ne_50m_mountain_ranges.json` },
         peaks: { type: 'geojson', data: `${GEOJSON}/ne_50m_geography_regions_elevation_points.json` },
+        cities: { type: 'geojson', data: `${GEOJSON}/ne_cities.json` },
+        roads: { type: 'geojson', data: `${GEOJSON}/ne_roads.json` },
+        railroads: { type: 'geojson', data: `${GEOJSON}/ne_railroads.json` },
         trail: { type: 'geojson', data: EMPTY_FC },
+        sector: { type: 'geojson', data: EMPTY_FC },
+        sar: { type: 'geojson', data: EMPTY_FC },
         heading: { type: 'geojson', data: EMPTY_FC },
         target: { type: 'geojson', data: EMPTY_FC },
         headingTip: { type: 'geojson', data: EMPTY_FC },
@@ -190,6 +240,106 @@ const darkStyle: maplibregl.StyleSpecification = {
                 'circle-stroke-color': '#121418',
                 'circle-stroke-width': 1,
             },
+        },
+        /* Cultural context, above the hydrography and below everything live.
+         * Railroads are dashed and roads solid -- the cartographic convention,
+         * so the two read apart without a legend. No feature is dropped: width
+         * carries the road class, a major highway reads heavier than a minor
+         * road, and all of them stay visible. */
+        {
+            id: 'railroads',
+            type: 'line',
+            source: 'railroads',
+            paint: {
+                'line-color': '#6d5c47',
+                'line-width': 0.9,
+                'line-opacity': 0.85,
+                'line-dasharray': [6, 4],
+            },
+        },
+        {
+            id: 'roads',
+            type: 'line',
+            source: 'roads',
+            paint: {
+                'line-color': '#454f5f',
+                'line-width': [
+                    'match', ['get', 'type'],
+                    'Major Highway', 1.4,
+                    'Secondary Highway', 1.0,
+                    0.7,
+                ],
+                'line-opacity': 0.85,
+            },
+        },
+        {
+            id: 'cities',
+            type: 'circle',
+            source: 'cities',
+            paint: {
+                'circle-radius': 2.6,
+                'circle-color': '#d8c9a3',
+                'circle-stroke-color': '#121418',
+                'circle-stroke-width': 0.8,
+            },
+        },
+        /* Names for the larger places only. Labelling all 447 would bury the
+         * map; the threshold keeps the 302 places over 50 000, and MapLibre's
+         * own collision hiding drops the ones that still overlap. The name is
+         * also on every city's click popup, so a small place is findable. */
+        {
+            id: 'cities-label',
+            type: 'symbol',
+            source: 'cities',
+            filter: ['>=', ['get', 'POP_MAX'], 50000],
+            layout: {
+                'text-field': ['get', 'NAME'],
+                'text-font': ['Open Sans Regular'],
+                'text-size': 11,
+                'text-offset': [0, 0.9],
+                'text-anchor': 'top',
+            },
+            paint: {
+                'text-color': '#d8c9a3',
+                'text-halo-color': '#121418',
+                'text-halo-width': 1.2,
+            },
+        },
+        /* The antenna pointing sector: the bearings an axis can reach, from the
+         * mount geometry. A translucent fill with a dotted outline, in the
+         * heading colour so the wedge and the heading line read as one
+         * instrument. */
+        {
+            id: 'sector',
+            type: 'fill',
+            source: 'sector',
+            paint: { 'fill-color': '#22d3ee', 'fill-opacity': 0.06 },
+        },
+        {
+            id: 'sector-outline',
+            type: 'line',
+            source: 'sector',
+            layout: { 'line-cap': 'round' },
+            paint: {
+                'line-color': '#22d3ee',
+                'line-width': 1.4,
+                'line-opacity': 0.75,
+                'line-dasharray': [0.1, 3],
+            },
+        },
+        /* The SAR beam footprint, in the target colour: it is where that beam
+         * lands. */
+        {
+            id: 'sar',
+            type: 'fill',
+            source: 'sar',
+            paint: { 'fill-color': '#ffb454', 'fill-opacity': 0.14 },
+        },
+        {
+            id: 'sar-outline',
+            type: 'line',
+            source: 'sar',
+            paint: { 'line-color': '#ffb454', 'line-width': 1.2, 'line-opacity': 0.8 },
         },
         {
             id: 'trail',
@@ -281,8 +431,10 @@ function initMap(): void {
         targetSource = map!.getSource('target') as maplibregl.GeoJSONSource;
         headingTipSource = map!.getSource('headingTip') as maplibregl.GeoJSONSource;
         targetTipSource = map!.getSource('targetTip') as maplibregl.GeoJSONSource;
+        sectorSource = map!.getSource('sector') as maplibregl.GeoJSONSource;
+        sarSource = map!.getSource('sar') as maplibregl.GeoJSONSource;
         ensureArrowImages();
-        redrawBearings();
+        redrawDynamic();
 
         /* Named summits: name and true elevation on click. Suppresses the
          * click-to-point for that click only, so inspecting a mountain never
@@ -306,6 +458,31 @@ function initMap(): void {
         map!.on('mouseleave', 'peaks', () => {
             map!.getCanvas().style.cursor = '';
         });
+
+        /* Cities: name and population on click, suppressed from click-to-point
+         * for the same reason as the summits -- reading a place off the map is
+         * not a command. */
+        map!.on('click', 'cities', (e: maplibregl.MapLayerMouseEvent) => {
+            const f = e.features?.[0];
+            if (!f) {
+                return;
+            }
+            const props = f.properties as { NAME?: string; POP_MAX?: number };
+            const name = props.NAME ?? 'unnamed';
+            const pop = props.POP_MAX !== undefined && props.POP_MAX > 0
+                ? `${props.POP_MAX.toLocaleString()} people`
+                : 'population unknown';
+            new maplibregl.Popup({ closeButton: true, offset: 8 })
+                .setLngLat(e.lngLat)
+                .setHTML(`<b>${name}</b><br>${pop}`)
+                .addTo(map!);
+        });
+        map!.on('mouseenter', 'cities', () => {
+            map!.getCanvas().style.cursor = 'pointer';
+        });
+        map!.on('mouseleave', 'cities', () => {
+            map!.getCanvas().style.cursor = '';
+        });
     });
 
     /* Bearing arrowheads. MapLibre has no built-in arrow and the console is
@@ -319,16 +496,18 @@ function initMap(): void {
     });
 
     /* A camera settle (zoom, pan or rotate) changes the metres per pixel, so
-     * the bearing lines need their geographic length recomputed. */
-    map.on('moveend', () => redrawBearings());
+     * the bearing lines and the pointing sector need their geographic length
+     * recomputed. */
+    map.on('moveend', () => redrawDynamic());
 
     /* Click-to-point: report degrees, unconverted. A click that lands on a
-     * summit is an inspection, not a command, and is left to the popup. */
+     * summit or a city is an inspection, not a command, and is left to the
+     * popup. */
     map.on('click', (e: maplibregl.MapMouseEvent) => {
         if (!map || !clickHandler) {
             return;
         }
-        const hit = map.queryRenderedFeatures(e.point, { layers: ['peaks'] });
+        const hit = map.queryRenderedFeatures(e.point, { layers: ['peaks', 'cities'] });
         if (hit.length > 0) {
             return;
         }
@@ -398,19 +577,6 @@ function ensureArrowImages(): void {
     if (!map.hasImage('bearing-arrow-target')) {
         map.addImage('bearing-arrow-target', arrowImage('#ffb454'));
     }
-}
-
-/* destination returns the point reached by travelling distM metres from
- * (lat, lon) on the given bearing (degrees, 0 = north, clockwise). The
- * great-circle formula, so the bearing stays true away from the equator. */
-function destination(lat: number, lon: number, bearingDeg: number, distM: number): [number, number] {
-    const d = distM / EARTH_RADIUS_M;
-    const th = (bearingDeg * Math.PI) / 180;
-    const p1 = (lat * Math.PI) / 180;
-    const l1 = (lon * Math.PI) / 180;
-    const p2 = Math.asin(Math.sin(p1) * Math.cos(d) + Math.cos(p1) * Math.sin(d) * Math.cos(th));
-    const l2 = l1 + Math.atan2(Math.sin(th) * Math.sin(d) * Math.cos(p1), Math.cos(d) - Math.sin(p1) * Math.sin(p2));
-    return [(l2 * 180) / Math.PI, (p2 * 180) / Math.PI];
 }
 
 /* bearingTo returns the initial great-circle bearing (degrees, 0 = north,
@@ -486,15 +652,74 @@ function redrawBearings(): void {
     }
 }
 
+/* redrawSector draws the wedge of bearings the antenna axis can reach. It is
+ * centred on the antenna base bearing -- the gondola heading plus the mount
+ * offset the operator gave -- and spans SECTOR_HALF_DEG to each side. A missing
+ * fix or heading clears it rather than drawing a wedge at a default bearing. */
+function redrawSector(): void {
+    if (sectorSource === null) {
+        return;
+    }
+    if (lastFix === null || gondolaHeadingDeg === null) {
+        sectorSource.setData(EMPTY_FC);
+        return;
+    }
+    const [lon, lat] = lastFix;
+    const feature = sectorPolygon(
+        lat,
+        lon,
+        gondolaHeadingDeg + mountOffsetDeg,
+        SECTOR_HALF_DEG,
+        SECTOR_PX * metresPerPixel(lat),
+        SECTOR_SAMPLES,
+    );
+    sectorSource.setData(feature ?? EMPTY_FC);
+}
+
+/* redrawSar draws where the SAR beam meets the ground, along the target
+ * bearing. A missing fix, target or altitude clears it. */
+function redrawSar(): void {
+    if (sarSource === null) {
+        return;
+    }
+    if (lastFix === null || targetHeadingDeg === null) {
+        sarSource.setData(EMPTY_FC);
+        return;
+    }
+    const [lon, lat] = lastFix;
+    const feature = sarFootprint(
+        lat,
+        lon,
+        targetHeadingDeg,
+        lastAltM,
+        SAR_DOWN_ANGLE_DEG,
+        SAR_FOV_DEG,
+        SAR_SAMPLES,
+    );
+    sarSource.setData(feature ?? EMPTY_FC);
+}
+
+/* redrawDynamic redraws everything driven by telemetry or the camera: the two
+ * bearing lines, the pointing sector and the SAR footprint. The trail is not
+ * here -- it is append-only and redraws on the frame that advances it. */
+function redrawDynamic(): void {
+    redrawBearings();
+    redrawSector();
+    redrawSar();
+}
+
 /* bearingReadout names the two bearing lines in the colours they are drawn in,
  * so the readout doubles as the legend. A held heading is called out, because
  * it is the last value the flight controller had rather than a measurement
- * (section 7.2). */
+ * (section 7.2). The sector and the footprint are named here too, in the same
+ * colours they are drawn. */
 function bearingReadout(): string {
     const deg = (d: number | null): string => (d === null ? '&mdash;' : `${d.toFixed(1)}&deg;`);
     const held = gondolaHeld ? ' <i>(held)</i>' : '';
     return ` &nbsp; <span style="color:#22d3ee">&#9679;</span> heading ${deg(gondolaHeadingDeg)}${held}` +
-        ` &nbsp; <span style="color:#ffb454">&#9679;</span> target ${deg(targetHeadingDeg)}`;
+        ` &nbsp; <span style="color:#ffb454">&#9679;</span> target ${deg(targetHeadingDeg)}` +
+        ` &nbsp; <span style="color:#22d3ee">&#9676;</span> reach` +
+        ` &nbsp; <span style="color:#ffb454">&#9678;</span> sar`;
 }
 
 /* Update marker position, bearing lines, trail, and readout from a decoded
@@ -505,6 +730,10 @@ function updateFromFrame(v: View): void {
     const pico = v.pico ?? null;
     gondolaHeadingDeg = pico === null ? null : pico.gondola_heading_deg;
     targetHeadingDeg = pico === null ? null : pico.target_heading_deg;
+    /* The mount offset the operator has given axis 1, which the antenna base
+     * bearing is measured from. Telemetry always carries both axes; the map
+     * draws one sector, so axis 1 is the one it follows. */
+    mountOffsetDeg = pico !== null && pico.antennas.length > 0 ? pico.antennas[0].mount_offset_deg : 0;
     gondolaHeld = pico !== null && pico.imu === 'HELD';
 
     /* Position readout below the map. Absence is stated, never drawn as zero. */
@@ -517,15 +746,17 @@ function updateFromFrame(v: View): void {
     }
 
     if (pos === null) {
-        /* No fix: clear the trail and the bearings rather than leaving a dot and
-         * two lines at a stale coordinate pretending to be the gondola. */
+        /* No fix: clear the trail and the overlays rather than leaving a dot
+         * and lines at a stale coordinate pretending to be the gondola. */
         lastFix = null;
+        lastAltM = 0;
         clearTrail();
-        redrawBearings();
+        redrawDynamic();
         return;
     }
 
     lastFix = [pos.lon, pos.lat];
+    lastAltM = pos.alt;
     const fixOk = pos.ok;
 
     if (map && marker) {
@@ -542,7 +773,7 @@ function updateFromFrame(v: View): void {
         }
     }
 
-    redrawBearings();
+    redrawDynamic();
 
     /* Trail (last TRAIL_MAX points = ~30 s at 1 Hz). */
     trail.push([pos.lon, pos.lat]);

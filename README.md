@@ -309,10 +309,16 @@ go run ./tools/gs_cli [flags] <command>
 | `-raw` | `false` | Print the whole frame as JSON. |
 | `-topic` | `telemetry` | Telemetry topic. |
 
-Commands: `query`, `photo`, `gnss <id>`, `heading <deg>`, `jog <servo> <tick>`,
-`zero [servo]`, `mount <servo> <deg>`, `dir <servo> ±1`, `heater <1|2> <on|off>`,
-`stop <servo|all>`, `pico-status`, `sdr-probe`, `sdr-connect`, `sdr-reset-usb`,
-`link <kbit>`, `reboot`.
+Commands: `query`, `photo`, `camera-get-params`, `gnss <id>`, `heading <deg>`,
+`jog <servo> <tick>`, `zero [servo]`, `mount <servo> <deg>`, `dir <servo> ±1`,
+`heater <1|2> <on|off>`, `stop <servo|all>`, `pico-status`, `sdr-probe`,
+`sdr-connect`, `sdr-reset-usb`, `link <kbit>`, `reboot`.
+
+`camera-get-params` reads the five capture settings in force. `sdr-get-params`
+and `sdr-connect` are on the list too; see `gs_cli commands` for the authoritative
+set, which both consoles read from the same table. Camera *settings* are changed
+from the Ground Station window or by editing `.camera-params.json`; the CLI reads
+them and does not write them.
 
 There is deliberately **no arm gate** in `gs_cli`. It added a step between an
 operator and a command without making anything safer, because the one consumer
@@ -367,6 +373,8 @@ Each talks to one piece of hardware directly, with no OBC involved:
 go run ./tools/pico_bench   -port /dev/ttyACM0 -raw -seconds 10
 go run ./tools/gnss_bench   -mode inject|listen|bank
 go run ./tools/camera_bench -device /dev/video0 -out /tmp/shot.jpg
+go run ./tools/camera_bench -resolution 1280x720 -quality 40   # ask for more, fetch less
+go run ./tools/camera_bench -print-args                        # the fswebcam command line, no capture
 go run ./tools/sdr_bench    -program third_party/sdr-ettus-b200mini
 ```
 
@@ -583,6 +591,18 @@ explicit flag  >  ROCSAR_* environment  >  rocsar.toml  >  code default
 | `gnss.selected` | `1` | Trusted receiver, by 1-based position in `ports`. |
 | `gnss.stale_after` | `2s` | Fix age past which `fix_ok` goes false. |
 | `camera.device` | `/dev/video0` | The node `fswebcam` reads. |
+| `camera.quality` | `0` | JPEG compression factor, 1–95; `0` is `fswebcam`'s "automatic". The biggest lever on fetch time over a 115 kbit/s link. |
+| `camera.resolution` | `384x288` | Requested capture size as `WxH`. **A request:** the driver may clamp it, and the OBC reports the size it actually got. |
+| `camera.frames` | `1` | Frames averaged into the output, 1–8. More frames is less noise *and* more blur on a moving gondola. |
+| `camera.skip` | `0` | Frames captured and discarded first, 0–60, for a camera whose opening frames are dark. |
+| `camera.delay_ms` | `0` | Milliseconds to let the image settle after the device opens; `0` does not wait. |
+
+The five `camera.*` settings above are the **initial** value only. Once anything
+changes them they are written to `.camera-params.json` in the data root, and that
+file wins — so a change made in the Ground Station survives an OBC restart and a
+change made in `rocsar.toml` does not. Delete the file to get these back. Bounds
+and the `fswebcam(1)` man page line each comes from:
+`internal/camera/params_contract.go`.
 | `sdr.program` | `/root/rocsar-rpi/sdr-ettus-b200mini` | Directory holding `parameters/` and `Data/` — **not** the `connect` binary, which is found on `PATH`. Must be named `sdr-ettus-b200mini`; see below. |
 | `sdr.data_dir` | `/mnt/rocsar_ssd` | Where the program writes captures (its `SSD_PATH`). Must equal `http.root`. |
 | `telemetry.interval` | `1s` | Frame rate. |

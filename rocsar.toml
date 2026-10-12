@@ -56,9 +56,9 @@ telemetry_endpoint = "tcp://*:5556"
 #
 # Flags beat this file, which beats ROCSAR_* environment variables' file half,
 # which beats the code default. See ARCHITECTURE.md 11.
-control_endpoint = "tcp://192.168.1.50:5555"
-telemetry_endpoint = "tcp://192.168.1.50:5556"
-http_endpoint = "http://192.168.1.50:5557"
+control_endpoint = "tcp://172.16.18.131:5555"
+telemetry_endpoint = "tcp://172.16.18.131:5556"
+http_endpoint = "http://172.16.18.131:5557"
 
 [http]
 addr = ":5557"
@@ -150,6 +150,55 @@ stale_after = "2s"
 
 [camera]
 device = "/dev/video0"
+
+# The capture settings, and the ONLY thing in this section that is a default
+# rather than a fact: these five are the value in force until somebody changes
+# one, and after that the file `.camera-params.json` in the data root wins over
+# them. The Ground Station writes that file when an operator applies a change, so
+# the precedence is
+#
+#     .camera-params.json on the SSD  >  these keys  >  fswebcam's own defaults
+#
+# which is why a change made in the window survives an OBC restart and a change
+# made here does not. Delete the settings file to get these back.
+#
+# Every value below is fswebcam's OWN default, spelled out. That is deliberate:
+# before these keys existed the camera passed no resolution at all, so fswebcam
+# asked the device for 384x288 and every photograph this system ever took was a
+# quarter-megapixel one. Naming the same request changes nothing and makes it
+# visible.
+#
+# Bounds and where each comes from: internal/camera/params_contract.go, which
+# cites the fswebcam(1) man page for every one. They are fswebcam's, not the
+# camera's -- a resolution here is a REQUEST, and the driver may decline it. The
+# OBC reports the decoded size of what it actually wrote, so a clamp is visible
+# rather than silent.
+
+# JPEG compression factor, 1..95. 0 is fswebcam's "automatic", which is what it
+# does by default. At 115 kbit/s this is the single biggest lever on how long a
+# photograph takes to fetch: near 40 is the difference between seconds and
+# minutes for a small frame.
+quality = 0
+
+# Requested capture size as WxH. fswebcam's man page is explicit that "the actual
+# resolution used may differ if the source or device cannot capture at the
+# specified resolution", so a value this camera cannot do is clamped, not
+# refused.
+resolution = "384x288"
+
+# Frames averaged into the output, 1..8. More frames is less noise AND more blur,
+# and this camera is on a moving gondola.
+frames = 1
+
+# Frames captured and thrown away first, 0..60. For a camera whose first frames
+# after opening are dark or corrupt, which the fswebcam man page says some are.
+# Left at 0 because raising it here would change what photographs look like
+# without anybody asking.
+skip = 0
+
+# Milliseconds to let the image settle between opening the device and capturing.
+# 0 does not wait.
+delay_ms = 0
 
 [sdr]
 # The directory holding parameters/params.json and Data/ -- NOT the connect

@@ -136,6 +136,79 @@ func BuildSetParamsRequest(patch SdrParamsPatch) (*Request, error) {
 	}, nil
 }
 
+// CameraParamsPatch is a partial capture-settings update. A nil pointer means
+// "leave it alone", exactly as on SdrParamsPatch.
+//
+// It mirrors the wire's CameraParams without importing domain: domain describes
+// what the OBC's camera accepts, this describes what the console sends, and the
+// two agree by construction in the one builder below rather than by sharing a
+// type across the link.
+//
+// The JSON names are the proto field names, which are also the settings file's
+// own keys and the console's input names -- one vocabulary in three places, so
+// an operator reading the file beside the window is reading the same words.
+type CameraParamsPatch struct {
+	// JPEGQuality is fswebcam's compression factor. Zero means automatic, and
+	// that is why the whole struct is pointers: a plain uint32 cannot tell
+	// "leave the quality alone" from "go back to automatic", and those are
+	// different requests to a camera.
+	JPEGQuality *uint32 `json:"jpeg_quality,omitempty"`
+	// Resolution is one "WxH" string rather than a width and a height, because
+	// one V4L2 format is one setting and half of one is not a thing a device can
+	// be asked for.
+	Resolution *string `json:"resolution,omitempty"`
+	Frames     *uint32 `json:"frames,omitempty"`
+	Skip       *uint32 `json:"skip,omitempty"`
+	DelayMs    *uint32 `json:"delay_ms,omitempty"`
+}
+
+// empty reports whether a patch names nothing at all.
+//
+// One predicate, as on SdrParamsPatch: an operator who pressed apply expects a
+// change, and a silent success is indistinguishable from a broken button.
+func (p CameraParamsPatch) empty() bool {
+	return p.JPEGQuality == nil && p.Resolution == nil && p.Frames == nil &&
+		p.Skip == nil && p.DelayMs == nil
+}
+
+// BuildCameraParamsRequest turns a typed patch into a CommandRequest.
+//
+// Typed, like BuildSetParamsRequest, because the caller is a window with typed
+// numeric fields: parsing a uint32 to a string to re-parse it would be
+// validation theatre twice over.
+func BuildCameraParamsRequest(patch CameraParamsPatch) (*Request, error) {
+	if patch.empty() {
+		return nil, fmt.Errorf("no settings were given; a partial update must name at least one")
+	}
+	params := &rocsarv1.CameraParams{}
+	if patch.JPEGQuality != nil {
+		v := *patch.JPEGQuality
+		params.JpegQuality = &v
+	}
+	if patch.Resolution != nil {
+		v := *patch.Resolution
+		params.Resolution = &v
+	}
+	if patch.Frames != nil {
+		v := *patch.Frames
+		params.Frames = &v
+	}
+	if patch.Skip != nil {
+		v := *patch.Skip
+		params.Skip = &v
+	}
+	if patch.DelayMs != nil {
+		v := *patch.DelayMs
+		params.DelayMs = &v
+	}
+	return &rocsarv1.CommandRequest{
+		RequestId: NewRequestID("camera-set-params"),
+		Payload: &rocsarv1.CommandRequest_CameraSetParams{
+			CameraSetParams: &rocsarv1.CameraSetParamsCommand{Params: params},
+		},
+	}, nil
+}
+
 // requestPrefix is the first field of every request_id this package generates.
 //
 // It was "gs-cli-" while this code lived in tools/gs_cli. It is neutral now
@@ -205,6 +278,11 @@ func BuildRequests(name string, args []string) ([]*rocsarv1.CommandRequest, erro
 	case "photo":
 		req.Payload = &rocsarv1.CommandRequest_TakePhoto{
 			TakePhoto: &rocsarv1.TakePhotoCommand{},
+		}
+
+	case "camera-get-params":
+		req.Payload = &rocsarv1.CommandRequest_CameraGetParams{
+			CameraGetParams: &rocsarv1.CameraGetParamsCommand{},
 		}
 
 	case "gnss":
@@ -476,8 +554,8 @@ func parseOnOff(s string) (bool, error) {
 // command palette, so the two cannot disagree about what exists.
 func Names() []string {
 	return []string{
-		"query", "photo", "gnss", "gnss-rotate", "heading", "jog", "zero", "mount", "dir",
-		"heater", "stop", "pico-status", "sdr-probe", "sdr-connect",
+		"query", "photo", "camera-get-params", "gnss", "gnss-rotate", "heading", "jog",
+		"zero", "mount", "dir", "heater", "stop", "pico-status", "sdr-probe", "sdr-connect",
 		"sdr-reset-usb", "sdr-get-params", "link", "reboot",
 	}
 }

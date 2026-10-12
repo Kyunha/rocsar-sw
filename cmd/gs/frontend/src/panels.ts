@@ -23,6 +23,7 @@ import {
     barGauge,
     budgetBar,
     clockText,
+    fmtBytes,
     compass,
     percent,
     Ring,
@@ -48,16 +49,6 @@ export function fmtUptime(s: number): string {
     const m = Math.floor((s % 3600) / 60);
     const sec = Math.floor(s % 60);
     return `${h}h${m.toString().padStart(2, '0')}m${sec.toString().padStart(2, '0')}s`;
-}
-
-export function fmtBytes(n: number): string {
-    if (n < 1024) {
-        return `${n} B`;
-    }
-    if (n < 1024 * 1024) {
-        return `${(n / 1024).toFixed(1)} KiB`;
-    }
-    return `${(n / 1024 / 1024).toFixed(1)} MiB`;
 }
 
 export function fmtAge(s: number): string {
@@ -323,7 +314,19 @@ export function renderCameraSdrLink(v: View, txHistory: number[] = []): string {
     const photos = c.photos_taken === null || c.photos_taken === undefined ? '—' : `${c.photos_taken}`;
     const photosChip = stateChip(`${photos} photo(s)`, 'dim');
     const device = c.device === null || c.device === undefined ? '' : ` ${esc(c.device)}`;
-    const last = c.last_photo ? ` <span class="hint">last ${esc(c.last_photo)}</span>` : '';
+    /* The last photograph's SIZE, not just its name. A name said a file existed
+     * and said nothing about whether fetching it was an afternoon; the decoded
+     * dimensions are what turn "take a photo" into a decision an operator can
+     * make. "—" when the header was never read, which is a different fact from
+     * "no photograph yet" and must not be drawn as 0x0. */
+    let last = '';
+    if (c.last_photo) {
+        const dims =
+            c.last_photo_width !== null && c.last_photo_height !== null
+                ? `${c.last_photo_width}×${c.last_photo_height}`
+                : 'size unknown';
+        last = ` <span class="hint">last ${esc(c.last_photo)} (${dims})</span>`;
+    }
 
     const s = v.sdr;
     /* The PID, not `running`. This rendered "running pid true" for as long as the

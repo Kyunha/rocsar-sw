@@ -126,6 +126,19 @@ type Shaper struct {
 	rateKbps uint32
 	active   bool
 	reason   string
+	// wantDevice and wantRateKbps are what this shaper has been asked to shape,
+	// recorded at the top of Apply before any failure path can run. device and
+	// rateKbps mean "what is believed to be in force right now" and are cleared
+	// when an install does not take; want* must outlive that, because Verify
+	// repairs from them. Without a remembered device, a single failed repair
+	// leaves Verify with nothing to retry against, which is how a vanished qdisc
+	// became a permanently unbounded link.
+	wantDevice   string
+	wantRateKbps uint32
+	// installed records that a cap was successfully put in force at least once,
+	// so Verify can tell "an HTB we did not install is on the device" from "we
+	// have never managed to install one and should keep trying".
+	installed bool
 	// lostAt records when the qdisc was last found missing, so a re-verification
 	// loop can report how long the link has been unbounded.
 	lostAt time.Time
@@ -181,6 +194,14 @@ func (s *Shaper) Apply(ctx context.Context, device string, rateKbps uint32) (boo
 				"capped at %d kbit/s instead", rateKbps, floor, floor)
 		rateKbps = floor
 	}
+
+	// Record what this shaper is responsible for BEFORE anything that can fail,
+	// so Verify always has a device and a rate to repair with. device/rateKbps
+	// (the fields below) continue to mean "what is believed to be in force now"
+	// and fail() clears them; want* survive that on purpose.
+	s.mu.Lock()
+	s.wantDevice, s.wantRateKbps = device, rateKbps
+	s.mu.Unlock()
 
 	// Remove any previous hierarchy first, or the class adds fail on the second
 	// start and shaping silently degrades. An absent qdisc is success -- see
@@ -242,6 +263,9 @@ func (s *Shaper) Apply(ctx context.Context, device string, rateKbps uint32) (boo
 	if clampedMsg != "" {
 		reason = clampedMsg + "; " + reason
 	}
+	s.mu.Lock()
+	s.installed = true
+	s.mu.Unlock()
 	s.set(device, rateKbps, true, reason)
 	s.log.Info("link rate applied", "device", device, "rate_kbps", rateKbps,
 		"floor_kbps", floor, "clamped", clampedMsg != "")
@@ -388,47 +412,69 @@ func (s *Shaper) QdiscPresent(ctx context.Context, device string) (bool, error) 
 // The two answers differ in kind and are not collapsed: missing means nothing is
 // limiting the device and the reason says so; present-but-inactive means our own
 // install failed and the reason says that instead.
+//
+// A missing qdisc is REPAIRED, and the repair is retried on every tick until it
+// sticks. A single attempt is not enough: the fault is often a capability that
+// has not been granted yet (main.go grants it to the unit) or a device that has
+// not appeared yet, and both can clear long after the first try. This is the
+// promise cmd/obc/main.go makes when it keeps a failed shaper alive -- "a
+// capability granted while the OBC is running, or a device that appears later,
+// is then recoverable without a restart" -- and until wantDevice outlived a
+// failure, Verify could not keep it.
 func (s *Shaper) Verify(ctx context.Context) (bool, string) {
 	s.mu.RLock()
-	device := s.device
+	wantDevice := s.wantDevice
+	wantRate := s.wantRateKbps
 	active := s.active
+	installed := s.installed
 	s.mu.RUnlock()
 
-	if device == "" {
-		// Nothing was ever installed on this shaper; there is nothing to verify.
+	if wantDevice == "" {
+		// Apply was never called. There is nothing this shaper is responsible
+		// for, so there is nothing to verify and nothing to repair.
 		return active, s.reasonLocked()
 	}
 
-	present, err := s.ops.Present(device)
+	present, err := s.ops.Present(wantDevice)
 	if err != nil {
 		// A read that failed is not evidence the qdisc is gone. Reporting it as
 		// missing would flap the operator's view every time the netlink read
 		// hiccuped, and the cost of a false alarm here is a lot of chasing.
 		reason := s.describe("could not read the traffic control state back from the kernel", err)
-		s.log.Warn("link shaping could not be verified", "device", device, "reason", reason)
+		s.log.Warn("link shaping could not be verified", "device", wantDevice, "reason", reason)
 		return active, reason
 	}
 
-	if present == active {
-		return present, s.reasonLocked()
+	if present && active {
+		// The steady state: the cap is on the device and we own it.
+		return true, s.reasonLocked()
 	}
 
 	if present && !active {
-		// Something installed a qdisc we did not. Not necessarily ours. Saying so
-		// is honest and leaves the operator to decide; claiming success would be
-		// the worse error, because our rate may not be the rate in force.
-		reason := fmt.Sprintf("a traffic control qdisc is present on %s but this OBC did not "+
-			"install one; the effective cap may not be the %d kbit/s reported",
-			device, s.Status().RateKbps)
+		// A qdisc is on the device that is not (or is no longer) the one we
+		// installed. Not necessarily ours, so claiming it as protection would be
+		// the worse error -- our rate may not be the rate in force.
+		if !installed {
+			// We have never installed a cap here; an HTB we did not put there is
+			// not ours to claim. Say so and claim nothing.
+			reason := fmt.Sprintf("a traffic control qdisc is present on %s but this OBC "+
+				"never installed one; the effective cap is not known to be %d kbit/s",
+				wantDevice, wantRate)
+			s.log.Warn("unexpected qdisc on the link device", "reason", reason)
+			return false, reason
+		}
+		reason := fmt.Sprintf("a traffic control qdisc other than the one this OBC installed "+
+			"is present on %s; the effective cap may not be the %d kbit/s reported",
+			wantDevice, wantRate)
 		s.log.Warn("unexpected qdisc on the link device", "reason", reason)
-		s.set(device, s.Status().RateKbps, true, reason)
+		s.set(wantDevice, wantRate, true, reason)
 		return true, reason
 	}
 
-	// The serious direction: we believe we installed a cap and the kernel says
-	// otherwise. Mark it inactive so telemetry stops claiming protection, and
-	// re-apply -- our install may simply have been replaced, and putting it back
-	// is the difference between a visible blip and an unbounded flight.
+	// present == false. Either the qdisc we installed has vanished, or a start
+	// that failed has never managed to install one. Both are repaired the same
+	// way, and the repair runs on every tick rather than once. Mark inactive so
+	// telemetry stops claiming protection until it is back.
 	since := ""
 	s.mu.Lock()
 	if !s.lostAt.IsZero() {
@@ -437,14 +483,16 @@ func (s *Shaper) Verify(ctx context.Context) (bool, string) {
 		s.lostAt = time.Now()
 	}
 	s.active = false
-	s.reason = fmt.Sprintf("the traffic control qdisc was removed from %s%s, so the link is "+
-		"NOT being limited; re-applying", device, since)
+	s.reason = fmt.Sprintf("the traffic control qdisc is not on %s%s, so the link is "+
+		"NOT being limited; re-applying", wantDevice, since)
 	s.mu.Unlock()
 
-	s.log.Error("link shaping disappeared; the device is unbounded",
-		"device", device, "rate_kbps", s.Status().RateKbps)
+	if active {
+		s.log.Error("link shaping disappeared; the device is unbounded",
+			"device", wantDevice, "rate_kbps", wantRate)
+	}
 
-	if _, reason := s.Apply(ctx, device, s.Status().RateKbps); reason != "" {
+	if ok, reason := s.Apply(ctx, wantDevice, wantRate); !ok {
 		s.log.Error("re-applying link shaping failed", "reason", reason)
 	}
 	return s.Active(), s.reasonLocked()

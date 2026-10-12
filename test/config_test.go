@@ -1,6 +1,7 @@
 package test
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -179,6 +180,11 @@ func TestEveryKeyHasAWorkingEnvironmentForm(t *testing.T) {
 		{"gnss.selected", "2"},
 		{"gnss.stale_after", "7s"},
 		{"camera.device", "/dev/video9"},
+		{"camera.quality", "60"},
+		{"camera.resolution", "640x480"},
+		{"camera.frames", "3"},
+		{"camera.skip", "4"},
+		{"camera.delay_ms", "250"},
 		{"sdr.program", "/opt/sdr"},
 		{"sdr.data_dir", "/opt/sdr-data"},
 		{"telemetry.interval", "5s"},
@@ -284,6 +290,26 @@ func assertEnvApplied(t *testing.T, cfg config.Config, key, value string) {
 	case "camera.device":
 		if cfg.Camera.Device != value {
 			t.Errorf("got %q, want %q", cfg.Camera.Device, value)
+		}
+	case "camera.quality":
+		if got := fmt.Sprint(cfg.Camera.Params.JPEGQuality); got != value {
+			t.Errorf("got %s, want %s", got, value)
+		}
+	case "camera.resolution":
+		if cfg.Camera.Params.Resolution != value {
+			t.Errorf("got %q, want %q", cfg.Camera.Params.Resolution, value)
+		}
+	case "camera.frames":
+		if got := fmt.Sprint(cfg.Camera.Params.Frames); got != value {
+			t.Errorf("got %s, want %s", got, value)
+		}
+	case "camera.skip":
+		if got := fmt.Sprint(cfg.Camera.Params.Skip); got != value {
+			t.Errorf("got %s, want %s", got, value)
+		}
+	case "camera.delay_ms":
+		if got := fmt.Sprint(cfg.Camera.Params.DelayMs); got != value {
+			t.Errorf("got %s, want %s", got, value)
 		}
 	case "sdr.program":
 		if cfg.SDR.Program != value {

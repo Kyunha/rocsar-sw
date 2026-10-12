@@ -262,6 +262,41 @@ func (a *App) Snapshot() *gsview.View {
 	return a.latest
 }
 
+// lastLinkRateKbps is the cap the OBC last reported, or zero if it has not
+// reported one.
+//
+// Zero means "unknown" and is not a slow link: before the first telemetry frame
+// there is no measurement at all, and a fetch time computed against a zero rate
+// would be an infinite wait presented as a number.
+func (a *App) lastLinkRateKbps() uint32 {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.latest == nil {
+		return 0
+	}
+	return a.latest.Link.RateKbps
+}
+
+// fetchSeconds is how many whole seconds a payload of this size takes over a link
+// capped at this rate. Zero when either input is unknown.
+//
+// ROUNDED UP, never down. This number is what an operator decides whether to wait
+// for on, and "about 5 seconds" that is really 5.4 is the wrong way round: they
+// start the fetch, it is still running when they expected it to be done, and the
+// figure they trusted was wrong.
+//
+// The arithmetic lives here rather than in the browser for GUI_ARCHITECTURE.md
+// 9.4: the frontend renders numbers, and a photograph's cost is a function of two
+// numbers that only this side has together.
+func fetchSeconds(size uint64, rateKbps uint32) float64 {
+	if size == 0 || rateKbps == 0 {
+		return 0
+	}
+	bytesPerSecond := float64(rateKbps) * 1000 / 8
+	secs := float64(size) / bytesPerSecond
+	return float64(int64(secs) + 1)
+}
+
 // ---------------------------------------------------------------------------
 // Commands
 // ---------------------------------------------------------------------------
@@ -283,6 +318,25 @@ type ArtefactMeta struct {
 	Name      string `json:"name"`
 	SizeBytes uint64 `json:"size_bytes"`
 	Kind      string `json:"kind"`
+
+	// Width and Height are the DECODED pixel dimensions, nil unless the header
+	// was read.
+	//
+	// Nil is a distinct third state alongside "a photograph" and "the header
+	// could not be read", and the console draws it as a dash. A zero here would
+	// be a claim about a picture nobody took.
+	Width  *uint32 `json:"width"`
+	Height *uint32 `json:"height"`
+
+	// FetchSeconds is how long this artefact takes to fetch over the link the
+	// OBC last reported, rounded up, and zero when that link rate is not known
+	// yet.
+	//
+	// It is here because the resolution controls change the size of a
+	// photograph by an order of magnitude, and on a 115 kbit/s link the
+	// difference between a usable and an unusable photograph IS this number. An
+	// operator choosing a quality factor needs to see the cost, not the factor.
+	FetchSeconds float64 `json:"fetch_seconds"`
 }
 
 // runCommand validates, submits and reports. Every motion and non-motion
@@ -334,7 +388,23 @@ func (a *App) submitAll(name string, reqs []*client.Request) CommandResult {
 			Message:   resp.GetMessage(),
 		}
 		if n := resp.GetArtefactName(); n != "" {
-			out.Artefact = &ArtefactMeta{Name: n, SizeBytes: resp.GetArtefactSizeBytes(), Kind: resp.GetArtefactKind()}
+			meta := &ArtefactMeta{Name: n, SizeBytes: resp.GetArtefactSizeBytes(), Kind: resp.GetArtefactKind()}
+			// The DECODED dimensions, when the header could be read. Nil in
+			// ArtefactMeta means "not decoded", and the console draws a dash for
+			// it -- which is the truth -- rather than 0x0, which is not a
+			// photograph.
+			if w, h := resp.GetArtefactWidth(), resp.GetArtefactHeight(); w > 0 && h > 0 {
+				width, height := uint32(w), uint32(h)
+				meta.Width, meta.Height = &width, &height
+			}
+			// How long the fetch will take, on the link the OBC says it has.
+			// Computed HERE rather than in the browser, for the reason
+			// GUI_ARCHITECTURE.md 9.4 gives: the frontend renders numbers and
+			// does not do arithmetic on them, and a photograph's cost on a
+			// 115 kbit/s link is arithmetic on two numbers that only Go has
+			// together.
+			meta.FetchSeconds = fetchSeconds(resp.GetArtefactSizeBytes(), a.lastLinkRateKbps())
+			out.Artefact = meta
 		}
 		if !resp.GetSuccess() {
 			// Naming the axis, on the refusal path as well as the transport one. A
@@ -383,9 +453,52 @@ func (a *App) getQueue() *client.Queue {
 // telemetry. Mostly a connectivity check with a human-readable answer.
 func (a *App) QueryStatus() CommandResult { return a.runCommand("query") }
 
-// TakePhoto captures one photograph. The result carries the artefact's name
-// and size; the bytes arrive through DownloadArtefact, never through here.
+// TakePhoto captures one photograph. The result carries the artefact's name,
+// size and decoded dimensions; the bytes arrive through DownloadArtefact, never
+// through here.
 func (a *App) TakePhoto() CommandResult { return a.runCommand("photo") }
+
+// CameraGetParams reads the capture settings in force via the OBC and returns
+// them as JSON. The window shows current values as placeholder hints while blank
+// inputs keep meaning "leave alone".
+//
+// An OBC that predates the command answers ERROR_INVALID_COMMAND (unknown oneof
+// payload, refused at dispatch, never a hang). That error is returned verbatim
+// rather than translated, exactly as for SdrGetParams: the frontend distinguishes
+// "the OBC is too old for this" from every other failure and falls back to
+// disabled controls with "(unavailable)" hints, which is the honest rendering of
+// a camera it cannot ask.
+func (a *App) CameraGetParams() (string, error) {
+	q := a.getQueue()
+	if q == nil {
+		return "", client.ErrNotConnected
+	}
+	reqs, err := client.BuildRequests("camera-get-params", nil)
+	if err != nil {
+		return "", err
+	}
+	resp, err := q.Submit(a.ctx, reqs[0])
+	if err != nil {
+		return "", err
+	}
+	if !resp.GetSuccess() {
+		return "", errors.New(resp.GetMessage())
+	}
+	return resp.GetMessage(), nil
+}
+
+// SetCameraParams applies a partial capture-settings update. Nil fields are left
+// alone; an all-nil patch is refused before anything travels, because a change
+// nobody asked for is indistinguishable from a button that is not wired up.
+func (a *App) SetCameraParams(patch client.CameraParamsPatch) CommandResult {
+	req, err := client.BuildCameraParamsRequest(patch)
+	if err != nil {
+		out := CommandResult{Error: "ERROR_INVALID_PARAMETER", Message: err.Error()}
+		a.emit(eventCommand, out)
+		return out
+	}
+	return a.submitAll("camera-set-params", []*client.Request{req})
+}
 
 // SelectReceiver trusts one GNSS receiver by 1-based id.
 func (a *App) SelectReceiver(receiverID uint32) CommandResult {
@@ -800,6 +913,14 @@ func (a *App) Dispatch(method string, args []json.RawMessage) (interface{}, erro
 		return a.QueryStatus(), nil
 	case "TakePhoto":
 		return a.TakePhoto(), nil
+	case "CameraGetParams":
+		return a.CameraGetParams()
+	case "SetCameraParams":
+		var patch client.CameraParamsPatch
+		if err := unmarshalArg(args, 0, &patch); err != nil {
+			return nil, err
+		}
+		return a.SetCameraParams(patch), nil
 	case "SelectReceiver":
 		id, err := argUint(args, 0)
 		if err != nil {

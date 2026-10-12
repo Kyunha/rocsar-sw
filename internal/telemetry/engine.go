@@ -30,15 +30,19 @@ const FrameBudgetBytes = 2048
 // interface so the caller can pass closures and the package needs no knowledge
 // of who implements what.
 type Providers struct {
-	System     func() SystemSnapshot
-	GNSS       func() []domain.ReceiverStatus
-	Pico       func() (domain.PicoTelemetry, bool)
-	PicoConn   func() bool
-	PicoAck    func() *domain.Ack
-	SDR        func() SDRSnapshot
-	Camera     func() domain.SubsystemState
-	CameraDev  func() string
-	CameraLast func() (string, uint64)
+	System    func() SystemSnapshot
+	GNSS      func() []domain.ReceiverStatus
+	Pico      func() (domain.PicoTelemetry, bool)
+	PicoConn  func() bool
+	PicoAck   func() *domain.Ack
+	SDR       func() SDRSnapshot
+	Camera    func() domain.SubsystemState
+	CameraDev func() string
+	// CameraShot reports how many photographs have been taken and which one was
+	// last. It replaced a provider that returned a name and a count and filled
+	// in neither: the name was always empty, so the console showed an empty
+	// last-photo for the life of the system.
+	CameraShot func() (uint64, *domain.Photo)
 	Link       func() domain.LinkStatus
 }
 
@@ -118,8 +122,8 @@ func (e *Engine) Build() Snapshot {
 	if e.providers.CameraDev != nil {
 		s.CameraDevice = e.providers.CameraDev()
 	}
-	if e.providers.CameraLast != nil {
-		s.LastPhoto, s.PhotosTaken = e.providers.CameraLast()
+	if e.providers.CameraShot != nil {
+		s.PhotosTaken, s.LastPhoto = e.providers.CameraShot()
 		// Known exactly when the encoder would emit the count: a provider
 		// supplied it and the subsystem is not unspecified. Mirroring the
 		// encoder's condition here rather than duplicating it there keeps the
@@ -154,8 +158,20 @@ type Snapshot struct {
 	SDR          SDRSnapshot
 	Camera       domain.SubsystemState
 	CameraDevice string
-	LastPhoto    string
 	PhotosTaken  uint64
+	// LastPhoto is the most recent photograph, or nil if none has been taken.
+	//
+	// A pointer, and not a name, because the photograph is more than its name:
+	// its dimensions are the only decoded evidence of what resolution the camera
+	// actually produced, and a name cannot carry them. It was a bare string until
+	// the decoded dimensions existed, and it was ALWAYS empty in practice --
+	// the only provider returned an empty name and a count, so the console's
+	// "last <name>" rendered as "last " for the life of the system.
+	//
+	// nil means "no photograph yet", which is a different fact from a photograph
+	// whose header could not be read: that is LastPhoto non-nil with Width and
+	// Height both zero.
+	LastPhoto *domain.Photo
 	// PhotosTakenKnown reports whether the count above means anything. A zero
 	// with Known=false is "the camera subsystem never reported", rendered as
 	// "—"; a zero with Known=true is "no photographs yet". The wire carries

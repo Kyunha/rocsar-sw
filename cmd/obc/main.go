@@ -177,11 +177,16 @@ func run() error {
 	// ---------------------------------------------------------------------
 	// Camera
 	// ---------------------------------------------------------------------
-	var cam domain.Camera = camera.NewMock(cfg.Camera.Device, "photos", store)
+	// The configured settings are the INITIAL value. A stored file on the SSD
+	// wins over them, and camera.NewCapture says so in the log when the two
+	// disagree, because "the config says one resolution and the camera is using
+	// another" is a fact somebody will need.
+	camParams := cfg.Camera.Params
+	var cam domain.Camera = camera.NewMock(cfg.Camera.Device, "photos", store, camParams, log)
 	if mocked["camera"] {
 		log.Warn("using a simulated camera")
 	} else {
-		real := camera.NewCapture(cfg.Camera.Device, "photos", store, 85)
+		real := camera.NewCapture(cfg.Camera.Device, "photos", store, camParams, log)
 		cam = real
 	}
 
@@ -277,9 +282,14 @@ func run() error {
 				LastError: sdrPort.LastError(),
 			}
 		},
-		Camera:     cam.State,
-		CameraDev:  cam.Device,
-		CameraLast: func() (string, uint64) { return "", cam.PhotosTaken() },
+		Camera:    cam.State,
+		CameraDev: cam.Device,
+		// The last photograph as well as the count. The provider this replaces
+		// returned an empty string for the name and the count for the second
+		// value, so the console's "last <name>" had nothing to show for its whole
+		// life -- the field was in the Snapshot, on the wire, in the view and in
+		// the panel, and nothing filled it.
+		CameraShot: func() (uint64, *domain.Photo) { return cam.PhotosTaken(), cam.LastPhoto() },
 		Link:       shaper.Status,
 	}, time.Now)
 

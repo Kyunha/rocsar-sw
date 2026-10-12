@@ -81,28 +81,19 @@ var Keys = []Key{
 	},
 	{
 		Name:       "skip",
-		Min:        1,
+		Min:        0,
 		Max:        60,
 		Unit:       "frames",
-		Provenance: "fswebcam(1): \"-S, --skip <number> ... These frames will be captured but won't be use. Use this option if your camera sends some bad or corrupt frames when it first starts capturing.\" Min is 1 because 0 is the man page's default and is carried by absence, not by a stored value -- a stored skip of 0 would be indistinguishable from never having set it. Max is a typo guard, not a device limit: 60 frames is about two seconds at 30 fps, which is longer than any USB webcam needs to settle, and its real purpose is to reject a mistyped 600 -- see also the frames+skip cross-field check in merged().",
+		Provenance: "fswebcam(1): \"-S, --skip <number> ... These frames will be captured but won't be use. Use this option if your camera sends some bad or corrupt frames when it first starts capturing.\" Min is 0, and 0 is a real setting rather than an absence: discard nothing and photograph the first frame, which is what fswebcam does by default and what this camera did for its whole life. That sentence in the man page is the reason the control is offered -- it is a description of a defect this aircraft's camera may well have -- and finding out is the operator's job, not a default to be changed on their behalf. Max is a typo guard, not a device limit: 60 frames is about two seconds at 30 fps, which is longer than any USB webcam needs to settle, and its real purpose is to reject a mistyped 600.",
 	},
 	{
 		Name:       "delay_ms",
-		Min:        1,
+		Min:        0,
 		Max:        10000,
 		Unit:       "ms",
-		Provenance: "fswebcam(1): \"-D, --delay <delay> ... Inserts a delay after the source or device has been opened and initialised, and before the capture begins. Some devices need this delay to let the image settle after a setting has changed.\" Max is a typo guard: ten seconds is longer than any exposure settle and comparable to the whole 20 s command timeout (client.CommandTimeout), past which the Ground Station has already given up on the reply. Min is 1 because 0 is absence -- no -D is passed at all.",
+		Provenance: "fswebcam(1): \"-D, --delay <delay> ... Inserts a delay after the source or device has been opened and initialised, and before the capture begins. Some devices need this delay to let the image settle after a setting has changed.\" Min is 0, which means do not wait -- fswebcam's own default, and so the one case in which no -D is passed. Max is a typo guard: ten seconds is longer than any exposure settle and comparable to the whole 20 s command timeout (client.CommandTimeout), past which the Ground Station has already given up on the reply.",
 	},
 }
-
-// MaxTotalFrames bounds frames + skip together.
-//
-// The man page gives no frame rate and the device's is unknown, so this cannot
-// be derived from the hardware. It is derived from the other end instead: the
-// Ground Station's command round trip is 20 s (internal/client.CommandTimeout),
-// and 120 frames is 24 s even at a conservative 5 fps and 4 s at 30 fps. So
-// this rejects "skip 1000" and leaves "skip 10, frames 4" alone.
-const MaxTotalFrames = 120
 
 // MaxResolutionPixels is a typo guard on one axis of RESOLUTION, and is
 // deliberately far above anything a USB camera offers.
@@ -181,17 +172,6 @@ func Validate(p domain.CameraParams) error {
 
 	if err := ValidateResolution(p.Resolution); err != nil {
 		errs = append(errs, err.Error())
-	}
-
-	// The cross-field check, on the sum rather than on either value. Only runs
-	// when both are individually in range, so a frames of 0 does not also get
-	// reported as "0 + 1 frames exceeds 120".
-	if p.Frames >= 1 && p.Frames <= 8 && p.Skip >= 1 && p.Skip <= 60 &&
-		uint64(p.Frames)+uint64(p.Skip) > MaxTotalFrames {
-		errs = append(errs, fmt.Sprintf(
-			"frames + skip = %d exceeds %d: the camera would have to produce %d frames "+
-				"inside one 20 s command round trip",
-			p.Frames+p.Skip, MaxTotalFrames, p.Frames+p.Skip))
 	}
 
 	if len(errs) == 0 {

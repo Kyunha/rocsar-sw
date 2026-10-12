@@ -27,6 +27,7 @@ import {
     stateChip,
     tickAngle,
     TICK_MAX,
+    renderShotResult,
 } from '../src/widgets.ts';
 
 test('shortestDelta takes the short way round', () => {
@@ -188,4 +189,95 @@ test('knobValueFromPointer snaps to the step and stays in range', () => {
         assert.equal(v, Math.round(v));
     }
     assert.equal(knobValueFromPointer(0, 100, 5, 0, -10), 50);
+});
+
+/* ---------------------------------------------------------------------------
+   The camera shot result
+   --------------------------------------------------------------------------- */
+
+/* The camera panel renders the size of a photograph, what it costs on the link,
+ * and whether the driver gave us the resolution we asked for. Each is a fact the
+ * operator cannot get anywhere else at the moment they press the button.
+ *
+ * The tests below are mostly about the three-way absence, which is where a
+ * rendering rule goes wrong silently: a "—" and a "0×0" both look like code that
+ * ran, and only one of them is true. */
+test('the shot result names the size and what it costs on the link', () => {
+    const out = renderShotResult('1280x720', {
+        size_bytes: 218_440,
+        width: 1280,
+        height: 720,
+        fetch_seconds: 16,
+    });
+    assert.match(out, /640×480|1280×720/);
+    assert.match(out, /KiB|MiB/);
+    /* A span, rendered as one. Not a clock time: clockText answers "what time
+     * will it be", so a 16-second fetch rendered as a wall clock reads as a time
+     * of day and means something else entirely. */
+    assert.match(out, /0:16 to fetch/);
+    assert.doesNotMatch(out, /to fetch<\/|am|pm/);
+});
+
+test('the shot result says when the driver clamped the resolution', () => {
+    const out = renderShotResult('1920x1080', {
+        size_bytes: 40_000,
+        width: 640,
+        height: 480,
+        fetch_seconds: 3,
+    });
+    assert.match(out, /clamped/);
+    assert.match(out, /1920x1080 was asked for/);
+    assert.match(out, /640×480/);
+});
+
+test('the shot result says nothing about clamping when the request was met', () => {
+    const out = renderShotResult('1280x720', {
+        size_bytes: 40_000,
+        width: 1280,
+        height: 720,
+        fetch_seconds: 3,
+    });
+    assert.doesNotMatch(out, /clamped/);
+});
+
+/* Three different facts, three different renderings. The middle one is the one
+ * that gets lost: a photograph exists, its header just could not be read, and
+ * drawing 0×0 for that is a claim about a picture nobody took. */
+test('the shot result keeps "no size decoded" apart from a real size', () => {
+    const unreadable = renderShotResult('1280x720', {
+        size_bytes: 40_000,
+        width: null,
+        height: null,
+        fetch_seconds: 3,
+    });
+    assert.match(unreadable, /size unknown/);
+    assert.doesNotMatch(unreadable, /0×0/);
+
+    const known = renderShotResult('1280x720', {
+        size_bytes: 40_000,
+        width: 640,
+        height: 480,
+        fetch_seconds: 3,
+    });
+    assert.match(known, /640×480/);
+    assert.doesNotMatch(known, /size unknown/);
+});
+
+/* An unknown link rate means the fetch cost is unknown, and the line omits it
+ * rather than claiming zero seconds. */
+test('the shot result omits the fetch cost when the link rate is unknown', () => {
+    const out = renderShotResult(null, {
+        size_bytes: 40_000,
+        width: 640,
+        height: 480,
+        fetch_seconds: 0,
+    });
+    assert.doesNotMatch(out, /to fetch/);
+    assert.match(out, /640×480/);
+});
+
+/* A command that produced no artefact renders nothing at all -- not an empty
+ * string that leaves a stray divider, and not a zero. */
+test('the shot result is empty when there is no artefact', () => {
+    assert.equal(renderShotResult('1280x720', null), '');
 });

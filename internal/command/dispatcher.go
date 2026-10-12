@@ -133,6 +133,10 @@ func (d *Dispatcher) Handle(ctx context.Context, req *rocsarv1.CommandRequest) *
 		return d.sdrGetParams(ctx, req.GetRequestId())
 	case *rocsarv1.CommandRequest_TakePhoto:
 		return d.takePhoto(ctx, req.GetRequestId())
+	case *rocsarv1.CommandRequest_CameraSetParams:
+		return d.cameraSetParams(ctx, req.GetRequestId(), p.CameraSetParams)
+	case *rocsarv1.CommandRequest_CameraGetParams:
+		return d.cameraGetParams(ctx, req.GetRequestId())
 	case *rocsarv1.CommandRequest_GnssSelect:
 		return d.gnssSelect(req.GetRequestId(), p.GnssSelect)
 	case *rocsarv1.CommandRequest_LinkSetLimit:
@@ -173,6 +177,10 @@ func commandName(req *rocsarv1.CommandRequest) string {
 		return "sdr.get_params"
 	case *rocsarv1.CommandRequest_TakePhoto:
 		return "camera.take_photo"
+	case *rocsarv1.CommandRequest_CameraSetParams:
+		return "camera.set_params"
+	case *rocsarv1.CommandRequest_CameraGetParams:
+		return "camera.get_params"
 	case *rocsarv1.CommandRequest_GnssSelect:
 		return "gnss.select"
 	case *rocsarv1.CommandRequest_LinkSetLimit:
@@ -430,6 +438,11 @@ func (d *Dispatcher) sdrGetParams(ctx context.Context, requestID string) *rocsar
 // The air link is 115 kbit/s. A multi-megabyte JPEG in a command response would
 // go through the priority class and starve command traffic; the Ground Station
 // fetches it over the bulk port instead. See ARCHITECTURE.md 5.1.
+//
+// The decoded dimensions come back with it. That is not decoration: the operator
+// asked for a resolution, and the only place a declined request can be reported
+// is the reply to the command that asked -- by the time the file is being
+// previewed the question has stopped being interesting.
 func (d *Dispatcher) takePhoto(ctx context.Context, requestID string) *rocsarv1.CommandResponse {
 	if d.camera == nil {
 		return fail(requestID, rocsarv1.ErrorCode_ERROR_NOT_CONNECTED, "no camera is configured")
@@ -443,12 +456,113 @@ func (d *Dispatcher) takePhoto(ctx context.Context, requestID string) *rocsarv1.
 			"the camera reported success but produced no photograph")
 	}
 
-	resp := ok(requestID, fmt.Sprintf("captured %s (%d bytes); fetch it over HTTP",
-		photo.Name, photo.SizeBytes))
+	resp := ok(requestID, describePhoto(ctx, photo, d.camera))
 	resp.ArtefactName = proto.String(photo.Path)
 	resp.ArtefactSizeBytes = proto.Uint64(photo.SizeBytes)
 	resp.ArtefactKind = proto.String(photo.Kind)
+	// Only when the header was read: absent means "no size was decoded", which
+	// is not the same claim as "this photograph is 0x0".
+	if photo.Width > 0 && photo.Height > 0 {
+		resp.ArtefactWidth = proto.Uint32(photo.Width)
+		resp.ArtefactHeight = proto.Uint32(photo.Height)
+	}
 	return resp
+}
+
+// describePhoto is the one-line reply to take_photo.
+//
+// It says the resolution that was asked for next to the one that arrived, and
+// names the difference when they differ. A reply that reads "captured X (40960
+// bytes)" is true and useless; the photograph an operator is about to spend
+// thirty minutes fetching over a 115 kbit/s link deserves to know its dimensions
+// before they start.
+func describePhoto(ctx context.Context, photo *domain.Photo, cam domain.Camera) string {
+	size := fmt.Sprintf("%d bytes", photo.SizeBytes)
+	if photo.Width > 0 && photo.Height > 0 {
+		size = fmt.Sprintf("%dx%d, %d bytes", photo.Width, photo.Height, photo.SizeBytes)
+	}
+
+	want, err := cam.Params(ctx)
+	if err != nil || want.Resolution == "" {
+		return fmt.Sprintf("captured %s (%s); fetch it over HTTP", photo.Name, size)
+	}
+	got := fmt.Sprintf("%dx%d", photo.Width, photo.Height)
+	if got == want.Resolution {
+		return fmt.Sprintf("captured %s (%s); fetch it over HTTP", photo.Name, size)
+	}
+	return fmt.Sprintf("captured %s (%s, NOT the %s you asked for: the driver clamped it); "+
+		"fetch it over HTTP", photo.Name, size, want.Resolution)
+}
+
+// cameraSetParams applies a partial capture-settings update.
+func (d *Dispatcher) cameraSetParams(ctx context.Context, requestID string, cmd *rocsarv1.CameraSetParamsCommand) *rocsarv1.CommandResponse {
+	if d.camera == nil {
+		return fail(requestID, rocsarv1.ErrorCode_ERROR_NOT_CONNECTED, "no camera is configured")
+	}
+	p := cmd.GetParams()
+	if p == nil {
+		return fail(requestID, rocsarv1.ErrorCode_ERROR_INVALID_PARAMETER, "no parameters supplied")
+	}
+
+	// Every field is optional and absent means "leave it alone", for the same
+	// reason it is so on the SDR: a JPEG factor of zero means "automatic" and
+	// has to be expressible, which is why these are optionals rather than
+	// values. A patch with nothing set is rejected rather than treated as a
+	// no-op, because an operator who pressed the button expects a change.
+	patch := domain.CameraParamsPatch{
+		JPEGQuality: p.JpegQuality,
+		Frames:      p.Frames,
+		Skip:        p.Skip,
+		DelayMs:     p.DelayMs,
+	}
+	// A string cannot be aliased from the message the way the *uint32 fields
+	// are: GetResolution returns the receiver's own field, and taking its address
+	// would hand the patch a pointer into a message this frame does not own.
+	if p.Resolution != nil {
+		v := p.GetResolution()
+		patch.Resolution = &v
+	}
+
+	if err := d.camera.SetParams(ctx, patch); err != nil {
+		return fail(requestID, classify(err), err.Error())
+	}
+	now, err := d.camera.Params(ctx)
+	if err != nil {
+		return ok(requestID, "settings updated, but they could not be read back: "+err.Error())
+	}
+	return ok(requestID, "settings updated: "+fmt.Sprintf("%+v", now))
+}
+
+// cameraGetParams reads the capture settings in force and returns them as JSON.
+//
+// The read side of camera_set_params, and identical in contract to
+// sdrGetParams: the console shows current values as placeholder hints while
+// blank inputs keep meaning "leave alone", and a read that fails is surfaced
+// rather than guessed.
+//
+// The JSON keys are the settings file's own keys, which are also the console's
+// field names, so all three speak one vocabulary.
+func (d *Dispatcher) cameraGetParams(ctx context.Context, requestID string) *rocsarv1.CommandResponse {
+	if d.camera == nil {
+		return fail(requestID, rocsarv1.ErrorCode_ERROR_NOT_CONNECTED, "no camera is configured")
+	}
+	params, err := d.camera.Params(ctx)
+	if err != nil {
+		return fail(requestID, classify(err), err.Error())
+	}
+	out, err := json.Marshal(params)
+	if err != nil {
+		return fail(requestID, rocsarv1.ErrorCode_ERROR_INTERNAL,
+			fmt.Sprintf("could not encode camera settings: %v", err))
+	}
+	// Cannot overflow in practice -- five small fields -- but the guard stays
+	// because a future settings file might carry a long string, and the
+	// alternative is a truncated JSON document the console parses into
+	// something it then reports as the state of the camera.
+	if len(out) > maxCommandOutput {
+		out = out[:maxCommandOutput]
+	}
+	return ok(requestID, string(out))
 }
 
 // ---------------------------------------------------------------------------

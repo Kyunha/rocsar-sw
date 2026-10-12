@@ -486,3 +486,93 @@ export function knobValueFromPointer(
     const snapped = Math.round(raw / step) * step;
     return clamp(Number(snapped.toFixed(6)), min, max);
 }
+
+/* ---------------------------------------------------------------------------
+   The camera shot result
+   --------------------------------------------------------------------------- */
+
+/* What the OBC said about the photograph it just wrote: how big it is, how big
+ * it turned out to be, and how long fetching it will take.
+ *
+ * Declared here rather than imported from models.ts so this module stays the
+ * leaf it has always been -- it imports nothing -- which is what lets
+ * test/widgets.test.ts hold these rules with `node --test` and no bundler. The
+ * shape is the ArtefactMeta the Go side sends; three fields of it are named
+ * locally because a test that has to import two modules to check a string is a
+ * test that stops being run. */
+export interface ShotArtefact {
+    size_bytes: number;
+    width: number | null;
+    height: number | null;
+    fetch_seconds: number;
+}
+
+/* The line under the photo button.
+ *
+ * Three things are said out loud, because each is a fact the operator cannot get
+ * anywhere else at that moment:
+ *
+ *   - the size on disk, which the resolution and quality controls move by an
+ *     order of magnitude;
+ *   - how long fetching it takes on the link the OBC actually has, which is the
+ *     difference between a usable photograph and a coffee break;
+ *   - when the resolution asked for is not the resolution produced.
+ *
+ * The mismatch line is the important one. fswebcam's man page warns that "the
+ * actual resolution used may differ if the source or device cannot capture at
+ * the specified resolution", so a clamp is routine and is not a fault -- but it
+ * is completely invisible unless something says so, and an operator who asked
+ * for 1920x1080 and silently got 640x480 has been given a file neither they nor
+ * the hardware chose.
+ *
+ * `requested` is null until a settings read has succeeded. A comparison with
+ * nothing to compare against is not a comparison, so it is not drawn as one. */
+export function renderShotResult(requested: string | null, artefact: ShotArtefact | null): string {
+    if (artefact === null) {
+        return '';
+    }
+    const a = artefact;
+
+    // "size unknown" and not "0×0": no decoder returns a 0×0 shape, so 0×0 is a
+    // claim about a picture nobody took.
+    const decoded = a.width !== null && a.height !== null;
+    const dims = decoded ? `${a.width}×${a.height}` : 'size unknown';
+
+    let out = `${fmtBytes(a.size_bytes)} · ${dims}`;
+    if (a.fetch_seconds > 0) {
+        // durationText, NOT clockText. clockText answers "what time will it be",
+        // so a sixteen-second fetch rendered as the current time of day with
+        // sixteen minutes added -- a number that looks like a clock, reads as
+        // one, and means something else entirely. A fetch time is a span.
+        out += ` · ${durationText(a.fetch_seconds)} to fetch`;
+    }
+    if (requested !== null && decoded && requested !== `${a.width}x${a.height}`) {
+        out += ` · <span class="err">driver clamped it; ${escHtml(requested)} was asked for</span>`;
+    }
+    return out;
+}
+
+/** fmtBytes renders a size for width: whole bytes below 1 KiB, one decimal above.
+ *
+ * The one formatter for a file size in this frontend. It used to live in
+ * panels.ts, which is where it was first needed, and renderShotResult needed it
+ * too -- at which point a second copy appeared with a DIFFERENT threshold
+ * (1000 rather than 1024, so the two disagreed about which of them called a
+ * number "1 KB"). Two formatters for one quantity that quietly disagree is
+ * exactly the drift this repository treats as a defect, so it lives here, in the
+ * leaf module both callers already reach, and there is one of it.
+ *
+ * Thresholds are 1024 while the labels are KiB and MiB, which is the honest
+ * reading of them: these are binary multiples and the names say so. */
+export function fmtBytes(n: number): string {
+    if (!Number.isFinite(n) || n < 0) {
+        return '-';
+    }
+    if (n < 1024) {
+        return `${n} B`;
+    }
+    if (n < 1024 * 1024) {
+        return `${(n / 1024).toFixed(1)} KiB`;
+    }
+    return `${(n / 1024 / 1024).toFixed(1)} MiB`;
+}

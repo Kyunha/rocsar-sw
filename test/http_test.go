@@ -12,7 +12,10 @@ import (
 	"strings"
 	"testing"
 
+	rocsarv1 "github.com/rocsar/obc/api/rocsar/v1"
 	"github.com/rocsar/obc/internal/camera"
+	"github.com/rocsar/obc/internal/command"
+	"github.com/rocsar/obc/internal/domain"
 	"github.com/rocsar/obc/internal/storage"
 	"github.com/rocsar/obc/internal/transport"
 )
@@ -305,7 +308,7 @@ func TestCameraMockProducesADecodableJPEG(t *testing.T) {
 	dir := t.TempDir()
 	store := storage.New(dir, "")
 
-	cam := camera.NewMock("/dev/video0", "photos", store)
+	cam := camera.NewMock("/dev/video0", "photos", store, domain.DefaultCameraParams(), nil)
 
 	photo, err := cam.Capture(context.Background())
 	if err != nil {
@@ -343,5 +346,82 @@ func TestCameraMockProducesADecodableJPEG(t *testing.T) {
 	}
 	if bytes.Equal(body, secondBody) {
 		t.Error("two captures produced identical bytes; they cannot be told apart on the wire")
+	}
+}
+
+// The camera's settings file is state, not an artefact, and must not appear in
+// the listing the operator reads -- while still being readable over HTTP.
+//
+// It is hidden by a prefix restated in internal/storage, because storage cannot
+// import the package that owns the name. This test is what holds the two to each
+// other: if either side renames its half, this fails.
+//
+// It also fails if the file stops being readable, which is the other half of the
+// arrangement: hiding something from a list is only honest if something else can
+// still show you what it says.
+func TestTheArtefactListingHidesEverySubsystemSettingsFile(t *testing.T) {
+	dir := t.TempDir()
+	store := storage.New(dir, "")
+
+	if err := store.WriteFileAtomic(camera.ParamsFileName,
+		[]byte(`{"resolution":"640x480"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.WriteFileAtomic("camera-20261008-120000.jpg", []byte("a"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	entries, err := store.List(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if e.Name == camera.ParamsFileName {
+			t.Errorf("%s is state and must not be listed as an artefact: %+v",
+				camera.ParamsFileName, e)
+		}
+	}
+	if len(entries) != 1 || entries[0].Name != "camera-20261008-120000.jpg" {
+		t.Errorf("listing = %+v, want the photograph and nothing else", entries)
+	}
+
+	// And it is still there for whoever wants to read it.
+	body, err := os.ReadFile(filepath.Join(dir, camera.ParamsFileName))
+	if err != nil {
+		t.Fatalf("the settings file was hidden from the listing but is not on disk: %v", err)
+	}
+	if !strings.Contains(string(body), "640x480") {
+		t.Errorf("the settings file does not hold what was written: %s", body)
+	}
+}
+
+// A photograph's dimensions travel from the capture, through the command
+// response, so the console can compare what was asked for against what arrived.
+//
+// This is the artefact handover end to end: the dispatcher decodes the JPEG it
+// just wrote and reports the size, and the response says so only when the header
+// was actually read.
+func TestTheTakePhotoResponseCarriesTheDecodedDimensions(t *testing.T) {
+	dir := t.TempDir()
+	store := storage.New(dir, "")
+	cam := camera.NewMock("/dev/video0", "photos", store, domain.DefaultCameraParams(), nil)
+
+	d := command.New(command.Deps{Camera: cam})
+	resp := d.Handle(context.Background(), &rocsarv1.CommandRequest{
+		RequestId: "photo-1",
+		Payload:   &rocsarv1.CommandRequest_TakePhoto{TakePhoto: &rocsarv1.TakePhotoCommand{}},
+	})
+
+	if !resp.GetSuccess() {
+		t.Fatalf("take_photo failed: %s", resp.GetMessage())
+	}
+	if resp.GetArtefactWidth() == 0 || resp.GetArtefactHeight() == 0 {
+		t.Fatalf("the response carries no decoded dimensions: %+v", resp)
+	}
+	if resp.GetArtefactSizeBytes() == 0 {
+		t.Error("the response carries no size")
+	}
+	if resp.GetArtefactName() == "" {
+		t.Error("the response names no artefact to fetch")
 	}
 }

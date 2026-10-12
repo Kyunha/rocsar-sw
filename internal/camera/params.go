@@ -45,24 +45,6 @@ const ParamsFileName = ".camera-params.json"
 // normal state on a first flight and not a failure.
 var ErrNoParamsFile = errors.New("camera: no stored parameters")
 
-// reader is how LoadParams gets bytes out of the store, as a variable so the
-// failure paths can be driven from a test without a filesystem that returns
-// ENOSPC.
-type reader func(*storage.Store, string) ([]byte, error)
-
-// readStored is the real reader.
-//
-// Through store.Resolve rather than a joined path, so the one way to read a file
-// outside the data root stays the one way -- the same rule internal/transport
-// follows on the serving side.
-var readStored reader = func(store *storage.Store, name string) ([]byte, error) {
-	abs, err := store.Resolve(name)
-	if err != nil {
-		return nil, err
-	}
-	return os.ReadFile(abs)
-}
-
 // LoadParams reads the stored settings.
 //
 // A file that is absent, unreadable, unparseable or out of bounds all return
@@ -73,12 +55,16 @@ var readStored reader = func(store *storage.Store, name string) ([]byte, error) 
 // picture is not a better outcome than a camera that takes it at the documented
 // defaults -- and every other layer in this system already degrades to a report
 // instead of a refusal, per ARCHITECTURE.md 8.
+//
+// Read through store.Resolve rather than a joined path, so the one way to reach
+// a file outside the data root stays the one way -- the same rule
+// internal/transport follows on the serving side.
 func LoadParams(store *storage.Store) (domain.CameraParams, error) {
-	return loadParams(store, readStored)
-}
-
-func loadParams(store *storage.Store, read reader) (domain.CameraParams, error) {
-	body, err := read(store, ParamsFileName)
+	abs, err := store.Resolve(ParamsFileName)
+	if err != nil {
+		return domain.CameraParams{}, fmt.Errorf("%w: %v", ErrNoParamsFile, err)
+	}
+	body, err := os.ReadFile(abs)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return domain.CameraParams{}, ErrNoParamsFile

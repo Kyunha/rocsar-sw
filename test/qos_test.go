@@ -608,6 +608,71 @@ func TestAnUnrepairableLossStopsBeingReportedAsProtection(t *testing.T) {
 	}
 }
 
+// A repair that could not be completed is RETRIED, not abandoned.
+//
+// The vanished qdisc is repaired by re-installing it, but a single attempt is
+// not enough: the fault is often a capability that has not been granted yet, or a
+// device that has not appeared. Before wantDevice outlived a failed Apply, fail()
+// cleared the device and Verify returned early forever after one failure, so the
+// link stayed unbounded for the rest of the flight. That contradicts
+// cmd/obc/main.go, which keeps a failed shaper alive precisely so a later tick
+// can recover it.
+func TestAFailedRepairIsRetriedUntilItSticks(t *testing.T) {
+	f := &stealingOps{}
+	s := qos.NewShaper(discardLogger(), f)
+	if ok, reason := s.Apply(context.Background(), "eth0", 115); !ok {
+		t.Fatalf("Apply: %s", reason)
+	}
+
+	f.steal()
+	// The first repair cannot run: the same shape as a capability revoked, or a
+	// device still being reconfigured underneath us.
+	f.failOn, f.err = "clear eth0", syscall.EPERM
+
+	if active, _ := s.Verify(context.Background()); active {
+		t.Fatal("Verify reported the cap in force while the repair was failing")
+	}
+
+	// The fault clears. The NEXT tick must try again, and succeed.
+	f.failOn, f.err = "", nil
+
+	active, reason := s.Verify(context.Background())
+	if !active {
+		t.Fatalf("Verify did not repair on the second tick (reason %q); a repair "+
+			"attempted only once cannot recover a capability granted later, which is "+
+			"exactly what cmd/obc/main.go promises", reason)
+	}
+	if !strings.Contains(strings.Join(f.recorded(), "\n"), "root-htb eth0") {
+		t.Error("Verify reported active without ever re-installing the tree")
+	}
+}
+
+// A start that failed is repaired too, without a restart.
+//
+// The other half of main.go's promise: an OBC that comes up without CAP_NET_ADMIN
+// reports itself unshaped and keeps serving telemetry, and if the capability is
+// granted while it is running the next verify tick installs the cap. That is only
+// true if Verify still knows which device it was asked to shape after a failed
+// start.
+func TestAStartThatFailedIsRepairedWithoutARestart(t *testing.T) {
+	f := &fakeOps{failOn: "clear eth0", err: syscall.EPERM}
+	s := qos.NewShaper(discardLogger(), f)
+
+	if ok, _ := s.Apply(context.Background(), "eth0", 115); ok {
+		t.Fatal("Apply reported success though its first step failed")
+	}
+	if active, _ := s.Verify(context.Background()); active {
+		t.Fatal("Verify reported the cap in force when nothing was ever installed")
+	}
+
+	// The capability is granted.
+	f.failOn, f.err = "", nil
+
+	if active, reason := s.Verify(context.Background()); !active {
+		t.Fatalf("Verify did not install the cap after the fault cleared (reason %q)", reason)
+	}
+}
+
 // A read that FAILS is not evidence the qdisc is gone.
 //
 // The distinction matters in both directions and collapsing them is how a

@@ -556,11 +556,11 @@ bench test.
 
 ### 6.3 Camera
 
-Snapshot only. On `take_photo`, grab one full-resolution JPEG, write it to the
-data directory atomically, and return its name and size in the command response.
-The GS then fetches the bytes over HTTP. There is no live stream: it consumed
-bandwidth that constraint H1 does not have, in exchange for a picture nobody
-needed continuously.
+Snapshot only. On `take_photo`, grab one JPEG at the settings in force, write it to
+the data directory atomically, and return its name, size and **decoded
+dimensions** in the command response. The GS then fetches the bytes over HTTP.
+There is no live stream: it consumed bandwidth that constraint H1 does not have,
+in exchange for a picture nobody needed continuously.
 
 Capture shells out to `fswebcam`. The hand-written V4L2 binding — `syscall`/`unsafe`
 struct definitions against `/dev/video0`, which was the camera adapter before — is
@@ -569,11 +569,84 @@ maintained Go V4L2 package, and that is exactly the argument for not doing it: t
 struct layout was an untestable liability maintained for the sake of a JPEG that
 `fswebcam` produces in one line.
 
-This is a reduction in capability, recorded as such: nothing can now set format,
-resolution or exposure through the OBC. If a capture needs tuning that
-`fswebcam` cannot express, the honest fix is a maintained capture package, not a
-resurrected struct definition. `camera.device` still defaults to `/dev/video0`
-because that is the device `fswebcam` reads.
+#### 6.3.1 The five settings, and the two dead fields they replaced
+
+Nothing could set the resolution, quality, frame count or settle time of a
+photograph. `NewCapture` took a `quality` argument, stored it in a field and
+**never read it** — the one "quality" input in the system was a control that did
+nothing. Five settings now reach `fswebcam` through `domain.CameraParams`, and
+`internal/camera/params_contract.go` is the one table of what is bounded, by how
+much, and where each bound comes from.
+
+**Every bound is cited to the `fswebcam(1)` man page, and that is a weaker footing
+than the SDR table's.** `internal/sdr/params_contract.go` cites a datasheet for a
+radio whose limits are physics. This one cites a man page for a program that is
+installed on the aircraft by apt, is archived upstream, and whose version nobody
+has written down. There is no `fswebcam` source in this repository to re-derive
+anything from. The mitigation is not more validation — it is the argument
+building, below.
+
+**A resolution is a request, never a report.** `fswebcam`'s man page: *"the actual
+resolution used may differ if the source or device cannot capture at the specified
+resolution"*. So the requested value goes out and the **decoded** dimensions of the
+JPEG come back, on `domain.Photo`, in the `take_photo` response and in telemetry.
+A console that displayed the request would be displaying a number no device agreed
+to, and a clamped capture would be invisible. That distinction is the reason
+`Photo` carries `Width`/`Height` and `CameraStatus` carries two optional varints.
+
+**This also corrects a false claim in this document.** `Capture`'s port comment said
+"one full-resolution JPEG". With no resolution requested, `fswebcam` asks the
+device for its own default of **384x288**, so every photograph this system ever
+took was a quarter-megapixel one. `domain.DefaultCameraParams()` is now those same
+values spelled out, which changes no behaviour and makes the fact visible.
+
+#### 6.3.2 Why an option is passed only when an operator asked for it
+
+`FswebcamArgs` omits every `fswebcam` option that is at its default, and passes
+`-r` even at its default. That asymmetry is the whole design.
+
+Omitting an option that equals its default is safe **because the defaults are
+`fswebcam`'s own** — "this setting is at its default" and "this option is not
+passed" are the same statement. So an `fswebcam` that has never heard of `--jpeg`
+can only break a capture whose operator specifically asked for the JPEG quality,
+with `fswebcam`'s own complaint on stderr naming the flag. Passing every option
+unconditionally would instead have turned a no-op field into a total loss of the
+camera, which is the state we found it in.
+
+`-r` is the exception because it is the one option whose omission silently
+inherits a default from a program we do not control, and the one option that
+cannot be missing from any `fswebcam` that works at all.
+`tools/camera_bench -print-args` prints the resulting command line so somebody
+standing next to the camera can confirm the installed build accepts the flags.
+
+#### 6.3.3 Where the settings live, and the second dead field
+
+They are in `.camera-params.json` in the data root: the stored file wins, the
+`camera.*` config keys are the initial value and are consulted only when there is
+no file. Settings in memory are true until the next restart, and this system
+restarts.
+
+`storage.List` hides that file. It is state, not an artefact, and every row in
+that listing is something an operator might fetch. The prefix that hides it is
+restated in `internal/storage` rather than imported, because storage is the
+substrate every subsystem writes through; `test/TestTheArtefactListingHidesEverySubsystemSettingsFile`
+holds the two to each other.
+
+**`last_photo` was the second dead field, and it is fixed here.** The field was in
+the Snapshot, on the wire, in the view and in the console panel, which rendered
+`last <name>` beside the photo count — and the only provider returned an empty
+string for the name and filled in the count. So the console rendered `last ` and
+nothing, for the life of the system. Same defect `domain.Camera` records for
+`Sdr.LastError`, in the same interface file, fixed the same way: give the port a
+method (`LastPhoto`) and fill it.
+
+This is a reduction in capability, recorded as such: nothing can set the camera's
+V4L2 *controls* — brightness, contrast, auto-exposure — and there is no
+`--set`-style passthrough. The legal set of those is whatever the driver accepts,
+which is the `TX_ANTENNA` problem written again, so the control is absent rather
+than offered and inert. `fswebcam --list-controls` returning its output verbatim,
+the way `sdr_probe` does, is the honest way to add it later. `camera.device`
+still defaults to `/dev/video0` because that is the device `fswebcam` reads.
 
 ### 6.4 SDR
 
@@ -764,6 +837,18 @@ numbers shown. The alternative — refuse and leave the device alone — turns o
 typo in a TOML line into an unbounded link, which is the failure the deleted
 bucket existed to prevent.
 
+#### The floor bounds the cap, not telemetry's share
+
+The floor guarantees the cap is **at least** 17 kbit/s. It does not guarantee that
+telemetry actually receives 17 kbit/s. With one class nothing steers traffic, so
+an artefact download and the telemetry stream share the cap — and `fq_codel`
+shares the class between flows, so a download will not starve telemetry outright,
+but telemetry is not promised its share either. At a 115 kbit/s cap a saturating
+download leaves the console able to go stale, which on a 1 Hz link (§6.5) is the
+state that stands motion down. Giving telemetry its own guaranteed class is the
+fix; it is the deferred classifier, and until it exists the floor is a floor on
+the *setting*, not on the bandwidth telemetry sees.
+
 #### The cap is verified, not assumed
 
 `Shaper.Verify` re-reads the device every 10 s (`cmd/obc/main.go`,
@@ -778,6 +863,16 @@ so in telemetry, and re-installs. The two failure directions are kept apart: a
 read that *fails* is not evidence the qdisc is gone and must not flap the
 operator's view, and a qdisc we did not install is reported as such rather than
 claimed.
+
+**The repair is retried, not attempted once.** `Verify` records the device and
+rate it was asked to shape (`wantDevice`, `wantRateKbps`) separately from the
+flags describing what is currently in force, so a failed re-install does not erase
+the only thing a later tick could repair against. A fault that clears afterward —
+capability granted to the unit while the OBC is running, a device that appears
+after boot, a transient netlink failure — is picked up on a subsequent tick
+without a restart. This is the promise `cmd/obc/main.go` makes when it keeps a
+failed shaper alive; a repair that gave up after a single attempt made that
+promise false.
 
 #### Measured throughput, which is not the cap
 

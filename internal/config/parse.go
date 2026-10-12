@@ -208,6 +208,28 @@ func (c *Config) assign(key string, raw any) error {
 
 	case "camera.device":
 		c.Camera.Device, err = str()
+	case "camera.quality":
+		// 0 means automatic -- fswebcam's own default -- so it is a value this
+		// accepts rather than a missing key. The bounds live in
+		// internal/camera/params_contract.go, which is the camera package's
+		// contract with fswebcam; this one only has to carry the value.
+		var n uint32
+		n, err = integer()
+		c.Camera.Params.JPEGQuality = n
+	case "camera.resolution":
+		c.Camera.Params.Resolution, err = str()
+	case "camera.frames":
+		var n uint32
+		n, err = integer()
+		c.Camera.Params.Frames = n
+	case "camera.skip":
+		var n uint32
+		n, err = integer()
+		c.Camera.Params.Skip = n
+	case "camera.delay_ms":
+		var n uint32
+		n, err = integer()
+		c.Camera.Params.DelayMs = n
 	case "sdr.program":
 		c.SDR.Program, err = str()
 	case "sdr.data_dir":

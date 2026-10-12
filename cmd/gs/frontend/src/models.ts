@@ -139,6 +139,20 @@ export interface CameraView {
     device: string | null;
     last_photo: string | null;
     photos_taken: number | null;
+    /* The DECODED dimensions of the last photograph, and null when they were
+     * not decoded. Three distinct states, and the panel has to draw all three:
+     *
+     *   no photograph yet      -> last_photo null, both dims null
+     *   a photograph, header  -> last_photo set, both dims null
+     *     unreadable
+     *   a photograph, header  -> last_photo set, both dims set
+     *     read
+     *
+     * A zero would collapse the middle case into "a 0x0 photograph", which is
+     * not a thing. These are the size the camera PRODUCED; the size that was
+     * ASKED FOR lives in the settings panel, and the panel compares the two. */
+    last_photo_width: number | null;
+    last_photo_height: number | null;
 }
 
 export interface LinkView {
@@ -172,10 +186,31 @@ export interface View {
     not_healthy_reasons: string[];
 }
 
+export interface CameraParamsPatch {
+    /* All optional, all nil-means-"leave it alone". jpeg_quality is 0 for the
+     * automatic case, which is why it is a pointer all the way down: a plain
+     * number cannot tell "leave the quality alone" from "go back to
+     * automatic", and those are different requests to a camera. */
+    jpeg_quality?: number;
+    resolution?: string;
+    frames?: number;
+    skip?: number;
+    delay_ms?: number;
+}
+
 export interface ArtefactMeta {
     name: string;
     size_bytes: number;
     kind: string;
+    /* The decoded dimensions, null when the header could not be read. */
+    width: number | null;
+    height: number | null;
+    /* Whole seconds this artefact takes over the link the OBC last reported,
+     * rounded UP, and 0 when that rate is not known yet. Computed in Go and
+     * not here: the browser renders numbers and does not do arithmetic on
+     * them (GUI_ARCHITECTURE.md 9.4), and this is a function of two numbers
+     * only the Go side has together. */
+    fetch_seconds: number;
 }
 
 export interface CommandResult {

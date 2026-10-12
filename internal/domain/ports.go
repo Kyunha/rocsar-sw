@@ -166,14 +166,22 @@ type CameraParamsPatch struct {
 // package's contract with fswebcam and this package knows nothing about
 // fswebcam.
 //
-// Every value is fswebcam's OWN default, spelled out. That is the point of the
-// whole type. This camera previously passed no resolution at all, which meant
-// fswebcam asked the device for 384x288 -- so every photograph the system has
-// ever taken was a quarter-megapixel one, while the port comment above called it
-// "full-resolution". Spelling the same request out changes no behaviour and
-// makes it visible. Choosing different defaults would mean picking a resolution,
-// a noise budget and a settle time for a camera none of us has seen, and would
-// mean that a plain upgrade changed what photographs look like.
+// # Every value is fswebcam's OWN default, and that is a load-bearing property
+//
+// Not a coincidence and not a claim: it means "this setting is at its default"
+// and "this option is not passed to fswebcam" are the same statement, so the
+// camera omits every option that is at its default and the result is
+// indistinguishable from passing it. That is what makes it safe for the camera
+// to pass only the options an operator asked for, when the bound on the fswebcam
+// this targets is a man page for a program whose version nobody has written down
+// (see FswebcamArgs).
+//
+// It is also why Skip is 0 and not 1. fswebcam's man page warns that "some
+// cameras send some bad or corrupt frames when it first starts capturing", and
+// the camera on this aircraft may well be one of them -- but raising the default
+// to 1 would mean this commit changed what photographs look like while claiming
+// only to add a control for it. Skip is offered so the operator can find out, not
+// set on their behalf.
 func DefaultCameraParams() CameraParams {
 	return CameraParams{
 		// Automatic, which fswebcam spells -1. Carried as the zero, and never
@@ -182,7 +190,7 @@ func DefaultCameraParams() CameraParams {
 		// fswebcam's own -r default.
 		Resolution: "384x288",
 		Frames:     1,
-		Skip:       1,
+		Skip:       0,
 		DelayMs:    0,
 	}
 }

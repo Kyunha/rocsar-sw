@@ -24,7 +24,7 @@ import {
     renderPico,
     renderSystem,
 } from '../src/panels';
-import { knob } from '../src/widgets';
+import { knob, renderShotResult } from '../src/widgets';
 import type { View, LinkState } from '../src/models';
 
 /* Run from cmd/gs/frontend (npm sets cwd there), so the stylesheet is at a
@@ -109,7 +109,14 @@ const view: View = {
     pico_connected: true,
     pico_last_ack: { command_sequence: 91, success: true, error: '' },
     sdr: { state: 'RUNNING', running: true, pid: 2041, last_log: '/var/log/connect.log', last_error: null },
-    camera: { state: 'READY', device: '/dev/video0', last_photo: 'IMG_0042.jpg', photos_taken: 43 },
+    camera: {
+        state: 'READY',
+        device: '/dev/video0',
+        last_photo: 'camera-20261008-131500.jpg',
+        photos_taken: 43,
+        last_photo_width: 1280,
+        last_photo_height: 720,
+    },
     link: {
         state: 'ACTIVE',
         device: 'tun0',
@@ -188,6 +195,23 @@ const html = `<!doctype html>
     <div class="zone-rail">
       <section class="p-sys"><h2>system</h2><div id="sys">${renderSystem(view)}</div></section>
       <section class="p-gnss"><h2>gnss</h2><div id="gnss">${renderGnss(view)}</div></section>
+      <section class="p-cam"><h2>camera</h2>
+        <div class="row"><button>photo</button><button>refresh settings</button><button>apply</button><button>clear</button></div>
+        <div class="row sub hint">blank = leave alone</div>
+        <div class="row">${renderShotResult('1920x1080', { size_bytes: 218_440, width: 640, height: 480, fetch_seconds: 16 })}</div>
+        <div class="row sub err"></div>
+        <div class="row"><span>last photo</span><span class="hint">1280×720, 218 KB, 16 s to fetch at 115 kbit/s</span></div>
+        <div class="row"><span>jpeg quality (1–95)</span><input placeholder="0 (automatic)"></div>
+        <div class="row sub hint">jpeg_quality: 0 = automatic. The link is 115 kbit/s, so lower is faster to fetch</div>
+        <div class="row"><span>resolution (WxH)</span><input placeholder="1280x720"></div>
+        <div class="row sub hint">resolution: a request: the driver may clamp it, and the capture reports what it got</div>
+        <div class="row"><span>frames averaged (frames)</span><input placeholder="1"></div>
+        <div class="row sub hint">frames: more frames = less noise, more blur on a moving gondola</div>
+        <div class="row"><span>frames skipped (frames)</span><input placeholder="0"></div>
+        <div class="row sub hint">skip: for a camera whose first frames are dark or corrupt</div>
+        <div class="row"><span>settle delay (ms)</span><input placeholder="0"></div>
+        <div class="row sub hint">delay_ms: let the image settle after the device opens; 0 does not wait</div>
+      </section>
       <section class="p-csl"><h2>camera · sdr · link</h2><div id="csl">${renderCameraSdrLink(view, txHist)}</div></section>
     </div>
     <div class="zone-bottom">

@@ -263,4 +263,22 @@ message CommandResponse {
   optional string artefact_name = 5;
   optional uint64 artefact_size_bytes = 6;
   optional string artefact_kind = 7;
+
+  // The artefact's DECODED pixel dimensions, for take_photo.
+  //
+  // These exist because a resolution is a request and a driver may decline it.
+  // fswebcam's man page: "the actual resolution used may differ if the source or
+  // device cannot capture at the specified resolution" -- so an operator who
+  // asks for 1920x1080 on a camera that cannot do it gets a 640x480 file, and
+  // the only place that fact can be reported honestly is the reply to the
+  // command that asked for it. The console compares these against the settings
+  // in force and says so out loud when they differ.
+  //
+  // optional, and absent means the header could not be read. That is distinct
+  // from 0x0, which no decoder returns, and distinct again from absent -- which
+  // is what a response to any other command looks like, so a consumer can tell
+  // "this artefact has a size we know" from "this response is not about an
+  // artefact".
+  optional uint32 artefact_width = 8;
+  optional uint32 artefact_height = 9;
 }

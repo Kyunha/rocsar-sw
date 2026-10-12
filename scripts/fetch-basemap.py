@@ -19,6 +19,15 @@ Why a script rather than committing the upstream files directly:
     (cmd/gs/bridge.go), so the bytes embedded in the Go binary are the
     compressed ones.
 
+Cultural context is drawn from Natural Earth's cultural directory: populated
+places (cities), roads and railroads, all clipped to the operating area. They
+are what turns a blank relief into recognisable ground for SAR planning -- the
+operator reads "the track crosses the river north of Falun", not "somewhere in
+Dalarna". Roads and railroads are large at 10m (5 024 and 8 257 features over
+the box, ~2.3 MB gzipped together), so the box clip there is load-bearing; the
+layers are otherwise unfiltered, because a road that is missing is worse than
+one drawn thinner than its class.
+
 Why some layers merge two upstream files: Natural Earth publishes its denser
 European hydrography as *supplements* which exclude the features already in the
 global set. ne_10m_lakes_europe has no Ladoga and no Vanern; ne_10m_rivers_europe
@@ -50,7 +59,7 @@ import urllib.request
 
 MIRROR = (
     "https://raw.githubusercontent.com/martynafford/"
-    "natural-earth-geojson/master/{scale}/physical/"
+    "natural-earth-geojson/master/{scale}/{sub}/"
 )
 CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "rocsar-basemap")
 DEFAULT_OUT = os.path.join(
@@ -68,7 +77,8 @@ NE_BOX = (-12.0, 50.0, 45.0, 72.0)
 # Every layer the map draws. Each entry is one output file, built from one or
 # more (scale, name) upstream sources merged in order. "filter" is an optional
 # (property, value) predicate applied to every source's features; "clip" limits
-# the output to the operating area.
+# the output to the operating area; "sub" is the Natural Earth top-level
+# directory (physical, the default, or cultural).
 LAYERS = [
     {"as": "ne_50m_ocean", "sources": [("50m", "ne_50m_ocean")]},
     {"as": "ne_50m_land", "sources": [("50m", "ne_50m_land")]},
@@ -94,10 +104,28 @@ LAYERS = [
         "as": "ne_50m_geography_regions_elevation_points",
         "sources": [("50m", "ne_50m_geography_regions_elevation_points")],
     },
+    {
+        "as": "ne_cities",
+        "sub": "cultural",
+        "sources": [("10m", "ne_10m_populated_places")],
+        "clip": NE_BOX,
+    },
+    {
+        "as": "ne_roads",
+        "sub": "cultural",
+        "sources": [("10m", "ne_10m_roads")],
+        "clip": NE_BOX,
+    },
+    {
+        "as": "ne_railroads",
+        "sub": "cultural",
+        "sources": [("10m", "ne_10m_railroads")],
+        "clip": NE_BOX,
+    },
 ]
 
 
-def fetch(scale: str, name: str, refresh: bool) -> dict:
+def fetch(scale: str, sub: str, name: str, refresh: bool) -> dict:
     """Return one upstream GeoJSON, from the cache when possible."""
     os.makedirs(CACHE_DIR, exist_ok=True)
     cached = os.path.join(CACHE_DIR, f"{scale}_{name}.json")
@@ -105,7 +133,7 @@ def fetch(scale: str, name: str, refresh: bool) -> dict:
         with open(cached, "rb") as f:
             return json.loads(f.read().decode("utf-8"))
 
-    url = MIRROR.format(scale=scale) + name + ".json"
+    url = MIRROR.format(scale=scale, sub=sub) + name + ".json"
     req = urllib.request.Request(url, headers={"User-Agent": "rocsar-basemap/1.0"})
     with urllib.request.urlopen(req, timeout=300) as resp:
         data = resp.read()
@@ -166,9 +194,10 @@ def intersects(geom: dict, box: tuple[float, float, float, float]) -> bool:
 
 
 def transform(layer: dict, nd: int, refresh: bool) -> tuple[dict, int]:
+    sub = layer.get("sub", "physical")
     feats: list = []
     for scale, name in layer["sources"]:
-        doc = fetch(scale, name, refresh)
+        doc = fetch(scale, sub, name, refresh)
         fs = doc["features"]
         flt = layer.get("filter")
         if flt is not None:

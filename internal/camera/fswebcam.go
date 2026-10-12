@@ -298,7 +298,7 @@ func (c *Capture) runFswebcam(ctx context.Context, params domain.CameraParams) (
 	_ = os.Remove(out)
 	defer os.Remove(out)
 
-	args := fswebcamArgs(c.device, out, params)
+	args := FswebcamArgs(c.device, out, params)
 
 	// Separate arguments, never a shell string: `device` comes from a config
 	// file and must not be able to become a command.
@@ -345,12 +345,17 @@ func (c *Capture) runFswebcam(ctx context.Context, params domain.CameraParams) (
 // one option that cannot be missing from any fswebcam that works at all, so
 // passing it costs nothing in the risk the rest of this function manages.
 //
-// # Test note
+// # Why it is exported
 //
-// This is a pure function of three values, deliberately, so that the exact
-// command line is assertable without a camera, a PATH or a subprocess. That is
-// most of what fswebcam_test.go checks.
-func fswebcamArgs(device, out string, p domain.CameraParams) []string {
+// Two callers want the command line and neither of them can guess it: the unit
+// test, which is most of what fswebcam_test.go checks and needs no camera, a PATH
+// or a subprocess to do it; and tools/camera_bench -print-args, which exists so
+// that somebody standing next to the camera can confirm the installed fswebcam
+// accepts the flags this file gates on the operator having asked for the
+// setting. Both read the same function the capture path calls, so neither can
+// report a command line the server would not run.
+// FswebcamArgs builds the argument list for one capture.
+func FswebcamArgs(device, out string, p domain.CameraParams) []string {
 	args := []string{"-d", device, "--no-banner"}
 
 	// -r, always: see above.
@@ -362,7 +367,7 @@ func fswebcamArgs(device, out string, p domain.CameraParams) []string {
 	if p.Frames != 1 {
 		args = append(args, "-F", strconv.FormatUint(uint64(p.Frames), 10))
 	}
-	if p.Skip != 1 {
+	if p.Skip != 0 {
 		args = append(args, "-S", strconv.FormatUint(uint64(p.Skip), 10))
 	}
 	if p.DelayMs != 0 {

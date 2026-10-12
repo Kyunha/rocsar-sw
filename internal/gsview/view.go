@@ -210,6 +210,22 @@ type CameraView struct {
 	Device      *string `json:"device"`
 	LastPhoto   *string `json:"last_photo"`
 	PhotosTaken *uint64 `json:"photos_taken"`
+
+	// LastPhotoWidth and LastPhotoHeight are the DECODED dimensions of the last
+	// photograph, and are nil unless they were actually decoded.
+	//
+	// Two pointers rather than two numbers, because the console must be able to
+	// draw "unknown" here. A zero is not a shape a JPEG decoder returns, so a
+	// plain uint32 would turn "the header could not be read" into "a 0x0
+	// photograph" -- and the whole reason these exist is that a resolution is a
+	// request and a driver may decline it. A console that cannot say "unknown"
+	// will say 0x0, which is a photograph nobody took.
+	//
+	// They are the resolution the camera PRODUCED, not the one that was asked
+	// for. Both are numbers an operator may need side by side, and conflating
+	// them is the failure this pair exists to make impossible.
+	LastPhotoWidth  *uint32 `json:"last_photo_width"`
+	LastPhotoHeight *uint32 `json:"last_photo_height"`
 }
 
 // LinkView is the traffic-control state.
@@ -369,8 +385,16 @@ func buildCamera(snap telemetry.Snapshot) CameraView {
 	if snap.CameraDevice != "" {
 		out.Device = &snap.CameraDevice
 	}
-	if snap.LastPhoto != "" {
-		out.LastPhoto = &snap.LastPhoto
+	if snap.LastPhoto != nil {
+		name := snap.LastPhoto.Name
+		out.LastPhoto = &name
+		// Only a decoded size is reported. A photograph whose header could not
+		// be read leaves both nil, and the console draws a dash -- which is the
+		// truth -- rather than 0x0, which is not a photograph.
+		if snap.LastPhoto.Width > 0 && snap.LastPhoto.Height > 0 {
+			w, h := snap.LastPhoto.Width, snap.LastPhoto.Height
+			out.LastPhotoWidth, out.LastPhotoHeight = &w, &h
+		}
 	}
 	if snap.PhotosTakenKnown {
 		out.PhotosTaken = &snap.PhotosTaken

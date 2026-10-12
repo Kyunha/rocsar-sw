@@ -396,10 +396,32 @@ func (s *Store) List(name string) ([]Entry, error) {
 
 	out := make([]Entry, 0, len(items))
 	for _, it := range items {
-		// Temporary files from an interrupted atomic write are not artefacts.
-		// Listing them would show the operator half-written files that no
-		// command can produce and that will never be complete.
-		if strings.HasPrefix(it.Name(), ".partial-") || strings.HasPrefix(it.Name(), ".rocsar-probe-") {
+		// cameraStatePrefix is the prefix of the settings files a subsystem keeps in the
+		// data root, and they are hidden from the artefact listing because they are
+		// state and not artefacts.
+		//
+		// The names themselves are owned by the packages that write them -- camera is
+		// the only one today, and camera.ParamsFileName is that file -- and this
+		// package deliberately does not import it: storage is the substrate every
+		// subsystem writes through, and a substrate that imports one of its consumers
+		// in order to name a file is a cycle waiting for the second consumer.
+		//
+		// So the prefix is restated here and held to the owner by a test in test/
+		// (TestTheArtefactListingHidesEverySubsystemSettingsFile), which is where
+		// cross-package invariants live in this repository. An allowance nothing checks
+		// is worse than none, because it reads as a decision that is still in force.
+		const cameraStatePrefix = ".camera-params"
+
+		// Temporary files from an interrupted atomic write are not artefacts, and
+		// neither is a subsystem's settings file. Listing either would show the
+		// operator a row that no command produced and that will never be a
+		// photograph: a half-written file, or a JSON blob the console already
+		// renders properly through camera_get_params. Both are state, and state
+		// belongs in a file whose contents something reads -- `curl
+		// localhost:5557/.camera-params.json` -- not in a list of things to fetch.
+		if strings.HasPrefix(it.Name(), ".partial-") ||
+			strings.HasPrefix(it.Name(), ".rocsar-probe-") ||
+			strings.HasPrefix(it.Name(), cameraStatePrefix) {
 			continue
 		}
 

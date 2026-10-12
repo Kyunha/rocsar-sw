@@ -64,8 +64,16 @@ func EncodeTelemetry(s telemetry.Snapshot) *rocsarv1.TelemetryFrame {
 	if s.CameraDevice != "" {
 		f.Camera.Device = proto.String(s.CameraDevice)
 	}
-	if s.LastPhoto != "" {
-		f.Camera.LastPhotoName = proto.String(s.LastPhoto)
+	// The last photograph's identity and its DECODED dimensions. Only when the
+	// header was read: absent means "no size was decoded", which is not the same
+	// claim as "this photograph is 0x0", and a console that cannot tell those
+	// apart will draw a 0x0 photograph on screen next to a real file.
+	if s.LastPhoto != nil {
+		f.Camera.LastPhotoName = proto.String(s.LastPhoto.Name)
+		if s.LastPhoto.Width > 0 && s.LastPhoto.Height > 0 {
+			f.Camera.LastPhotoWidth = proto.Uint32(s.LastPhoto.Width)
+			f.Camera.LastPhotoHeight = proto.Uint32(s.LastPhoto.Height)
+		}
 	}
 	if s.Link.InactiveReason != "" {
 		f.Link.InactiveReason = proto.String(s.Link.InactiveReason)
@@ -243,7 +251,13 @@ func DecodeTelemetry(f *rocsarv1.TelemetryFrame) telemetry.Snapshot {
 	if cam := f.GetCamera(); cam != nil {
 		s.Camera = fromWireState(cam.GetState())
 		s.CameraDevice = cam.GetDevice()
-		s.LastPhoto = cam.GetLastPhotoName()
+		if name := cam.GetLastPhotoName(); name != "" {
+			s.LastPhoto = &domain.Photo{Name: name}
+			// Absent dimensions stay zero, which is how a header that could not
+			// be read survives the round trip instead of becoming a 0x0 claim.
+			s.LastPhoto.Width = cam.GetLastPhotoWidth()
+			s.LastPhoto.Height = cam.GetLastPhotoHeight()
+		}
 		if cam.PhotosTaken != nil {
 			s.PhotosTaken = cam.GetPhotosTaken()
 			s.PhotosTakenKnown = true

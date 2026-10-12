@@ -9,6 +9,7 @@ import (
 
 	rocsarv1 "github.com/rocsar/obc/api/rocsar/v1"
 	"github.com/rocsar/obc/internal/domain"
+	"github.com/rocsar/obc/internal/storage"
 	"github.com/rocsar/obc/internal/telemetry"
 	"github.com/rocsar/obc/internal/transport"
 )
@@ -81,7 +82,11 @@ func worstCaseSnapshot() telemetry.Snapshot {
 			LastError: "uhd_usrp_probe: USRP RX TX Center Freq error",
 		},
 		Camera: domain.SubsystemReady, CameraDevice: "/dev/video0",
-		LastPhoto: "camera-20261003-142530.jpg", PhotosTaken: 1 << 32,
+		LastPhoto: &domain.Photo{
+			Name: "camera-20261003-142530.jpg", Kind: storage.KindCamera,
+			SizeBytes: 1 << 21, Width: 1920, Height: 1080,
+		},
+		PhotosTaken:      1 << 32,
 		PhotosTakenKnown: true,
 		Link: domain.LinkStatus{
 			State: domain.SubsystemBusy, Device: "eth0", RateKbps: 115, PriorityKbps: 41,
@@ -330,6 +335,95 @@ func TestUnknownPhotoCountSurvivesTheRoundTrip(t *testing.T) {
 	}
 	if enc := transport.EncodeTelemetry(s); enc.GetCamera().PhotosTaken != nil {
 		t.Error("an unreported photo count was encoded onto the wire")
+	}
+}
+
+// The last photograph's NAME must reach the console. It did not, for the whole
+// life of the system: the snapshot carried the field, the wire carried it, the
+// view carried it and the panel rendered "last <name>" -- and the only provider
+// filled in the count and returned an empty string for the name.
+//
+// A field that is everywhere and populated nowhere is the same defect the SDR
+// port records for LastError, and it is invisible until something asserts the
+// name is not empty.
+func TestTheLastPhotographsNameReachesTheWire(t *testing.T) {
+	s := worstCaseSnapshot()
+	enc := transport.EncodeTelemetry(s)
+	if got := enc.GetCamera().GetLastPhotoName(); got != s.LastPhoto.Name {
+		t.Errorf("last photo name on the wire = %q, want %q", got, s.LastPhoto.Name)
+	}
+
+	back := transport.DecodeTelemetry(enc)
+	if back.LastPhoto == nil {
+		t.Fatal("the last photograph did not survive the round trip")
+	}
+	if back.LastPhoto.Name != s.LastPhoto.Name {
+		t.Errorf("name came back %q, want %q", back.LastPhoto.Name, s.LastPhoto.Name)
+	}
+}
+
+// The dimensions on the wire are the DECODED ones, because a resolution is a
+// request and a driver may decline it. Nothing in this system may report a
+// requested resolution as an achieved one.
+func TestTheDecodedDimensionsReachTheWire(t *testing.T) {
+	s := worstCaseSnapshot()
+	enc := transport.EncodeTelemetry(s)
+	if enc.GetCamera().GetLastPhotoWidth() != 1920 || enc.GetCamera().GetLastPhotoHeight() != 1080 {
+		t.Errorf("dimensions on the wire = %dx%d, want 1920x1080",
+			enc.GetCamera().GetLastPhotoWidth(), enc.GetCamera().GetLastPhotoHeight())
+	}
+
+	back := transport.DecodeTelemetry(enc)
+	if back.LastPhoto.Width != 1920 || back.LastPhoto.Height != 1080 {
+		t.Errorf("dimensions came back %dx%d, want 1920x1080",
+			back.LastPhoto.Width, back.LastPhoto.Height)
+	}
+}
+
+// Absence is not zero, twice over. Three different facts have to stay distinct
+// through the wire, because a console conflating any two of them draws
+// something that is not a photograph:
+//
+//	no photograph at all        -> no name, no dimensions
+//	a photograph, header unreadable -> a name, no dimensions
+//	a photograph, header read   -> a name, and dimensions
+func TestAnUnreadableHeaderKeepsTheNameAndDropsTheDimensions(t *testing.T) {
+	s := worstCaseSnapshot()
+	s.LastPhoto.Width, s.LastPhoto.Height = 0, 0
+
+	enc := transport.EncodeTelemetry(s)
+	if got := enc.GetCamera().GetLastPhotoName(); got != "camera-20261003-142530.jpg" {
+		t.Errorf("name = %q, want it to survive an unreadable header: the photograph "+
+			"exists on the SSD whether or not this code could read its size", got)
+	}
+	if enc.GetCamera().LastPhotoWidth != nil || enc.GetCamera().LastPhotoHeight != nil {
+		t.Error("dimensions were encoded for a header that was never read")
+	}
+
+	back := transport.DecodeTelemetry(enc)
+	if back.LastPhoto == nil {
+		t.Fatal("the photograph disappeared because its header could not be read")
+	}
+	if back.LastPhoto.Width != 0 || back.LastPhoto.Height != 0 {
+		t.Errorf("dimensions came back as %dx%d, want 0x0 meaning \"not decoded\"",
+			back.LastPhoto.Width, back.LastPhoto.Height)
+	}
+}
+
+// With nothing photographed there is no photograph on the wire at all.
+func TestNoPhotographMeansNoPhotographOnTheWire(t *testing.T) {
+	s := worstCaseSnapshot()
+	s.LastPhoto = nil
+
+	enc := transport.EncodeTelemetry(s)
+	if cam := enc.GetCamera(); cam.GetLastPhotoName() != "" ||
+		cam.LastPhotoWidth != nil || cam.LastPhotoHeight != nil {
+		t.Errorf("the wire carries a photograph when none has been taken: %v", cam)
+	}
+
+	back := transport.DecodeTelemetry(enc)
+	if back.LastPhoto != nil {
+		t.Errorf("a photograph appeared from nothing: %+v", back.LastPhoto)
 	}
 }
 

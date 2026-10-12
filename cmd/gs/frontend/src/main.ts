@@ -22,7 +22,6 @@ import './style.css';
 import { call, on, connect } from './bridge';
 import {
     esc,
-    fmtBytes,
     renderAttention,
     renderBudgetTiles,
     renderCameraSdrLink,
@@ -33,8 +32,8 @@ import {
     renderSystem,
     telemetryAgeRing,
 } from './panels';
-import { Ring, knob, knobGeometry, knobValueFromPointer } from './widgets';
-import type { View, CommandResult, LinkState, Config, Entry, SdrParamsPatch, FrameEvent, DownloadProgress, DownloadDone } from './models';
+import { Ring, fmtBytes, knob, knobGeometry, knobValueFromPointer, renderShotResult } from './widgets';
+import type { View, CameraParamsPatch, CommandResult, LinkState, Config, Entry, SdrParamsPatch, FrameEvent, DownloadProgress, DownloadDone } from './models';
 
 /* Stale after three telemetry intervals. A constant, not configuration --
  * configuration arrives in step 7 ([gui] stale_after) and replaces this with
@@ -324,6 +323,246 @@ async function refreshParams(): Promise<void> {
         logLine('params refreshed from OBC');
     }
 }
+
+/* --------------------------------------------------------------------------
+   Camera settings
+   -------------------------------------------------------------------------- */
+
+/* One camera setting: the input, the settings-file key it maps to, the label and
+ * the unit of the value the operator types.
+ *
+ * Generated from this table rather than written into the markup, for the reason
+ * PARAM_FIELDS gives: the input id, the JSON key, the label and the unit are four
+ * things that must not drift apart, and there is now one place to add a setting
+ * and one place a key can be spelled wrong.
+ *
+ * The keys are the camera's own -- the same names camera_get_params answers with
+ * and the same names in .camera-params.json on the SSD -- so an operator reading
+ * the file beside the window is reading one vocabulary in three places.
+ *
+ * `hint` marks the fields whose legal values are enumerable here, which is all
+ * of them. These are not hardware limits: they are the bounds in
+ * internal/camera/params_contract.go, and each of those cites the fswebcam(1)
+ * man page line it came from. What the DEVICE will accept is another question
+ * entirely -- fswebcam's man page says outright that "the actual resolution used
+ * may differ if the source or device cannot capture at the specified
+ * resolution" -- which is why a capture reports the size it got and the panel
+ * says so out loud when the two differ. */
+interface CameraField {
+    id: string;
+    key: string;
+    label: string;
+    unit: string;
+    hint: string;
+    size: number;
+}
+
+const CAMERA_FIELDS: CameraField[] = [
+    {
+        id: 'in-cam-quality', key: 'jpeg_quality', label: 'jpeg quality', unit: '1–95',
+        hint: '0 = automatic. The link is 115 kbit/s, so lower is faster to fetch',
+        size: 5,
+    },
+    {
+        id: 'in-cam-res', key: 'resolution', label: 'resolution', unit: 'WxH',
+        hint: 'a request: the driver may clamp it, and the capture reports what it got',
+        size: 10,
+    },
+    {
+        id: 'in-cam-frames', key: 'frames', label: 'frames averaged', unit: 'frames',
+        hint: 'more frames = less noise, more blur on a moving gondola',
+        size: 4,
+    },
+    {
+        id: 'in-cam-skip', key: 'skip', label: 'frames skipped', unit: 'frames',
+        hint: 'for a camera whose first frames are dark or corrupt',
+        size: 4,
+    },
+    {
+        id: 'in-cam-delay', key: 'delay_ms', label: 'settle delay', unit: 'ms',
+        hint: 'let the image settle after the device opens; 0 does not wait',
+        size: 6,
+    },
+];
+
+function cameraRows(host: HTMLElement): void {
+    for (const f of CAMERA_FIELDS) {
+        const row = document.createElement('div');
+        row.className = 'row';
+
+        const label = document.createElement('span');
+        label.textContent = `${f.label} (${f.unit})`;
+        label.title = f.key;
+        row.appendChild(label);
+
+        const input = document.createElement('input');
+        input.id = f.id;
+        input.size = f.size;
+        input.title = f.hint;
+        row.appendChild(input);
+
+        host.appendChild(row);
+
+        // The hint is text on the row as well as a title attribute, because a
+        // hover hint is invisible to an operator in a hurry.
+        const note = document.createElement('div');
+        note.className = 'row sub hint';
+        note.textContent = `${f.key}: ${f.hint}`;
+        host.appendChild(note);
+    }
+}
+
+/* Whether the settings panel is usable at all.
+ *
+ * False means the OBC answered camera_get_params with something other than the
+ * settings -- which for an OBC that predates the command is ERROR_INVALID_COMMAND
+ * and nothing else. The panel then disables every control and says why, rather
+ * than leaving inputs an operator can fill in and an apply button that will be
+ * refused. Controls that cannot work must not look like controls that can. */
+let cameraReadable = false;
+
+function setCameraReadable(ok: boolean): void {
+    cameraReadable = ok;
+    for (const f of CAMERA_FIELDS) {
+        (req(f.id) as HTMLInputElement).disabled = !ok;
+    }
+    for (const id of ['b-cam-apply', 'b-cam-clear', 'b-cam-refresh']) {
+        const el = document.getElementById(id);
+        if (el instanceof HTMLButtonElement) {
+            el.disabled = !ok;
+        }
+    }
+    const note = document.getElementById('cam-note');
+    if (note !== null) {
+        note.textContent = ok
+            ? ''
+            : 'these settings are unreadable: this OBC does not have them. ' +
+              'Photo quality and resolution are fixed to its own defaults.';
+    }
+}
+
+/* A blank camera input means "leave it alone", exactly as on the SDR panel, and
+ * for the same reason: a value present in a field becomes part of the next
+ * patch, so a console that auto-filled one would queue a camera change to the
+ * aircraft as a side effect of tabbing through a neighbouring field
+ * (GUI_ARCHITECTURE.md 9.4).
+ *
+ * jpeg_quality is the field where this matters most, because its zero is a real
+ * value meaning "automatic" rather than an absence. 0 and "" are therefore
+ * different requests, and neither is inferred from the other. */
+function cameraPatch(): CameraParamsPatch {
+    const patch: CameraParamsPatch = {};
+
+    const num = (id: string): number | undefined => {
+        const raw = (req(id) as HTMLInputElement).value.trim();
+        if (raw === '') {
+            return undefined;
+        }
+        const v = Number(raw);
+        return Number.isFinite(v) ? v : NaN;
+    };
+
+    const quality = num('in-cam-quality');
+    if (quality !== undefined) {
+        patch.jpeg_quality = quality;
+    }
+    const res = (req('in-cam-res') as HTMLInputElement).value.trim();
+    if (res !== '') {
+        patch.resolution = res;
+    }
+    const frames = num('in-cam-frames');
+    if (frames !== undefined) {
+        patch.frames = frames;
+    }
+    const skip = num('in-cam-skip');
+    if (skip !== undefined) {
+        patch.skip = skip;
+    }
+    const delay = num('in-cam-delay');
+    if (delay !== undefined) {
+        patch.delay_ms = delay;
+    }
+    return patch;
+}
+
+function clearCameraSettings(): void {
+    for (const f of CAMERA_FIELDS) {
+        (req(f.id) as HTMLInputElement).value = '';
+    }
+}
+
+/* Current values arrive as placeholder hints; the inputs stay empty so blank keeps
+ * meaning "leave alone".
+ *
+ * A read that fails leaves "(unavailable)" hints and DISABLED controls, never
+ * stale numbers: a placeholder from a previous connection is a lie about the
+ * current one, and a panel that accepts input it cannot send is worse than a
+ * panel that says it is deaf.
+ *
+ * jpeg_quality is displayed through the same text as every other field, including
+ * its zero, because 0 here means "automatic" and an operator who reads "0" as a
+ * quality setting has been told their photographs are encoded at the worst
+ * possible factor. The placeholder says "0 (automatic)". */
+async function refreshCameraSettings(): Promise<void> {
+    let vals: Record<string, unknown> | null = null;
+    try {
+        vals = JSON.parse(await call<string>('CameraGetParams')) as Record<string, unknown>;
+        setCameraReadable(true);
+    } catch (err) {
+        vals = null;
+        setCameraReadable(false);
+        cameraRequestedResolution = null;
+        logLine(`camera settings unavailable: ${err}`);
+    }
+
+    /* The resolution in force, remembered so the next capture can be compared
+     * against it. Read HERE, from the OBC, and not from the input box: the box
+     * holds what an operator typed, the field holds what is in force, and they
+     * differ the moment somebody types without pressing apply.
+     *
+     * Cleared when the read fails rather than left holding the last value. A
+     * stale requested resolution would put a clamp warning on a capture taken
+     * under settings nobody can currently read -- comparing against a number
+     * this console no longer believes. */
+    const res = vals === null ? undefined : vals['resolution'];
+    cameraRequestedResolution = typeof res === 'string' ? res : null;
+
+    for (const f of CAMERA_FIELDS) {
+        const el = req(f.id) as HTMLInputElement;
+        const v = vals === null ? undefined : vals[f.key];
+        if (typeof v === 'number') {
+            el.placeholder = f.key === 'jpeg_quality' && v === 0 ? '0 (automatic)' : String(v);
+            el.title = `${f.key}: ${v}`;
+        } else if (typeof v === 'string') {
+            el.placeholder = v;
+            el.title = `${f.key}: ${v}`;
+        } else if (vals === null) {
+            el.placeholder = '(unavailable)';
+            el.title = f.key;
+        } else {
+            // The key is present but of a type this table does not describe,
+            // which means the Go side and this table have genuinely diverged.
+            // "(unknown)" is honest; printing something else would put a value
+            // in the box that the operator would take for a setting.
+            el.placeholder = '(unknown)';
+            el.title = f.key;
+        }
+    }
+    if (vals !== null) {
+        logLine('camera settings refreshed from OBC');
+    }
+}
+
+/* The resolution the OBC last said was in force, or null when this console does
+ * not currently know it.
+ *
+ * Set by refreshCameraSettings from the OBC's own answer, never from an input
+ * box, and cleared when a read fails. It exists so the next capture can be
+ * compared against what was asked for -- the only place a driver clamp becomes
+ * visible to an operator (fswebcam's man page: "the actual resolution used may
+ * differ if the source or device cannot capture at the specified resolution"). A
+ * comparison against nothing is not a comparison, so null draws nothing. */
+let cameraRequestedResolution: string | null = null;
 
 /* --------------------------------------------------------------------------
    Arming delay, suggested from the session length
@@ -790,6 +1029,11 @@ function wireCommands(): void {
         if (r.success) {
             void refreshListing();
         }
+        // The size, the fetch cost, and whether the driver gave us the
+        // resolution we asked for. The command result already carries all three
+        // -- Go computed the fetch time, because the browser does not do
+        // arithmetic on numbers it is given.
+        req('cam-shot').innerHTML = renderShotResult(cameraRequestedResolution, r.artefact);
     }));
     on('b-gnss', () => void call<Cmd>('SelectReceiver', numArg('in-gnss')).then((r) => cmdLine('gnss', r)));
     on('b-gnss-rot', () => void call<Cmd>('RotateReceiver').then((r) => cmdLine('gnss-rotate', r)));
@@ -833,6 +1077,28 @@ function wireCommands(): void {
     })());
     on('b-params-clear', () => clearParams());
     on('b-params-refresh', () => void refreshParams());
+    on('b-cam-apply', () => void (async () => {
+        // Behind the disabled buttons as well as in front of them. A disabled
+        // button is a hint and a hint is not a guarantee: a stale layout, a
+        // keyboard shortcut, or a click that landed between the read failing
+        // and the DOM updating all reach here.
+        if (!cameraReadable) {
+            logLine('camera settings: not readable, so not sending; the OBC may predate them');
+            return;
+        }
+        try {
+            const r = await call<Cmd>('SetCameraParams', cameraPatch());
+            cmdLine('camera-set-params', r);
+            if (r.success) {
+                clearCameraSettings();
+                await refreshCameraSettings();
+            }
+        } catch (err) {
+            logLine(`camera settings input: ${err}`);
+        }
+    })());
+    on('b-cam-clear', () => clearCameraSettings());
+    on('b-cam-refresh', () => void refreshCameraSettings());
     on('b-ls', () => void refreshListing());
     on('b-dlcancel', () => void call<Cmd>('CancelDownload').then(
         () => logLine('download cancel requested'),
@@ -958,8 +1224,18 @@ function layout(): void {
         <section class="p-gnss"><h2>gnss</h2><div id="gnss"></div>
           <div class="row"><input id="in-gnss" size="4" value="1"><button id="b-gnss">select</button> <button id="b-gnss-rot">rotate</button></div>
         </section>
+        <section class="p-cam"><h2>camera</h2>
+          <div class="row"><button id="b-photo">photo</button>
+            <button id="b-cam-refresh">refresh settings</button>
+            <button id="b-cam-apply">apply</button>
+            <button id="b-cam-clear">clear</button></div>
+          <div class="row sub hint">blank = leave alone</div>
+          <div class="row" id="cam-shot"></div>
+          <div class="row sub err" id="cam-note"></div>
+          <div id="cam-rows"></div>
+        </section>
         <section class="p-csl"><h2>camera · sdr · link</h2><div id="csl"></div>
-          <div class="row"><button id="b-photo">photo</button> <button id="b-probe">sdr probe</button> <button id="b-sdrcon">sdr connect</button> <button id="b-sdrusb">sdr reset usb</button></div>
+          <div class="row"><button id="b-probe">sdr probe</button> <button id="b-sdrcon">sdr connect</button> <button id="b-sdrusb">sdr reset usb</button></div>
           <div class="row"><input id="in-link" size="6" value="115"><button id="b-link">set limit kbit</button> <input id="in-telrate" size="5" value="1000"><button id="b-telrate">set telemetry ms</button> <button id="b-query">query</button></div>
           <div class="row" id="cmd-result"></div>
           <div class="row"><span>sdr params (blank = leave alone)</span></div>
@@ -985,9 +1261,16 @@ function layout(): void {
     </div>`;
 
     // After the markup exists and before anything can call req() on a parameter
-    // input: the rows are generated from PARAM_FIELDS, so the inputs do not
-    // exist until this line runs.
+    // input: the rows are generated from PARAM_FIELDS and CAMERA_FIELDS, so the
+    // inputs do not exist until these lines run.
     paramRows(req('param-rows'));
+    cameraRows(req('cam-rows'));
+
+    // Disabled until a read says they are readable. A panel full of live-looking
+    // controls for an OBC that cannot answer is the failure setCameraReadable
+    // exists to prevent, and the default has to be the safe one: the first paint
+    // may not have a frame yet, or an OBC at all.
+    setCameraReadable(false);
 }
 
 async function firstPaint(): Promise<void> {
@@ -1006,6 +1289,7 @@ async function firstPaint(): Promise<void> {
         }
         await refreshListing();
         await refreshParams();
+        await refreshCameraSettings();
     } catch (err) {
         logLine(`first paint: ${err}`);
     }

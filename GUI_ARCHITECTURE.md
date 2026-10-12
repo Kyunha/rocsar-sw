@@ -94,14 +94,29 @@ Go-native option below is rejected regardless of its other merits.
 
 The operating area is **Northern Europe** (lon −12…45, lat 50…72). The
 requirement is *low-detail geographic context* — rivers, lakes, coastlines and
-visible terrain — not a street basemap. The basemap is two committed assets,
-both from Natural Earth and both drawn by MapLibre:
+visible terrain — not a street basemap. The basemap is three committed assets,
+all from Natural Earth and all drawn by MapLibre:
 
-1. **Vector GeoJSON** — ocean, land, mountain ranges and named summits at 50m
-   globally, plus lakes and rivers at 10m clipped to the operating area.
+1. **Vector GeoJSON (physical)** — ocean, land, mountain ranges and named summits
+   at 50m globally, plus lakes and rivers at 10m clipped to the operating area.
    Produced by `scripts/fetch-basemap.py`.
-2. **A hypsometric-relief image** over the operating area, carrying elevation
+2. **Vector GeoJSON (cultural)** — populated places, roads and railroads at 10m,
+   clipped to the operating area, so a position reads against recognisable
+   ground rather than blank relief. Produced by `scripts/fetch-basemap.py`.
+3. **A hypsometric-relief image** over the operating area, carrying elevation
    as colour and slope as shading. Produced by `scripts/fetch-relief/main.go`.
+
+**Dynamic overlays.** On top of the basemap the map draws three overlays from
+telemetry, each absent when its input is: the **position trail** (the last 30
+fixes, ~30 s); the **antenna pointing sector**, the bearings an axis can reach
+(±36° around the gondola heading plus the mount offset, being the servo's 12-bit
+encoder geared 5:1 — `firmware/gondola_model.h:962`), drawn as a dotted wedge in
+the heading colour; and the **SAR beam footprint**, where a 45°-depression,
+10°-full-angle beam meets the ground along the target bearing, computed from the
+altitude. Rendered offline, the ground is a flat sea-level datum — no terrain
+model is shipped — so over high ground the footprint is on the datum. The
+footprint is the shape of the beam, not a modelled image; it is what tells an
+operator whether a commanded bearing actually covers the target.
 
 **Why not DEM terrain tiles.** MapLibre can render hillshade (a `hillshade`
 layer) and 3D terrain (`setTerrain`) from a `raster-dem` source, and AWS
@@ -153,10 +168,28 @@ GeoJSON. It rounds coordinates to 6 dp (the linework is generalised; 14-digit
 precision is noise), filters `geography_regions_polys` to
 `featurecla == "Range/mtn"` — only 127 of its 514 features are mountains, and
 shipping island groups and deserts to draw mountains would be paying 3 MB for
-map never rendered — and clips the 10m hydrography to the operating box. It
-writes pre-compressed `.json.gz`; `cmd/gs/bridge.go` serves them with
-`Content-Encoding: gzip`, so the bytes embedded in the binary are the compressed
-ones and the frontend still reads plain JSON URLs.
+map never rendered — and clips both the 10m hydrography and the cultural layers
+to the operating box. The physical layers come from Natural Earth's `physical/`
+directory and the cultural ones from `cultural/`; each layer names its
+directory. It writes pre-compressed `.json.gz`; `cmd/gs/bridge.go` serves them
+with `Content-Encoding: gzip`, so the bytes embedded in the binary are the
+compressed ones and the frontend still reads plain JSON URLs.
+
+**Why the cultural layers are clipped and unfiltered.** The 10m roads and
+railroads are dense: **5 024 roads and 8 257 railroads** over the box, against
+the 447 populated places. The box clip is therefore load-bearing for them, but
+no feature is dropped below that — a missing road is worse than one drawn
+lighter than its class, and the road class is carried by line width, not by a
+filter. City labels are the one exception: names are drawn for places over
+50 000 (302 of the 447), because 447 labels bury the map; every city still has
+a dot and a click popup. Labels are SDF text, which MapLibre can only draw from
+glyph PBFs, so the two Latin ranges the area's place names need are committed
+under `public/fonts` (Open Sans, Apache-2.0) and served from the same origin.
+
+**Cost.** Vector ~4.12 MB gzipped plus relief 611 KB ≈ **4.73 MB embedded**,
+about 141 KB of that the committed font glyphs. The cultural layers are ~2.4 MB
+of it; they were a deliberate choice to spend bytes on ground the operator can
+name, over keeping the binary under 3 MB.
 
 **Why the water is at a different scale from the land.** At 50m the whole of
 Northern Europe carries **58 lakes and 34 rivers**, which is why the map
@@ -179,10 +212,11 @@ eleven-bullet attribution block — EU-DEM, SRTM/GMTED, ETOPO1, LINZ CC BY 3.0 N
 UK EA OGL v3 and more — to ship inside the binary.
 
 **Recorded limitations.**
-- **Relief and detailed water exist only inside the operating-area box.**
-  Outside it there is the 50m vector basemap — land, ocean, coastlines, mountain
-  ranges, summits — with no terrain and no fine hydrography. Global relief would
-  have to be downsampled to roughly 6 km/px, which shows nothing.
+- **Relief, detailed water and all cultural data exist only inside the
+  operating-area box.** Outside it there is the 50m vector basemap — land,
+  ocean, coastlines, mountain ranges, summits — with no terrain, no fine
+  hydrography and no cities, roads or railroads. Global relief would have to be
+  downsampled to roughly 6 km/px, which shows nothing.
 - **No 3D and no elevation.** The relief is a flat raster, so `setTerrain` is
   unavailable and a click's `lngLat` is not terrain-adjusted. 3D means the DEM
   route above.
@@ -679,7 +713,45 @@ before the first event.
 
 **GNSS** — `SelectReceiver(id)`, `RotateReceiver()`
 
-**Camera** — `TakePhoto()`
+**Camera** — `TakePhoto()`, `CameraGetParams()`, `SetCameraParams(patch)`
+
+`CameraGetParams` returns the five capture settings as JSON — `jpeg_quality`,
+`resolution`, `frames`, `skip`, `delay_ms` — and `SetCameraParams` applies a
+partial update, nil fields left alone. The read is what makes the write usable:
+the window shows current values as **placeholder hints** while blank inputs keep
+meaning "leave alone", exactly as on the SDR panel, and the rules that follow from
+that (9.4) apply unchanged.
+
+An OBC that predates the command answers `ERROR_INVALID_COMMAND` — unknown oneof
+payload, refused at dispatch, never a hang. The panel then **disables every
+control and says why**. Controls that cannot work must not look like controls that
+can, and a placeholder from a previous connection is a lie about the current one.
+
+Two things are specific to the camera:
+
+- **`jpeg_quality = 0` is a real value meaning "automatic"**, not an absence. It is
+  `0` on the wire and in the file, and the placeholder says `0 (automatic)` — a
+  bare `0` in that box reads as "encoded at the worst possible factor". It is also
+  why every field is a pointer the whole way down: `""` and `0` are different
+  requests and neither is inferred from the other.
+- **A resolution is a request, not a report.** `fswebcam`'s man page: *"the actual
+  resolution used may differ if the source or device cannot capture at the
+  specified resolution"*. So `TakePhoto`'s result carries the **decoded**
+  dimensions of the file that was written, and the panel says so out loud when
+  they differ from the setting: `driver clamped it; 1920x1080 was asked for`. A
+  clamp is routine and is not a fault, but it is completely invisible unless
+  something states it.
+
+`TakePhoto`'s result also carries `fetch_seconds`, **computed in Go**. A
+photograph's cost on a 115 kbit/s link is arithmetic on two numbers only the Go side
+has together, and 9.4 says the frontend renders numbers rather than doing
+arithmetic on them. It is rounded **up**: an operator deciding whether to wait for
+something is told 5 s when it is 5.4, not the other way round.
+
+The camera has its own panel rather than sharing the "camera · sdr · link" box.
+Three subsystems in one box meant the camera's controls were one button in a row
+belonging to something else, and there was nowhere to put five settings and the
+result of the last capture.
 
 **SDR** — `SdrProbe()`, `SdrGetParams()`, `SdrConnect()`, `SdrResetUSB()`, `SetSdrParams(patch)`
 
